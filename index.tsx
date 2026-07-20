@@ -473,9 +473,11 @@ function View() {
   }
 
   const changeDebugMode = (enabled: boolean) => {
-    setDebugModeEnabled(enabled)
-    setDebugModeState(enabled)
-    if (enabled) void logEvent({ level: "info", event: "debug-mode.enabled" })
+    void (async () => {
+      await setDebugModeEnabled(enabled)
+      setDebugModeState(enabled)
+      if (enabled) await logEvent({ level: "info", event: "debug-mode.enabled" })
+    })()
   }
 
   const updatePlatformSessions = (updater: (current: Partial<Record<AuthPlatform, PlatformAuthSession>>) => Partial<Record<AuthPlatform, PlatformAuthSession>>) => {

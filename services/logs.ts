@@ -23,8 +23,10 @@ export type LogPage = {
 const LOG_DIR = Path.join(Script.directory, "logs")
 const HISTORY_DIR = Path.join(LOG_DIR, "history")
 const LATEST_LOG_PATH = Path.join(LOG_DIR, "latest.jsonl")
+const MINIMAL_LOG_PATH = Path.join(LOG_DIR, "minimal.jsonl")
 const DEBUG_MODE_KEY = "yoinks.debug-mode-enabled"
 const MAX_LATEST_BYTES = 512 * 1024
+const MAX_MINIMAL_BYTES = 128 * 1024
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024
 const MAX_TEXT_LENGTH = 32_000
 
@@ -107,14 +109,29 @@ async function ensureDirectories() {
   if (!(await FileManager.exists(HISTORY_DIR))) await FileManager.createDirectory(HISTORY_DIR, true)
 }
 
-async function trimLatestLog() {
+async function trimLog(path: string, maxBytes: number) {
   try {
-    if (!FileManager.existsSync(LATEST_LOG_PATH) || FileManager.statSync(LATEST_LOG_PATH).size <= MAX_LATEST_BYTES) return
-    const content = FileManager.readAsStringSync(LATEST_LOG_PATH)
-    const tail = content.slice(-Math.floor(MAX_LATEST_BYTES * 0.75))
+    if (!FileManager.existsSync(path) || FileManager.statSync(path).size <= maxBytes) return
+    const content = FileManager.readAsStringSync(path)
+    let tail = content.slice(-maxBytes)
     const firstNewline = tail.indexOf("\n")
-    FileManager.writeAsStringSync(LATEST_LOG_PATH, firstNewline >= 0 ? tail.slice(firstNewline + 1) : tail)
+    tail = firstNewline >= 0 ? tail.slice(firstNewline + 1) : ""
+    while (tail) {
+      FileManager.writeAsStringSync(path, tail)
+      if (FileManager.statSync(path).size <= maxBytes) return
+      const nextNewline = tail.indexOf("\n", Math.ceil(tail.length / 2))
+      tail = nextNewline >= 0 ? tail.slice(nextNewline + 1) : ""
+    }
+    FileManager.writeAsStringSync(path, "")
   } catch {}
+}
+
+async function trimLatestLog() {
+  await trimLog(LATEST_LOG_PATH, MAX_LATEST_BYTES)
+}
+
+async function trimMinimalLog() {
+  await trimLog(MINIMAL_LOG_PATH, MAX_MINIMAL_BYTES)
 }
 
 async function directorySize(path: string): Promise<number> {
@@ -151,16 +168,41 @@ export function isDebugModeEnabled(): boolean {
   return Storage.get<boolean>(DEBUG_MODE_KEY) === true
 }
 
-export function setDebugModeEnabled(enabled: boolean): void {
-  Storage.set(DEBUG_MODE_KEY, enabled)
+export async function setDebugModeEnabled(enabled: boolean): Promise<void> {
+  if (!enabled) {
+    Storage.set(DEBUG_MODE_KEY, false)
+    return
+  }
+  try {
+    if (await FileManager.exists(MINIMAL_LOG_PATH)) {
+      const minimalEvents = parseEvents(await FileManager.readAsString(MINIMAL_LOG_PATH))
+      if (minimalEvents.length) {
+        await ensureDirectories()
+        await FileManager.appendText(LATEST_LOG_PATH, minimalEvents.map((event) => `${JSON.stringify(event)}\n`).join(""))
+        await trimLatestLog()
+      }
+      await FileManager.remove(MINIMAL_LOG_PATH)
+    }
+  } catch {} finally {
+    Storage.set(DEBUG_MODE_KEY, true)
+  }
 }
 
 export function createTaskId(): string {
   return `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`
 }
 
+function isMinimalEvent(payload: YoinksLogEvent): boolean {
+  if (payload.level === "warn" || payload.level === "error") return true
+  return /^(paste|manual-url)\.accepted$|^probe\.(started|completed)$|^download\.(started|completed|failed|cancel\.requested)$|^merge\.ffmpeg\.completed$|^verify\.completed$|^save\.(photos|files)\.completed$|^platform-auth\.(login\.completed|login\.failed|download-login\.failed)$|^history\.(prune\.partial|write\.failed|action\.failed|clear\.partial)$/.test(payload.event)
+}
+
+function compactDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!details) return undefined
+  return Object.fromEntries(Object.entries(details).map(([key, value]) => [key, typeof value === "string" ? safeText(value, 2_000) : value]))
+}
+
 export async function logEvent(event: Omit<YoinksLogEvent, "timestamp">): Promise<void> {
-  if (!isDebugModeEnabled()) return
   const now = new Date()
   const payload: YoinksLogEvent = {
     timestamp: now.toISOString(),
@@ -171,6 +213,13 @@ export async function logEvent(event: Omit<YoinksLogEvent, "timestamp">): Promis
   }
   const line = `${JSON.stringify(payload)}\n`
   try {
+    if (!isDebugModeEnabled()) {
+      if (!isMinimalEvent(payload)) return
+      await ensureDirectories()
+      await FileManager.appendText(MINIMAL_LOG_PATH, `${JSON.stringify({ ...payload, details: compactDetails(payload.details) })}\n`)
+      await trimMinimalLog()
+      return
+    }
     await ensureDirectories()
     await FileManager.appendText(LATEST_LOG_PATH, line)
     if (payload.taskId) {
@@ -203,6 +252,15 @@ export async function readLogPage(filter: LogFilter, offset: number, limit: numb
     }
   } catch {
     return { events: [], totalMatching: 0, totalAvailable: 0, hasMore: false, sizeBytes: 0 }
+  }
+}
+
+export async function readMinimalLog(): Promise<YoinksLogEvent[]> {
+  try {
+    if (!(await FileManager.exists(MINIMAL_LOG_PATH))) return []
+    return parseEvents(await FileManager.readAsString(MINIMAL_LOG_PATH)).map((event) => ({ ...event, details: sanitizeDetails(event.details) }))
+  } catch {
+    return []
   }
 }
 
