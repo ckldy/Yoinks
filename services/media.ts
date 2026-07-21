@@ -5,6 +5,8 @@ import type { AuthPlatform } from "./platform-auth"
 export type SaveMode = "ask" | "photos" | "files"
 export type ConcurrentDownloads = 1 | 2 | 4 | 8
 export type MediaKind = "video" | "audio"
+export type AutomaticDownloadFormatStrategy = "recommended" | "highest-video" | "highest-audio" | "preferred-container"
+export type PreferredContainer = "mp4" | "mkv" | "avi" | "wmv"
 
 export type ToolStatus = {
   ytDlpVersion: string | null
@@ -26,6 +28,7 @@ export type MediaChoice = {
   label: string
   kind: MediaKind
   formatExpression: string
+  container?: string
   height?: number
   estimatedBytes?: number
   mergeAudioFormat?: string
@@ -254,6 +257,7 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
     label: `${item.height}p 视频${item.ext ? ` · ${item.ext.toUpperCase()}` : ""}${item.fps ? ` · ${Math.round(item.fps)} fps` : ""}${item.filesize ? ` · 约 ${formatBytes(item.filesize)}` : ""}`,
     kind: "video",
     formatExpression: item.formatId,
+    container: item.ext?.toLowerCase(),
     height: item.height,
     estimatedBytes: item.filesize,
     previewURL: item.previewURL,
@@ -281,11 +285,34 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
     label: `仅音频${item.ext ? ` · ${item.ext.toUpperCase()}` : ""}${item.abr || item.tbr ? ` · ${Math.round(item.abr || item.tbr || 0)} kbps` : ""}${item.filesize ? ` · 约 ${formatBytes(item.filesize)}` : ""}`,
     kind: "audio",
     formatExpression: item.formatId,
+    container: item.ext?.toLowerCase(),
     estimatedBytes: item.filesize,
     previewURL: item.previewURL,
   })))
 
   return choices
+}
+
+export function resolveAutomaticChoice(
+  choices: MediaChoice[],
+  strategy: AutomaticDownloadFormatStrategy,
+  preferredContainer: PreferredContainer,
+): { choice: MediaChoice | null; usedFallback: boolean } {
+  const recommended = choices[0] || null
+  if (!recommended || strategy === "recommended") return { choice: recommended, usedFallback: false }
+
+  if (strategy === "highest-video") {
+    const choice = choices.filter((item) => item.kind === "video").sort((a, b) => (b.height || 0) - (a.height || 0))[0] || recommended
+    return { choice, usedFallback: choice === recommended && choice.kind !== "video" }
+  }
+
+  if (strategy === "highest-audio") {
+    const choice = choices.find((item) => item.kind === "audio") || recommended
+    return { choice, usedFallback: choice === recommended && choice.kind !== "audio" }
+  }
+
+  const choice = choices.find((item) => item.kind === "video" && !item.mergeAudioFormat && item.container === preferredContainer) || recommended
+  return { choice, usedFallback: choice !== null && choice.container !== preferredContainer }
 }
 
 export async function getToolStatus(): Promise<ToolStatus> {

@@ -41,6 +41,7 @@ import {
   installYtDlp,
   mediaPlatformLabel,
   probeMedia,
+  resolveAutomaticChoice,
   saveResult,
   type ConcurrentDownloads,
   type DownloadProgress,
@@ -65,6 +66,8 @@ import {
 import {
   getPreferences,
   setPreferences,
+  type AutomaticDownloadFormatStrategy,
+  type PreferredContainer,
   type PreviewAutoplayMode,
   type YoinksPreferences,
 } from "./services/preferences"
@@ -102,6 +105,18 @@ const SAVE_LABELS: Record<SaveMode, string> = {
 const PREVIEW_AUTOPLAY_LABELS: Record<PreviewAutoplayMode, string> = {
   muted: "静音自动播放",
   audible: "有声自动播放",
+}
+const AUTOMATIC_DOWNLOAD_FORMAT_LABELS: Record<AutomaticDownloadFormatStrategy, string> = {
+  recommended: "使用推荐格式",
+  "highest-video": "最高画质视频",
+  "highest-audio": "最高音质音频",
+  "preferred-container": "指定视频格式",
+}
+const PREFERRED_CONTAINER_LABELS: Record<PreferredContainer, string> = {
+  mp4: "MP4",
+  mkv: "MKV",
+  avi: "AVI",
+  wmv: "WMV",
 }
 
 function formatBytes(bytes: number): string {
@@ -456,6 +471,7 @@ function View() {
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
+  const launchClipboardCheckedRef = useRef(false)
 
   const updateSaveMode = (next: SaveMode) => {
     const nextPreferences = setPreferences({ ...preferences, defaultSaveMode: next })
@@ -610,13 +626,13 @@ function View() {
     }
   }
 
-  const downloadWithPlatformSession = async (sourceURL: string, platform: AuthPlatform | null, insecureTLS: boolean, session: PlatformAuthSession | null): Promise<DownloadResult> => {
+  const downloadWithPlatformSession = async (sourceURL: string, choice: MediaChoice, platform: AuthPlatform | null, insecureTLS: boolean, session: PlatformAuthSession | null): Promise<DownloadResult> => {
     let cookieFile: string | null = null
     try {
       if (session) cookieFile = await createTaskCookieFile(session)
       return await downloadMedia({
         url: sourceURL,
-        choice: selectedChoice!,
+        choice,
         concurrentFragments,
         insecureTLS,
         cookieFile: cookieFile || undefined,
@@ -706,6 +722,37 @@ function View() {
     }
   }
 
+  const checkLaunchClipboard = async () => {
+    if (launchClipboardCheckedRef.current || analyzing || downloading || url) return
+    launchClipboardCheckedRef.current = true
+    await logEvent({ level: "info", event: "clipboard-launch.checked" })
+    try {
+      if (!(await Pasteboard.hasStrings)) {
+        await logEvent({ level: "info", event: "clipboard-launch.empty" })
+        return
+      }
+      const next = extractFirstURL(await Pasteboard.getString())
+      if (!next) {
+        await logEvent({ level: "info", event: "clipboard-launch.invalid" })
+        return
+      }
+      await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
+      disposeTemporarySession()
+      setURL(next)
+      setProbe(null)
+      setSelectedChoice(null)
+      setResult(null)
+      setStatus("已检测到剪贴板链接，正在自动分析。")
+      await analyzeMedia(next, { automaticDownload: true })
+    } catch (error) {
+      await logEvent({ level: "warn", event: "auto-download.skipped", details: { reason: "clipboard-unavailable", message: error instanceof Error ? error.message : String(error) } })
+    }
+  }
+
+  useEffect(() => {
+    void checkLaunchClipboard()
+  }, [])
+
   const enterURL = async () => {
     if (enteringURL) return
     setEnteringURL(true)
@@ -742,7 +789,7 @@ function View() {
     }
   }
 
-  const analyzeMedia = async (source?: string) => {
+  const analyzeMedia = async (source?: string, options: { automaticDownload?: boolean } = {}) => {
     if (analyzing || downloading) return
     const validURL = extractFirstURL(source || url)
     if (!validURL) {
@@ -772,9 +819,16 @@ function View() {
       const platform = detectMediaPlatform(validURL)
       const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       const nextProbe = await probeWithPlatformSession(validURL, session)
+      const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
       setProbe(nextProbe)
-      selectMediaChoice(nextProbe.choices[0] || null)
+      selectMediaChoice(resolved.choice)
       setStatus(`已找到 ${nextProbe.choices.length} 个可下载格式。`)
+      if (options.automaticDownload && preferences.automaticDownloadEnabled && resolved.choice) {
+        await logEvent({ level: "info", event: "auto-download.selected", details: { strategy: preferences.automaticDownloadFormatStrategy, preferredContainer: preferences.preferredContainer, choiceId: resolved.choice.id, usedFallback: resolved.usedFallback } })
+        await startDownload(false, { sourceURL: validURL, choice: resolved.choice, probeTitle: nextProbe.title, toolStatus: availableTools })
+      } else if (options.automaticDownload) {
+        await logEvent({ level: "info", event: "auto-download.skipped", details: { reason: preferences.automaticDownloadEnabled ? "no-choice" : "disabled" } })
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const platform = detectMediaPlatform(validURL)
@@ -784,9 +838,16 @@ function View() {
           if (session) {
             setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新分析。`)
             const nextProbe = await probeWithPlatformSession(validURL, session)
+            const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
             setProbe(nextProbe)
-            selectMediaChoice(nextProbe.choices[0] || null)
+            selectMediaChoice(resolved.choice)
             setStatus(`已找到 ${nextProbe.choices.length} 个可下载格式。`)
+            if (options.automaticDownload && preferences.automaticDownloadEnabled && resolved.choice) {
+              await logEvent({ level: "info", event: "auto-download.selected", details: { strategy: preferences.automaticDownloadFormatStrategy, preferredContainer: preferences.preferredContainer, choiceId: resolved.choice.id, usedFallback: resolved.usedFallback } })
+              await startDownload(false, { sourceURL: validURL, choice: resolved.choice, probeTitle: nextProbe.title, toolStatus: availableTools })
+            } else if (options.automaticDownload) {
+              await logEvent({ level: "info", event: "auto-download.skipped", details: { reason: preferences.automaticDownloadEnabled ? "no-choice" : "disabled" } })
+            }
             return
           }
         } catch (loginError) {
@@ -844,6 +905,28 @@ function View() {
     if (choice != null) updatePreferences({ ...preferences, previewAutoplayMode: values[choice] })
   }
 
+  const chooseAutomaticDownloadFormat = async () => {
+    const values: AutomaticDownloadFormatStrategy[] = ["recommended", "highest-video", "highest-audio", "preferred-container"]
+    const choice = await Dialog.actionSheet({
+      title: "自动下载格式",
+      message: "指定视频格式只匹配来源原本提供的直出格式；未匹配时使用推荐格式。",
+      actions: values.map((value) => ({ label: AUTOMATIC_DOWNLOAD_FORMAT_LABELS[value] })),
+      cancelButton: true,
+    })
+    if (choice != null) updatePreferences({ ...preferences, automaticDownloadFormatStrategy: values[choice] })
+  }
+
+  const choosePreferredContainer = async () => {
+    const values: PreferredContainer[] = ["mp4", "mkv", "avi", "wmv"]
+    const choice = await Dialog.actionSheet({
+      title: "指定视频格式",
+      message: "仅选择来源直接提供且包含音频的视频格式；不存在时使用推荐格式。",
+      actions: values.map((value) => ({ label: PREFERRED_CONTAINER_LABELS[value] })),
+      cancelButton: true,
+    })
+    if (choice != null) updatePreferences({ ...preferences, preferredContainer: values[choice] })
+  }
+
   const chooseConcurrency = async () => {
     const values: ConcurrentDownloads[] = [1, 2, 4, 8]
     const choice = await Dialog.actionSheet({
@@ -884,18 +967,20 @@ function View() {
     await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
   }
 
-  const startDownload = async (insecureTLS = false) => {
-    if (!tools?.ytDlpVersion) {
+  const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }) => {
+    const availableTools = automatic?.toolStatus || tools
+    if (!availableTools?.ytDlpVersion) {
       setStatus("请先安装 yt-dlp。")
       return
     }
-    const validURL = extractFirstURL(url)
+    const validURL = extractFirstURL(automatic?.sourceURL || url)
     if (!validURL) {
       setStatus("请先粘贴或输入有效的公开链接。")
       return
     }
 
-    if (!selectedChoice) {
+    const downloadChoice = automatic?.choice || selectedChoice
+    if (!downloadChoice) {
       setStatus("请先分析链接并选择实际可用格式。")
       return
     }
@@ -910,14 +995,14 @@ function View() {
     try {
       const platform = detectMediaPlatform(validURL)
       const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
-      const downloaded = await downloadWithPlatformSession(validURL, isAuthPlatform(platform) ? platform : null, insecureTLS, session)
+      const downloaded = await downloadWithPlatformSession(validURL, downloadChoice, isAuthPlatform(platform) ? platform : null, insecureTLS, session)
       const effectiveSaveMode: SaveMode = downloaded.choice.kind === "audio" && saveMode === "photos" ? "files" : saveMode
       if (effectiveSaveMode !== saveMode) updateSaveMode(effectiveSaveMode)
       const saveStatus = await saveResult(downloaded.filePath, downloaded.fileName, effectiveSaveMode, downloaded.taskId)
       setResult(downloaded)
       setStatus(saveStatus)
       if (effectiveSaveMode !== "ask") setCompletedSaveMode(effectiveSaveMode)
-      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, probe?.title || downloaded.fileName)
+      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, automatic?.probeTitle || probe?.title || downloaded.fileName)
       if (!sourceFileAvailable) {
         setResult(null)
         setCompletedSaveMode(null)
@@ -933,14 +1018,14 @@ function View() {
           const session = await loginForPlatform(platform)
           if (session) {
             setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新下载。`)
-            const downloaded = await downloadWithPlatformSession(validURL, platform, insecureTLS, session)
+            const downloaded = await downloadWithPlatformSession(validURL, downloadChoice, platform, insecureTLS, session)
             const effectiveSaveMode: SaveMode = downloaded.choice.kind === "audio" && saveMode === "photos" ? "files" : saveMode
             if (effectiveSaveMode !== saveMode) updateSaveMode(effectiveSaveMode)
             const saveStatus = await saveResult(downloaded.filePath, downloaded.fileName, effectiveSaveMode, downloaded.taskId)
             setResult(downloaded)
             setStatus(saveStatus)
             if (effectiveSaveMode !== "ask") setCompletedSaveMode(effectiveSaveMode)
-      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, probe?.title || downloaded.fileName)
+      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, automatic?.probeTitle || probe?.title || downloaded.fileName)
       if (!sourceFileAvailable) {
         setResult(null)
         setCompletedSaveMode(null)
@@ -964,7 +1049,7 @@ function View() {
         })
         if (retry) {
           setStatus("正在以证书兼容模式重试。")
-          await startDownload(true)
+          await startDownload(true, automatic)
           return
         }
       }
@@ -1177,6 +1262,12 @@ function View() {
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
               <Button title={`在线预览：${PREVIEW_AUTOPLAY_LABELS[preferences.previewAutoplayMode]}`} systemImage="play.circle" action={() => void choosePreviewAutoplayMode()} disabled={downloading || analyzing} />
+            </Section>
+            <Section title="自动下载">
+              <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
+              <Button title={`自动下载格式：${AUTOMATIC_DOWNLOAD_FORMAT_LABELS[preferences.automaticDownloadFormatStrategy]}`} systemImage="slider.horizontal.3" action={() => void chooseAutomaticDownloadFormat()} disabled={downloading || analyzing} />
+              {preferences.automaticDownloadFormatStrategy === "preferred-container" ? <Button title={`指定视频格式：${PREFERRED_CONTAINER_LABELS[preferences.preferredContainer]}`} systemImage="film" action={() => void choosePreferredContainer()} disabled={downloading || analyzing} /> : null}
+              <Text font="caption" foregroundStyle="secondaryLabel">启动进入下载页时会自动分析剪贴板中的公开链接。自动下载默认关闭。</Text>
             </Section>
             <Section title="本地存储">
               <Text font="caption" foregroundStyle="secondaryLabel">自动清理优先删除最早的 Yoinks 原文件和对应记录。</Text>
