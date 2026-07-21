@@ -109,20 +109,27 @@ async function ensureDirectories() {
   if (!(await FileManager.exists(HISTORY_DIR))) await FileManager.createDirectory(HISTORY_DIR, true)
 }
 
+export function retainLogTailWithinBytes(content: string, maxBytes: number): string {
+  const lines = content.split(/\r?\n/)
+  if (lines.at(-1) === "") lines.pop()
+  const retained: string[] = []
+  let retainedBytes = 0
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = `${lines[index]}\n`
+    const lineBytes = new TextEncoder().encode(line).length
+    if (retainedBytes + lineBytes > maxBytes) break
+    retained.unshift(lines[index])
+    retainedBytes += lineBytes
+  }
+  return retained.length ? `${retained.join("\n")}\n` : ""
+}
+
 async function trimLog(path: string, maxBytes: number) {
   try {
     if (!FileManager.existsSync(path) || FileManager.statSync(path).size <= maxBytes) return
     const content = FileManager.readAsStringSync(path)
-    let tail = content.slice(-maxBytes)
-    const firstNewline = tail.indexOf("\n")
-    tail = firstNewline >= 0 ? tail.slice(firstNewline + 1) : ""
-    while (tail) {
-      FileManager.writeAsStringSync(path, tail)
-      if (FileManager.statSync(path).size <= maxBytes) return
-      const nextNewline = tail.indexOf("\n", Math.ceil(tail.length / 2))
-      tail = nextNewline >= 0 ? tail.slice(nextNewline + 1) : ""
-    }
-    FileManager.writeAsStringSync(path, "")
+    const tail = retainLogTailWithinBytes(content, maxBytes)
+    if (tail !== content) FileManager.writeAsStringSync(path, tail)
   } catch {}
 }
 
@@ -168,24 +175,34 @@ export function isDebugModeEnabled(): boolean {
   return Storage.get<boolean>(DEBUG_MODE_KEY) === true
 }
 
+let logWriteQueue: Promise<void> = Promise.resolve()
+
+function enqueueLogWrite(operation: () => Promise<void>): Promise<void> {
+  const scheduled = logWriteQueue.then(operation, operation)
+  logWriteQueue = scheduled.catch(() => {})
+  return scheduled
+}
+
 export async function setDebugModeEnabled(enabled: boolean): Promise<void> {
-  if (!enabled) {
-    Storage.set(DEBUG_MODE_KEY, false)
-    return
-  }
-  try {
-    if (await FileManager.exists(MINIMAL_LOG_PATH)) {
-      const minimalEvents = parseEvents(await FileManager.readAsString(MINIMAL_LOG_PATH))
-      if (minimalEvents.length) {
-        await ensureDirectories()
-        await FileManager.appendText(LATEST_LOG_PATH, minimalEvents.map((event) => `${JSON.stringify(event)}\n`).join(""))
-        await trimLatestLog()
-      }
-      await FileManager.remove(MINIMAL_LOG_PATH)
+  await enqueueLogWrite(async () => {
+    if (!enabled) {
+      Storage.set(DEBUG_MODE_KEY, false)
+      return
     }
-  } catch {} finally {
-    Storage.set(DEBUG_MODE_KEY, true)
-  }
+    try {
+      if (await FileManager.exists(MINIMAL_LOG_PATH)) {
+        const minimalEvents = parseEvents(await FileManager.readAsString(MINIMAL_LOG_PATH))
+        if (minimalEvents.length) {
+          await ensureDirectories()
+          await FileManager.appendText(LATEST_LOG_PATH, minimalEvents.map((event) => `${JSON.stringify(event)}\n`).join(""))
+          await trimLatestLog()
+        }
+        await FileManager.remove(MINIMAL_LOG_PATH)
+      }
+    } catch {} finally {
+      Storage.set(DEBUG_MODE_KEY, true)
+    }
+  })
 }
 
 export function createTaskId(): string {
@@ -194,7 +211,7 @@ export function createTaskId(): string {
 
 function isMinimalEvent(payload: YoinksLogEvent): boolean {
   if (payload.level === "warn" || payload.level === "error") return true
-  return /^(paste|manual-url)\.accepted$|^probe\.(started|completed)$|^download\.(started|completed|failed|cancel\.requested)$|^merge\.ffmpeg\.completed$|^verify\.completed$|^save\.(photos|files)\.completed$|^platform-auth\.(login\.completed|login\.failed|download-login\.failed)$|^history\.(prune\.partial|write\.failed|action\.failed|clear\.partial)$/.test(payload.event)
+  return /^(paste|manual-url)\.accepted$|^probe\.(started|completed)$|^download\.(started|completed|failed|cancel\.requested)$|^merge\.ffmpeg\.completed$|^verify\.completed$|^save\.(photos|files)\.completed$|^platform-auth\.(login\.completed|login\.failed|download-login\.failed)$|^preview\.(login-requested|retry-after-login\.(playing|failed)|fallback-download)$|^history\.(prune\.partial|write\.failed|action\.failed|clear\.partial)$/.test(payload.event)
 }
 
 function compactDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
@@ -212,25 +229,27 @@ export async function logEvent(event: Omit<YoinksLogEvent, "timestamp">): Promis
     details: sanitizeDetails(event.details),
   }
   const line = `${JSON.stringify(payload)}\n`
-  try {
-    if (!isDebugModeEnabled()) {
-      if (!isMinimalEvent(payload)) return
+  await enqueueLogWrite(async () => {
+    try {
+      if (!isDebugModeEnabled()) {
+        if (!isMinimalEvent(payload)) return
+        await ensureDirectories()
+        await FileManager.appendText(MINIMAL_LOG_PATH, `${JSON.stringify({ ...payload, details: compactDetails(payload.details) })}\n`)
+        await trimMinimalLog()
+        return
+      }
       await ensureDirectories()
-      await FileManager.appendText(MINIMAL_LOG_PATH, `${JSON.stringify({ ...payload, details: compactDetails(payload.details) })}\n`)
-      await trimMinimalLog()
-      return
-    }
-    await ensureDirectories()
-    await FileManager.appendText(LATEST_LOG_PATH, line)
-    if (payload.taskId) {
-      const path = taskLogPath(payload.taskId, now)
-      const parent = Path.join(HISTORY_DIR, dayKey(now))
-      if (!(await FileManager.exists(parent))) await FileManager.createDirectory(parent, true)
-      await FileManager.appendText(path, line)
-      await trimHistory()
-    }
-    await trimLatestLog()
-  } catch {}
+      await FileManager.appendText(LATEST_LOG_PATH, line)
+      if (payload.taskId) {
+        const path = taskLogPath(payload.taskId, now)
+        const parent = Path.join(HISTORY_DIR, dayKey(now))
+        if (!(await FileManager.exists(parent))) await FileManager.createDirectory(parent, true)
+        await FileManager.appendText(path, line)
+        await trimHistory()
+      }
+      await trimLatestLog()
+    } catch {}
+  })
 }
 
 export async function readLogPage(filter: LogFilter, offset: number, limit: number): Promise<LogPage> {

@@ -75,8 +75,8 @@ const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
 const MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".m4a", ".aac", ".opus", ".mp3"])
 
-function quote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`
+export function quote(value: string): string {
+  return `"${value.replace(/["\\$`]/g, "\\$&")}"`
 }
 
 function compactMessage(value: string): string {

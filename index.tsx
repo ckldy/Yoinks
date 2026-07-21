@@ -81,6 +81,11 @@ import {
   type YoinksPreferences,
 } from "./services/preferences"
 import {
+  beginGenericPreviewLogin,
+  disposeGenericPreviewSession,
+  type GenericPreviewSession,
+} from "./services/generic-preview-session"
+import {
   authPlatformLabel,
   beginPlatformLogin,
   clearPlatformLogin,
@@ -172,7 +177,7 @@ function isTransientAccessError(message: string): boolean {
 }
 
 const INITIAL_LOG_EVENT_LIMIT = 20
-const APP_VERSION = "1.1.0"
+const APP_VERSION = "1.1.1"
 const CURRENT_RELEASE_NOTES = [
   "新增在线预览自动播放设置，默认静音自动播放。",
   "下载中显示已下载大小、文件总大小、当前速度和预计剩余时间。",
@@ -388,6 +393,15 @@ function safeJavaScriptString(value: string): string {
   return JSON.stringify(value).replace(/</g, "\\u003c")
 }
 
+type PreviewPlaybackOutcome = "playing" | "media-error" | "open-failed" | "timeout"
+
+type PreviewPlaybackResult = {
+  outcome: PreviewPlaybackOutcome
+  errorCode?: number
+}
+
+const PREVIEW_PLAYBACK_TIMEOUT_MS = 12_000
+
 function playerHTML(source: string, autoplayMode: PreviewAutoplayMode, useRelativeLocalURL = false): string {
   const mediaURL = safeJavaScriptString(
     useRelativeLocalURL
@@ -414,7 +428,7 @@ function playerHTML(source: string, autoplayMode: PreviewAutoplayMode, useRelati
       event,
       currentTime: player.currentTime,
       duration: player.duration,
-      error: player.error ? player.error.message : null,
+      errorCode: player.error ? player.error.code : null,
     })
   }
   player.addEventListener("loadedmetadata", () => report("loadedmetadata"))
@@ -426,15 +440,29 @@ function playerHTML(source: string, autoplayMode: PreviewAutoplayMode, useRelati
 </html>`
 }
 
-async function presentHTML5Player(source: string, title: string, autoplayMode: PreviewAutoplayMode): Promise<void> {
-  const webView = new WebViewController({ ephemeral: true })
+async function presentHTML5Player(source: string, title: string, autoplayMode: PreviewAutoplayMode, session?: GenericPreviewSession): Promise<PreviewPlaybackResult> {
+  const webView = session?.webView || new WebViewController({ ephemeral: true })
+  const ownsWebView = !session
   const isRemote = isHTTPURL(source)
-  if (!isRemote && !source.startsWith("/")) throw new Error("本地视频路径无效")
+  if (!isRemote && !source.startsWith("/")) return { outcome: "open-failed" }
   const localDirectory = source.slice(0, source.lastIndexOf("/"))
   const localPagePath = `${source}.yoinks-player.html`
+  let resolveOutcome: ((result: PreviewPlaybackResult) => void) | null = null
+  let settled = false
+  const settle = (result: PreviewPlaybackResult) => {
+    if (settled) return
+    settled = true
+    if (result.outcome !== "playing") webView.dismiss()
+    resolveOutcome?.(result)
+  }
   try {
+    const outcome = new Promise<PreviewPlaybackResult>((resolve) => { resolveOutcome = resolve })
     await webView.addScriptMessageHandler("mediaEvent", (details: Record<string, unknown> = {}) => {
-      void logEvent({ level: details.event === "error" ? "error" : "info", event: "html5-player.event", details: { ...details, title } })
+      const event = typeof details.event === "string" ? details.event : "unknown"
+      const errorCode = typeof details.errorCode === "number" ? details.errorCode : undefined
+      void logEvent({ level: event === "error" || event === "play.failed" ? "warn" : "info", event: "preview.player.event", details: { event, errorCode, title, isRemote, retry: !ownsWebView } })
+      if (event === "playing") settle({ outcome: "playing" })
+      if (event === "error") settle({ outcome: "media-error", errorCode })
       return true
     })
     const loaded = isRemote
@@ -443,16 +471,24 @@ async function presentHTML5Player(source: string, title: string, autoplayMode: P
           await FileManager.writeAsString(localPagePath, playerHTML(source, autoplayMode, true))
           return webView.loadFile(localPagePath, localDirectory)
         })()
-    if (!loaded) throw new Error("无法加载视频页面")
-    await logEvent({ level: "info", event: "html5-player.opened", details: { title, isRemote } })
-    await webView.present({ fullscreen: true, navigationTitle: "播放" })
+    if (!loaded) return { outcome: "open-failed" }
+    await logEvent({ level: "info", event: "preview.player.opened", details: { title, isRemote, retry: !ownsWebView } })
+    void webView.present({ fullscreen: true, navigationTitle: "播放" })
+      .catch(() => settle({ outcome: "open-failed" }))
+      .finally(async () => {
+        webView.dispose()
+        if (!isRemote && await FileManager.exists(localPagePath)) await FileManager.remove(localPagePath)
+      })
+    const timeout = new Promise<PreviewPlaybackResult>((resolve) => setTimeout(() => resolve({ outcome: "timeout" }), PREVIEW_PLAYBACK_TIMEOUT_MS))
+    const result = await Promise.race([outcome, timeout])
+    if (result.outcome !== "playing") settle(result)
+    return result
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    await logEvent({ level: "error", event: "html5-player.failed", details: { title, message } })
-    await Dialog.alert({ title: "播放失败", message })
-  } finally {
-    webView.dispose()
+    await logEvent({ level: "error", event: "preview.player.failed", details: { title, message, isRemote, retry: !ownsWebView } })
+    if (ownsWebView) webView.dispose()
     if (!isRemote && await FileManager.exists(localPagePath)) await FileManager.remove(localPagePath)
+    return { outcome: "open-failed" }
   }
 }
 
@@ -1078,7 +1114,59 @@ function View() {
       setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
       return
     }
-    await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
+    const showFallback = async (outcome: PreviewPlaybackOutcome, retry: boolean) => {
+      await logEvent({ level: "warn", event: "preview.fallback-download", details: { outcome, retry } })
+      setStatus("临时媒体链接无法稳定在线播放，请下载完后播放")
+      await Dialog.alert({ title: "在线预览失败", message: "临时媒体链接无法稳定在线播放，请下载完后播放" })
+    }
+    const firstResult = await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
+    if (firstResult.outcome === "playing") return
+    const sourceURL = extractFirstURL(url) || probe.webpageURL
+    if (!isHTTPURL(selectedChoice.previewURL) || !sourceURL) {
+      await showFallback(firstResult.outcome, false)
+      return
+    }
+    const hostname = (() => {
+      try { return new URL(sourceURL).hostname } catch { return "" }
+    })()
+    if (!hostname) {
+      await showFallback(firstResult.outcome, false)
+      return
+    }
+    const confirmed = await Dialog.confirm({
+      title: "登录后进行预览",
+      message: `在线播放失败，可能需要登录 ${hostname} 后才能访问媒体。是否前往登录？`,
+      confirmLabel: "前往登录",
+      cancelLabel: "取消",
+    })
+    if (!confirmed) {
+      await showFallback(firstResult.outcome, false)
+      return
+    }
+    let session: GenericPreviewSession | null = null
+    try {
+      await logEvent({ level: "info", event: "preview.login-requested", details: { hostname } })
+      session = await beginGenericPreviewLogin(sourceURL)
+      if (!session) {
+        await showFallback(firstResult.outcome, false)
+        return
+      }
+      setStatus("已获取临时登录状态，正在重新尝试预览。")
+      const retryResult = await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode, session)
+      if (retryResult.outcome === "playing") {
+        session = null
+        await logEvent({ level: "info", event: "preview.retry-after-login.playing", details: { hostname } })
+        return
+      }
+      await logEvent({ level: "warn", event: "preview.retry-after-login.failed", details: { hostname, outcome: retryResult.outcome, errorCode: retryResult.errorCode } })
+      await showFallback(retryResult.outcome, true)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await logEvent({ level: "warn", event: "preview.login.failed", details: { hostname, message } })
+      await showFallback(firstResult.outcome, false)
+    } finally {
+      disposeGenericPreviewSession(session)
+    }
   }
 
   const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
@@ -1343,11 +1431,9 @@ function View() {
                 <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
                 {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
               </VStack>
-              <HStack spacing={12}>
-                <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
-                {url ? <Button title="重新分析链接" systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
-                {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
-              </HStack>
+              <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
+              {url ? <Button title={analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
+              {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
             </Section>
 
             <Section title="格式与保存">
