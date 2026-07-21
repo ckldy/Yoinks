@@ -358,8 +358,7 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message !== "下载工具未返回可识别的媒体信息") throw error
-    await logEvent({ level: "warn", event: "probe.output.retry", taskId, details: { delayMilliseconds: 750 } })
-    await new Promise<void>((resolve) => setTimeout(resolve, 750))
+    await logEvent({ level: "warn", event: "probe.output.retry", taskId, details: { delayMilliseconds: 0 } })
     result = await runCommand(`python3 ${quote(PROBE_PATH)} ${quote(sourceURL)}${cookieArgument}`, 120)
     await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
     if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))

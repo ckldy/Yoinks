@@ -163,6 +163,10 @@ function isCertificateError(message: string): boolean {
   return /CERTIFICATE_VERIFY_FAILED|certificate verify failed|self-signed certificate/i.test(message)
 }
 
+function isTransientAccessError(message: string): boolean {
+  return /HTTP Error 403: Forbidden|HTTP Error 429|too many requests/i.test(message)
+}
+
 const INITIAL_LOG_EVENT_LIMIT = 20
 const APP_VERSION = "1.1.0"
 const CURRENT_RELEASE_NOTES = [
@@ -1036,7 +1040,7 @@ function View() {
     await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
   }
 
-  const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }) => {
+  const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
     const availableTools = automatic?.toolStatus || tools
     if (!availableTools?.ytDlpVersion) {
       setStatus("请先安装 yt-dlp。")
@@ -1111,6 +1115,12 @@ function View() {
           return
         }
       }
+      if (!retriedTransientAccess && isTransientAccessError(message)) {
+        await logEvent({ level: "warn", event: "download.access.retry", details: { sourceURL: validURL, reason: "transient-access-error" } })
+        setStatus("来源暂时拒绝访问，正在重试下载。")
+        await startDownload(insecureTLS, automatic, true)
+        return
+      }
       if (!insecureTLS && isCertificateError(message)) {
         const retry = await Dialog.confirm({
           title: "证书校验失败",
@@ -1120,7 +1130,7 @@ function View() {
         })
         if (retry) {
           setStatus("正在以证书兼容模式重试。")
-          await startDownload(true, automatic)
+          await startDownload(true, automatic, retriedTransientAccess)
           return
         }
       }
