@@ -322,10 +322,22 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   const taskId = createTaskId()
   await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile) } })
   const cookieArgument = options.cookieFile ? ` ${quote(options.cookieFile)}` : ""
-  const result = await runCommand(`python3 ${quote(PROBE_PATH)} ${quote(sourceURL)}${cookieArgument}`, 120)
+  let result = await runCommand(`python3 ${quote(PROBE_PATH)} ${quote(sourceURL)}${cookieArgument}`, 120)
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
   if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
-  const payload = parseLastJSON(result.output)
+  let payload: Record<string, unknown>
+  try {
+    payload = parseLastJSON(result.output)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message !== "下载工具未返回可识别的媒体信息") throw error
+    await logEvent({ level: "warn", event: "probe.output.retry", taskId, details: { delayMilliseconds: 750 } })
+    await new Promise<void>((resolve) => setTimeout(resolve, 750))
+    result = await runCommand(`python3 ${quote(PROBE_PATH)} ${quote(sourceURL)}${cookieArgument}`, 120)
+    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
+    if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
+    payload = parseLastJSON(result.output)
+  }
   if (payload.ok !== true) throw new Error(compactMessage(stringValue(payload.error) || "媒体探测失败"))
   const rawFormats = Array.isArray(payload.formats) ? payload.formats : []
   const formats: RawFormat[] = rawFormats.map((value) => {

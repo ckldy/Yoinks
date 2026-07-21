@@ -43,6 +43,7 @@ import {
   probeMedia,
   saveResult,
   type ConcurrentDownloads,
+  type DownloadProgress,
   type DownloadResult,
   type MediaChoice,
   type MediaProbe,
@@ -64,6 +65,7 @@ import {
 import {
   getPreferences,
   setPreferences,
+  type PreviewAutoplayMode,
   type YoinksPreferences,
 } from "./services/preferences"
 import {
@@ -97,12 +99,30 @@ const SAVE_LABELS: Record<SaveMode, string> = {
   photos: "自动保存到相册",
   files: "自动导出到文件",
 }
+const PREVIEW_AUTOPLAY_LABELS: Record<PreviewAutoplayMode, string> = {
+  muted: "静音自动播放",
+  audible: "有声自动播放",
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function formatDownloadBytes(downloadedBytes?: number, totalBytes?: number): string {
+  const downloaded = downloadedBytes == null ? "计算中" : formatBytes(downloadedBytes)
+  const total = totalBytes == null ? "总大小待确定" : formatBytes(totalBytes)
+  return `已下载 ${downloaded} / ${total}`
+}
+
+function formatDownloadSpeed(speed?: number, eta?: number): string {
+  const speedLabel = speed == null || speed <= 0 ? "速度计算中" : `速度 ${formatBytes(speed)}/s`
+  if (eta == null || eta < 0 || !Number.isFinite(eta)) return speedLabel
+  const rounded = Math.ceil(eta)
+  const etaLabel = rounded < 60 ? `${rounded} 秒` : `${Math.floor(rounded / 60)} 分 ${rounded % 60} 秒`
+  return `${speedLabel} · 剩余约 ${etaLabel}`
 }
 
 function formatHistoryDate(value: string): string {
@@ -124,6 +144,12 @@ function isCertificateError(message: string): boolean {
 }
 
 const INITIAL_LOG_EVENT_LIMIT = 20
+const APP_VERSION = "1.1.0"
+const CURRENT_RELEASE_NOTES = [
+  "新增在线预览自动播放设置，默认静音自动播放。",
+  "下载中显示已下载大小、文件总大小、当前速度和预计剩余时间。",
+  "媒体探测成功但输出暂时无法解析时自动重试一次。",
+]
 const LOG_FILTER_LABELS: Record<LogFilter, string> = {
   all: "全部",
   info: "信息",
@@ -182,6 +208,22 @@ function LogDetailPage(props: { event: YoinksLogEvent }) {
   )
 }
 
+function ReleaseNotesPage() {
+  const dismiss = Navigation.useDismiss()
+  return (
+    <NavigationStack>
+      <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+        <Section title={`Yoinks ${APP_VERSION} · 2026-07-21`}>
+          {CURRENT_RELEASE_NOTES.map((note) => <Text key={note}>{note}</Text>)}
+        </Section>
+        <Section title="版本规则">
+          <Text font="caption" foregroundStyle="secondaryLabel">使用主版本.次版本.修订版本：新增向后兼容功能时提升次版本；修复问题时提升修订版本；不兼容的大改提升主版本。</Text>
+        </Section>
+      </List>
+    </NavigationStack>
+  )
+}
+
 function AboutPage() {
   const dismiss = Navigation.useDismiss()
   const openUpstreamProject = async () => {
@@ -198,6 +240,8 @@ function AboutPage() {
       <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
         <Section title="Yoinks">
           <Text>Yoinks 是基于 Scripting 的公开媒体链接下载工具：先探测可用格式，再按选择下载和保存。</Text>
+          <Text font="caption" foregroundStyle="secondaryLabel">版本 {APP_VERSION}</Text>
+          <Button title="查看更新内容" systemImage="text.badge.checkmark" action={() => void Navigation.present({ element: <ReleaseNotesPage /> })} />
         </Section>
         <Section title="功能与特点">
           <Text>支持格式优先选择、可用时的在线预览、音视频下载与 FFmpeg 合并，以及保存到相册或文件。</Text>
@@ -316,7 +360,7 @@ function safeJavaScriptString(value: string): string {
   return JSON.stringify(value).replace(/</g, "\\u003c")
 }
 
-function playerHTML(source: string, useRelativeLocalURL = false): string {
+function playerHTML(source: string, autoplayMode: PreviewAutoplayMode, useRelativeLocalURL = false): string {
   const mediaURL = safeJavaScriptString(
     useRelativeLocalURL
       ? encodeURI(source.slice(source.lastIndexOf("/") + 1))
@@ -335,7 +379,8 @@ function playerHTML(source: string, useRelativeLocalURL = false): string {
 <video id="player" controls autoplay playsinline></video>
 <script>
   const player = document.getElementById("player")
-  player.src = ${mediaURL}
+  player.muted = ${autoplayMode === "muted" ? "true" : "false"}
+   player.src = ${mediaURL}
   const report = (event) => {
     window.webkit.messageHandlers.mediaEvent.postMessage({
       event,
@@ -353,7 +398,7 @@ function playerHTML(source: string, useRelativeLocalURL = false): string {
 </html>`
 }
 
-async function presentHTML5Player(source: string, title: string): Promise<void> {
+async function presentHTML5Player(source: string, title: string, autoplayMode: PreviewAutoplayMode): Promise<void> {
   const webView = new WebViewController({ ephemeral: true })
   const isRemote = isHTTPURL(source)
   if (!isRemote && !source.startsWith("/")) throw new Error("本地视频路径无效")
@@ -365,9 +410,9 @@ async function presentHTML5Player(source: string, title: string): Promise<void> 
       return true
     })
     const loaded = isRemote
-      ? await webView.loadHTML(playerHTML(source), source)
+      ? await webView.loadHTML(playerHTML(source, autoplayMode), source)
       : await (async () => {
-          await FileManager.writeAsString(localPagePath, playerHTML(source, true))
+          await FileManager.writeAsString(localPagePath, playerHTML(source, autoplayMode, true))
           return webView.loadFile(localPagePath, localDirectory)
         })()
     if (!loaded) throw new Error("无法加载视频页面")
@@ -398,7 +443,7 @@ function View() {
   const [installing, setInstalling] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [cancelPath, setCancelPath] = useState<string | null>(null)
-  const [progress, setProgress] = useState({ fraction: 0, stage: "准备就绪" })
+  const [progress, setProgress] = useState<DownloadProgress>({ fraction: 0, stage: "准备就绪" })
   const [status, setStatus] = useState("粘贴一个公开媒体链接，然后选择输出格式。")
   const [result, setResult] = useState<DownloadResult | null>(null)
   const [completedSaveMode, setCompletedSaveMode] = useState<SaveMode | null>(null)
@@ -788,6 +833,17 @@ function View() {
     if (choice != null) updateSaveMode(values[choice])
   }
 
+  const choosePreviewAutoplayMode = async () => {
+    const values: PreviewAutoplayMode[] = ["muted", "audible"]
+    const choice = await Dialog.actionSheet({
+      title: "在线预览自动播放",
+      message: "有声自动播放可能被 iOS 拦截；被拦截时可使用播放器控制条手动播放。",
+      actions: values.map((value) => ({ label: PREVIEW_AUTOPLAY_LABELS[value] })),
+      cancelButton: true,
+    })
+    if (choice != null) updatePreferences({ ...preferences, previewAutoplayMode: values[choice] })
+  }
+
   const chooseConcurrency = async () => {
     const values: ConcurrentDownloads[] = [1, 2, 4, 8]
     const choice = await Dialog.actionSheet({
@@ -825,7 +881,7 @@ function View() {
       setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
       return
     }
-    await presentHTML5Player(selectedChoice.previewURL, probe.title)
+    await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
   }
 
   const startDownload = async (insecureTLS = false) => {
@@ -1102,6 +1158,8 @@ function View() {
                 <VStack alignment="leading" spacing={10} padding={{ vertical: 6 }}>
                   <HStack><Text font="subheadline">{progress.stage}</Text><Spacer /><Text font="caption" foregroundStyle="secondaryLabel">{Math.round(progress.fraction * 100)}%</Text></HStack>
                   <ProgressView value={progress.fraction} />
+                  <Text font="caption" foregroundStyle="secondaryLabel">{formatDownloadBytes(progress.downloadedBytes, progress.totalBytes)}</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel">{formatDownloadSpeed(progress.speed, progress.eta)}</Text>
                   <Button title="取消下载" systemImage="xmark" role="destructive" action={() => void stopDownload()} />
                 </VStack>
               ) : <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || !tools?.ytDlpVersion || installing || !selectedChoice || analyzing} />}
@@ -1118,6 +1176,7 @@ function View() {
             <Section title="下载偏好">
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
+              <Button title={`在线预览：${PREVIEW_AUTOPLAY_LABELS[preferences.previewAutoplayMode]}`} systemImage="play.circle" action={() => void choosePreviewAutoplayMode()} disabled={downloading || analyzing} />
             </Section>
             <Section title="本地存储">
               <Text font="caption" foregroundStyle="secondaryLabel">自动清理优先删除最早的 Yoinks 原文件和对应记录。</Text>
