@@ -1274,7 +1274,7 @@ function View() {
               <HStack spacing={12}>
                 <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
                 {url ? <Button title="重新分析链接" systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
-                {url ? <Button title="" systemImage="xmark.circle" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
+                {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
               </HStack>
             </Section>
 
