@@ -496,6 +496,10 @@ function View() {
     setHistory(records)
     setHistoryAvailability(Object.fromEntries(availability))
     setHistorySummary(summary)
+    if (!listRecentLinks().length) {
+      for (const record of [...records].reverse()) rememberRecentLink(record.sourceURL)
+      setRecentLinks(listRecentLinks())
+    }
   }
 
   const updatePreferences = (next: YoinksPreferences) => {
@@ -712,6 +716,7 @@ function View() {
 
   const useRecentLink = async (record: RecentLinkRecord) => {
     if (analyzing || downloading) return
+    await logEvent({ level: "info", event: "recent-link.selected", details: { sourceURL: record.url } })
     disposeTemporarySession()
     setURL(record.url)
     setProbe(null)
@@ -724,20 +729,33 @@ function View() {
 
   const chooseRecentLink = async () => {
     if (!recentLinks.length) {
-      setStatus("尚无成功下载的历史链接。")
+      setStatus("尚无历史链接。")
       return
     }
     const choice = await Dialog.actionSheet({
       title: "历史链接",
-      message: "仅保留最近 10 条成功下载的链接。",
+      message: "保留最近 10 条使用过的链接。",
       actions: recentLinks.map((record) => ({ label: record.url })),
       cancelButton: true,
     })
-    if (choice != null) await useRecentLink(recentLinks[choice])
+    if (choice == null) {
+      await logEvent({ level: "info", event: "recent-link.cancelled" })
+      return
+    }
+    const record = recentLinks[choice]
+    if (!record) {
+      await logEvent({ level: "warn", event: "recent-link.invalid-selection", details: { choice, available: recentLinks.length } })
+      return
+    }
+    await useRecentLink(record)
+  }
+
+  const rememberLink = (sourceURL: string) => {
+    setRecentLinks(rememberRecentLink(sourceURL))
   }
 
   const finishSuccessfulDownload = (sourceURL: string) => {
-    setRecentLinks(rememberRecentLink(sourceURL))
+    rememberLink(sourceURL)
     clearCurrentLink()
     setStatus("下载完成，当前链接已清除。")
   }
@@ -757,6 +775,7 @@ function View() {
         return
       }
       await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
+      rememberLink(next)
       disposeTemporarySession()
       setURL(next)
       setProbe(null)
@@ -785,6 +804,7 @@ function View() {
         return
       }
       await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
+      rememberLink(next)
       disposeTemporarySession()
       setURL(next)
       setProbe(null)
@@ -825,6 +845,7 @@ function View() {
         return
       }
       await logEvent({ level: "info", event: "manual-url.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
+      rememberLink(next)
       disposeTemporarySession()
       setURL(next)
       setProbe(null)
