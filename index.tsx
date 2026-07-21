@@ -64,6 +64,11 @@ import {
   type HistoryStorageSummary,
 } from "./services/history"
 import {
+  listRecentLinks,
+  rememberRecentLink,
+  type RecentLinkRecord,
+} from "./services/link-history"
+import {
   getPreferences,
   setPreferences,
   type AutomaticDownloadFormatStrategy,
@@ -466,6 +471,7 @@ function View() {
   const [history, setHistory] = useState<DownloadHistoryRecord[]>([])
   const [historyAvailability, setHistoryAvailability] = useState<Record<string, boolean>>({})
   const [historySummary, setHistorySummary] = useState<HistoryStorageSummary>({ totalRecords: 0, availableCount: 0, managedBytes: 0 })
+  const [recentLinks, setRecentLinks] = useState<RecentLinkRecord[]>(() => listRecentLinks())
   const [debugMode, setDebugModeState] = useState(() => isDebugModeEnabled())
   const [enteringURL, setEnteringURL] = useState(false)
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
@@ -692,6 +698,48 @@ function View() {
 
   const openLogFolder = async () => {
     await QuickLook.previewURLs([getLogDirectory()], true)
+  }
+
+  const clearCurrentLink = () => {
+    disposeTemporarySession()
+    setURL("")
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    setStatus("当前链接已清除。")
+  }
+
+  const useRecentLink = async (record: RecentLinkRecord) => {
+    if (analyzing || downloading) return
+    disposeTemporarySession()
+    setURL(record.url)
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    setStatus("正在分析历史链接。")
+    await analyzeMedia(record.url)
+  }
+
+  const chooseRecentLink = async () => {
+    if (!recentLinks.length) {
+      setStatus("尚无成功下载的历史链接。")
+      return
+    }
+    const choice = await Dialog.actionSheet({
+      title: "历史链接",
+      message: "仅保留最近 10 条成功下载的链接。",
+      actions: recentLinks.map((record) => ({ label: record.url })),
+      cancelButton: true,
+    })
+    if (choice != null) await useRecentLink(recentLinks[choice])
+  }
+
+  const finishSuccessfulDownload = (sourceURL: string) => {
+    setRecentLinks(rememberRecentLink(sourceURL))
+    clearCurrentLink()
+    setStatus("下载完成，当前链接已清除。")
   }
 
   const pasteURL = async () => {
@@ -1007,6 +1055,7 @@ function View() {
         setResult(null)
         setCompletedSaveMode(null)
       }
+      finishSuccessfulDownload(validURL)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const logs = await readLatestLog()
@@ -1030,6 +1079,7 @@ function View() {
         setResult(null)
         setCompletedSaveMode(null)
       }
+            finishSuccessfulDownload(validURL)
             return
           }
         } catch (loginError) {
@@ -1221,7 +1271,11 @@ function View() {
                 <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
                 {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
               </VStack>
-              {url ? <Button title="重新分析链接" systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
+              <HStack spacing={12}>
+                <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
+                {url ? <Button title="重新分析链接" systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
+                {url ? <Button title="" systemImage="xmark.circle" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
+              </HStack>
             </Section>
 
             <Section title="格式与保存">
