@@ -20,6 +20,10 @@ import {
   useState,
 } from "scripting"
 import {
+  consumeSkippedClipboardURL,
+  rememberSkippedClipboardURL,
+} from "./services/launch-clipboard"
+import {
   clearLogs,
   getLogDirectory,
   isDebugModeEnabled,
@@ -210,7 +214,7 @@ function LogDetailPage(props: { event: YoinksLogEvent }) {
   const style = LOG_LEVEL_STYLE[props.event.level]
   return (
     <NavigationStack>
-      <List navigationTitle="日志详情" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <List navigationTitle="日志详情" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
         <Section title="事件">
           <HStack spacing={8}>
             <Image systemName={style.icon} foregroundStyle={style.color as any} />
@@ -236,7 +240,7 @@ function ReleaseNotesPage() {
   const dismiss = Navigation.useDismiss()
   return (
     <NavigationStack>
-      <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
         <Section title={`Yoinks ${APP_VERSION} · 2026-07-21`}>
           {CURRENT_RELEASE_NOTES.map((note) => <Text key={note}>{note}</Text>)}
         </Section>
@@ -261,7 +265,7 @@ function AboutPage() {
 
   return (
     <NavigationStack>
-      <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
         <Section title="Yoinks">
           <Text>Yoinks 是基于 Scripting 的公开媒体链接下载工具：先探测可用格式，再按选择下载和保存。</Text>
           <Text font="caption" foregroundStyle="secondaryLabel">版本 {APP_VERSION}</Text>
@@ -333,7 +337,7 @@ function LogPage() {
 
   return (
     <NavigationStack>
-      <List navigationTitle="运行日志" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <List navigationTitle="运行日志" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
         <Section title="筛选与维护">
           <Button title={`级别：${LOG_FILTER_LABELS[filter]}`} systemImage="line.3.horizontal.decrease.circle" action={() => void chooseFilter()} />
           <Button title="刷新日志" systemImage="arrow.clockwise" action={() => { setLimit(INITIAL_LOG_EVENT_LIMIT); void refresh(filter, INITIAL_LOG_EVENT_LIMIT) }} />
@@ -482,6 +486,7 @@ function View() {
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const launchClipboardCheckedRef = useRef(false)
+  const closingRef = useRef(false)
 
   const updateSaveMode = (next: SaveMode) => {
     const nextPreferences = setPreferences({ ...preferences, defaultSaveMode: next })
@@ -718,6 +723,15 @@ function View() {
     setStatus("当前链接已清除。")
   }
 
+  const closeYoinks = () => {
+    closingRef.current = true
+    const current = extractFirstURL(url)
+    if (current) rememberSkippedClipboardURL(current)
+    clearCurrentLink()
+    void logEvent({ level: "info", event: "script.closed", details: { skippedClipboardURL: current || null } })
+    dismiss()
+  }
+
   const useRecentLink = async (record: RecentLinkRecord) => {
     if (analyzing || downloading) return
     await logEvent({ level: "info", event: "recent-link.selected", details: { sourceURL: record.url } })
@@ -807,6 +821,11 @@ function View() {
         await logEvent({ level: "info", event: "clipboard-launch.invalid" })
         return
       }
+      if (consumeSkippedClipboardURL(next)) {
+        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { sourceURL: next, reason: "closed-with-current-link" } })
+        setStatus("已跳过上次关闭时的链接。")
+        return
+      }
       await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
       rememberLink(next)
       disposeTemporarySession()
@@ -863,7 +882,7 @@ function View() {
   }
 
   const analyzeMedia = async (source?: string, options: { automaticDownload?: boolean } = {}) => {
-    if (analyzing || downloading) return
+    if (analyzing || downloading || closingRef.current) return
     const validURL = extractFirstURL(source || url)
     if (!validURL) {
       setStatus("请先粘贴或输入有效的公开链接。")
@@ -892,6 +911,7 @@ function View() {
       const platform = detectMediaPlatform(validURL)
       const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       const nextProbe = await probeWithPlatformSession(validURL, session)
+      if (closingRef.current) return
       const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
       setProbe(nextProbe)
       selectMediaChoice(resolved.choice)
@@ -911,6 +931,7 @@ function View() {
           if (session) {
             setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新分析。`)
             const nextProbe = await probeWithPlatformSession(validURL, session)
+            if (closingRef.current) return
             const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
             setProbe(nextProbe)
             selectMediaChoice(resolved.choice)
@@ -1257,7 +1278,7 @@ function View() {
             navigationTitle="下载记录"
             navigationBarTitleDisplayMode="inline"
             toolbar={{
-              cancellationAction: <Button title="关闭" action={dismiss} />,
+              cancellationAction: <Button title="关闭" action={closeYoinks} />,
               topBarTrailing: <Button title="" systemImage="arrow.clockwise" action={() => void refreshHistory()} />,
             }}
           >
@@ -1293,7 +1314,7 @@ function View() {
             navigationTitle="Yoinks"
             navigationBarTitleDisplayMode="inline"
             toolbar={{
-              cancellationAction: <Button title="关闭" action={dismiss} />,
+              cancellationAction: <Button title="关闭" action={closeYoinks} />,
               topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} />,
             }}
           >
@@ -1342,7 +1363,7 @@ function View() {
 
       <Tab title="设置" systemImage="gearshape.fill" value={SETTINGS_TAB}>
         <NavigationStack>
-          <List navigationTitle="设置" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+          <List navigationTitle="设置" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={closeYoinks} /> }}>
             <Section title="下载偏好">
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
