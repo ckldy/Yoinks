@@ -487,6 +487,8 @@ function View() {
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const launchClipboardCheckedRef = useRef(false)
   const closingRef = useRef(false)
+  const analysisGenerationRef = useRef(0)
+  const launchClipboardSuppressedRef = useRef(false)
 
   const updateSaveMode = (next: SaveMode) => {
     const nextPreferences = setPreferences({ ...preferences, defaultSaveMode: next })
@@ -714,6 +716,8 @@ function View() {
   }
 
   const clearCurrentLink = () => {
+    launchClipboardSuppressedRef.current = true
+    analysisGenerationRef.current += 1
     disposeTemporarySession()
     setURL("")
     setProbe(null)
@@ -734,6 +738,8 @@ function View() {
 
   const useRecentLink = async (record: RecentLinkRecord) => {
     if (analyzing || downloading) return
+    launchClipboardSuppressedRef.current = false
+    analysisGenerationRef.current += 1
     await logEvent({ level: "info", event: "recent-link.selected", details: { sourceURL: record.url } })
     disposeTemporarySession()
     setURL(record.url)
@@ -792,6 +798,8 @@ function View() {
         setStatus("剪贴板中没有有效的公开 http 或 https 链接。")
         return
       }
+      launchClipboardSuppressedRef.current = false
+      analysisGenerationRef.current += 1
       await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
       rememberLink(next)
       disposeTemporarySession()
@@ -821,11 +829,17 @@ function View() {
         await logEvent({ level: "info", event: "clipboard-launch.invalid" })
         return
       }
+      if (launchClipboardSuppressedRef.current) {
+        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { sourceURL: next, reason: "cleared-during-launch-check" } })
+        return
+      }
       if (consumeSkippedClipboardURL(next)) {
         await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { sourceURL: next, reason: "closed-with-current-link" } })
         setStatus("已跳过上次关闭时的链接。")
         return
       }
+      launchClipboardSuppressedRef.current = false
+      analysisGenerationRef.current += 1
       await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
       rememberLink(next)
       disposeTemporarySession()
@@ -867,6 +881,8 @@ function View() {
         setStatus("请输入有效的公开 http 或 https 链接。")
         return
       }
+      launchClipboardSuppressedRef.current = false
+      analysisGenerationRef.current += 1
       await logEvent({ level: "info", event: "manual-url.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
       rememberLink(next)
       disposeTemporarySession()
@@ -883,6 +899,8 @@ function View() {
 
   const analyzeMedia = async (source?: string, options: { automaticDownload?: boolean } = {}) => {
     if (analyzing || downloading || closingRef.current) return
+    const generation = analysisGenerationRef.current
+    const isCurrentAnalysis = () => !closingRef.current && generation === analysisGenerationRef.current
     const validURL = extractFirstURL(source || url)
     if (!validURL) {
       setStatus("请先粘贴或输入有效的公开链接。")
@@ -893,6 +911,7 @@ function View() {
       setStatus("正在检查下载引擎。")
       try {
         availableTools = await getToolStatus()
+        if (!isCurrentAnalysis()) return
         setTools(availableTools)
       } catch (error) {
         setStatus(`工具检测失败：${error instanceof Error ? error.message : String(error)}`)
@@ -903,6 +922,7 @@ function View() {
       setStatus("请先安装 yt-dlp。")
       return
     }
+    if (!isCurrentAnalysis()) return
     setAnalyzing(true)
     setProbe(null)
     setSelectedChoice(null)
@@ -911,7 +931,7 @@ function View() {
       const platform = detectMediaPlatform(validURL)
       const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       const nextProbe = await probeWithPlatformSession(validURL, session)
-      if (closingRef.current) return
+      if (!isCurrentAnalysis()) return
       const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
       setProbe(nextProbe)
       selectMediaChoice(resolved.choice)
@@ -931,7 +951,7 @@ function View() {
           if (session) {
             setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新分析。`)
             const nextProbe = await probeWithPlatformSession(validURL, session)
-            if (closingRef.current) return
+            if (!isCurrentAnalysis()) return
             const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
             setProbe(nextProbe)
             selectMediaChoice(resolved.choice)
