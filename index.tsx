@@ -14,6 +14,7 @@ import {
   VStack,
   Tab,
   TabView,
+  ZStack,
   useEffect,
   useObservable,
   useRef,
@@ -26,13 +27,11 @@ import {
 import {
   clearLogs,
   getLogDirectory,
-  isDebugModeEnabled,
+  isVerboseLogEnabled,
   logEvent,
-  readLatestLog,
   readLogPage,
-  setDebugModeEnabled,
+  setVerboseLogEnabled,
   type LogFilter,
-  type LogLevel,
   type LogPage as LogPageData,
   type YoinksLogEvent,
 } from "./services/logs"
@@ -81,24 +80,20 @@ import {
   type YoinksPreferences,
 } from "./services/preferences"
 import {
-  beginGenericPreviewLogin,
-  disposeGenericPreviewSession,
-  type GenericPreviewSession,
-} from "./services/generic-preview-session"
-import {
-  authPlatformLabel,
   beginPlatformLogin,
   clearPlatformLogin,
   createTaskCookieFile,
   disposePlatformSession,
-  isAuthPlatform,
-  isFreshCookieError,
-  removeTaskCookieFile,
   restorePersistentPlatformSession,
-  supportedAuthPlatforms,
   type AuthPlatform,
   type PlatformAuthSession,
+  authPlatformLabel,
+  isAuthPlatform,
+  isFreshCookieError,
+  supportedAuthPlatforms,
 } from "./services/platform-auth"
+import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-preview"
+import type { HLSPlayerService } from "./services/player/hls-player-service"
 
 const HISTORY_TAB = 0
 const DOWNLOAD_TAB = 1
@@ -112,19 +107,19 @@ const CONCURRENCY_LABELS: Record<ConcurrentDownloads, string> = {
   8: "8 线程",
 }
 const SAVE_LABELS: Record<SaveMode, string> = {
-  ask: "下载后询问",
-  photos: "自动保存到相册",
-  files: "自动导出到文件",
+  photos: "相册",
+  files: "文件",
+  ask: "每次询问",
 }
 const PREVIEW_AUTOPLAY_LABELS: Record<PreviewAutoplayMode, string> = {
   muted: "静音自动播放",
   audible: "有声自动播放",
 }
 const AUTOMATIC_DOWNLOAD_FORMAT_LABELS: Record<AutomaticDownloadFormatStrategy, string> = {
-  recommended: "使用推荐格式",
+  "recommended": "推荐",
   "highest-video": "最高画质视频",
-  "highest-audio": "最高音质音频",
-  "preferred-container": "指定视频格式",
+  "highest-audio": "最高质量音频",
+  "preferred-container": "指定容器格式",
 }
 const PREFERRED_CONTAINER_LABELS: Record<PreferredContainer, string> = {
   mp4: "MP4",
@@ -140,356 +135,150 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
-function formatDownloadBytes(downloadedBytes?: number, totalBytes?: number): string {
-  const downloaded = downloadedBytes == null ? "计算中" : formatBytes(downloadedBytes)
-  const total = totalBytes == null ? "总大小待确定" : formatBytes(totalBytes)
-  return `已下载 ${downloaded} / ${total}`
+function formatHistoryDate(iso: string): string {
+  const date = new Date(iso)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
 }
 
-function formatDownloadSpeed(speed?: number, eta?: number): string {
-  const speedLabel = speed == null || speed <= 0 ? "速度计算中" : `速度 ${formatBytes(speed)}/s`
-  if (eta == null || eta < 0 || !Number.isFinite(eta)) return speedLabel
-  const rounded = Math.ceil(eta)
-  const etaLabel = rounded < 60 ? `${rounded} 秒` : `${Math.floor(rounded / 60)} 分 ${rounded % 60} 秒`
-  return `${speedLabel} · 剩余约 ${etaLabel}`
+function formatDownloadBytes(downloaded: number, total: number): string {
+  return `${formatBytes(downloaded)} / ${formatBytes(total)}`
 }
 
-function formatHistoryDate(value: string): string {
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false })
+function formatDownloadSpeed(speed: number, eta: number): string {
+  if (!speed || speed < 1) return "计算中..."
+  const etaStr = eta && eta > 0 ? ` · 预计 ${Math.round(eta)}s` : ""
+  return `${formatBytes(speed)}/s${etaStr}`
 }
 
-function toolLabel(status: ToolStatus | null) {
-  if (!status) return "正在检查"
-  return status.ytDlpVersion ? `yt-dlp ${status.ytDlpVersion}` : "yt-dlp 未安装"
+function statusIcon(ok: boolean): string {
+  return ok ? "checkmark.circle.fill" : "xmark.circle.fill"
 }
 
-function statusIcon(installed: boolean) {
-  return installed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+function toolLabel(tools: ToolStatus | null): string {
+  if (!tools) return "下载引擎：未就绪"
+  if (!tools.ytDlpVersion) return "下载引擎：未安装"
+  return `yt-dlp ${tools.ytDlpVersion} · 就绪`
 }
 
-function isCertificateError(message: string): boolean {
-  return /CERTIFICATE_VERIFY_FAILED|certificate verify failed|self-signed certificate/i.test(message)
-}
-
-function isTransientAccessError(message: string): boolean {
-  return /HTTP Error 403: Forbidden|HTTP Error 429|too many requests/i.test(message)
-}
-
-const INITIAL_LOG_EVENT_LIMIT = 20
-const APP_VERSION = "1.1.1"
-const CURRENT_RELEASE_NOTES = [
-  "新增在线预览自动播放设置，默认静音自动播放。",
-  "下载中显示已下载大小、文件总大小、当前速度和预计剩余时间。",
-  "媒体探测成功但输出暂时无法解析时自动重试一次。",
-]
-const LOG_FILTER_LABELS: Record<LogFilter, string> = {
-  all: "全部",
-  info: "信息",
-  warn: "警告",
-  error: "错误",
-}
-const LOG_LEVEL_STYLE: Record<LogLevel, { label: string; icon: string; color: string }> = {
-  debug: { label: "调试", icon: "ladybug", color: "secondaryLabel" },
-  info: { label: "信息", icon: "info.circle.fill", color: "blue" },
-  warn: { label: "警告", icon: "exclamationmark.triangle.fill", color: "orange" },
-  error: { label: "错误", icon: "xmark.octagon.fill", color: "red" },
-}
-
-function formatLogTimestamp(timestamp?: string): string {
-  if (!timestamp) return "尚无记录"
-  const date = new Date(timestamp)
-  return Number.isNaN(date.getTime()) ? timestamp : date.toLocaleString("zh-CN", { hour12: false })
-}
-
-function formatLogSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-}
-
-function logSummary(event: YoinksLogEvent): string {
-  const entries = Object.entries(event.details || {})
-  if (!entries.length) return event.taskId ? `任务：${event.taskId}` : "无附加信息"
-  return entries.slice(0, 2).map(([key, value]) => `${key}=${String(value)}`).join(" · ")
-}
-
-function LogDetailPage(props: { event: YoinksLogEvent }) {
+function LogDetailView({ event }: { event: YoinksLogEvent }) {
   const dismiss = Navigation.useDismiss()
-  const style = LOG_LEVEL_STYLE[props.event.level]
   return (
-    <NavigationStack>
-      <List navigationTitle="日志详情" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
-        <Section title="事件">
-          <HStack spacing={8}>
-            <Image systemName={style.icon} foregroundStyle={style.color as any} />
-            <Text font="headline">{style.label} · {props.event.event}</Text>
+    <List navigationTitle="日志详情" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <Section header={<Text>事件</Text>}>
+        <VStack alignment="leading" spacing={4} padding={{ vertical: 4 }}>
+          <Text font="headline">{event.event}</Text>
+          <Text font="caption" foregroundStyle="secondaryLabel">{event.timestamp}</Text>
+          <HStack spacing={6}>
+            <Text font="caption2" foregroundStyle={event.level === "error" ? "red" : event.level === "warn" ? "orange" : event.level === "debug" ? "gray" : "green"}>
+              {event.level.toUpperCase()}
+            </Text>
+            {event.taskId ? <Text font="caption2" foregroundStyle="secondaryLabel">{event.taskId}</Text> : null}
           </HStack>
-          <Text font="caption" foregroundStyle="secondaryLabel">{formatLogTimestamp(props.event.timestamp)}</Text>
-          {props.event.taskId ? <Text font="caption" foregroundStyle="secondaryLabel">任务：{props.event.taskId}</Text> : null}
+        </VStack>
+      </Section>
+      {event.details ? (
+        <Section header={<Text>详情</Text>}>
+          <Text font="body" foregroundStyle="label">{JSON.stringify(event.details, null, 2)}</Text>
         </Section>
-        <Section title="已脱敏详情">
-          {Object.entries(props.event.details || {}).length ? Object.entries(props.event.details || {}).map(([key, value]) => (
-            <VStack alignment="leading" spacing={3} key={key}>
-              <Text font="caption" foregroundStyle="secondaryLabel">{key}</Text>
-              <Text>{String(value)}</Text>
-            </VStack>
-          )) : <Text foregroundStyle="secondaryLabel">此事件没有附加字段。</Text>}
-        </Section>
-      </List>
-    </NavigationStack>
+      ) : null}
+    </List>
   )
 }
 
-function ReleaseNotesPage() {
+function ChangelogView() {
   const dismiss = Navigation.useDismiss()
   return (
-    <NavigationStack>
-      <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
-        <Section title={`Yoinks ${APP_VERSION} · 2026-07-21`}>
-          {CURRENT_RELEASE_NOTES.map((note) => <Text key={note}>{note}</Text>)}
-        </Section>
-        <Section title="版本规则">
-          <Text font="caption" foregroundStyle="secondaryLabel">使用主版本.次版本.修订版本：新增向后兼容功能时提升次版本；修复问题时提升修订版本；不兼容的大改提升主版本。</Text>
-        </Section>
-      </List>
-    </NavigationStack>
+    <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <Section header={<Text>版本 1.2.0 (2026-07-24)</Text>}>
+        <Text font="body">• A：下载进度分段映射 + 阶段清 progress + UI 节流，避免进度回跳与高频刷新</Text>
+        <Text font="body">• B：紧凑进度置顶 + 右下浮层取消，下载中可正常滑动列表</Text>
+        <Text font="body">• C：m3u8/HLS 经 FFmpeg 直连，失败时 BackgroundURLSession 回退</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.10 (2026-07-24)</Text>}>
+        <Text font="body">• 下载中进度置顶，取消与进度始终可见；链接/格式在下方可继续浏览</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.9 (2026-07-24)</Text>}>
+        <Text font="body">• 下载页去掉默认保存方式入口，统一在设置中管理</Text>
+        <Text font="body">• 下载中文件大小与速度合并为一行</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.8 (2026-07-24)</Text>}>
+        <Text font="body">• 去掉下载页底部空白区块，列表末尾不再多一截空页</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.7 (2026-07-24)</Text>}>
+        <Text font="body">• 下载进度保留在任务区；列表底部留白，下载中仍可上滑查看链接/格式</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.6 (2026-07-24)</Text>}>
+        <Text font="body">• 下载同分辨率只保留一路并优先 H.264，减少 AV1 导致的验证失败</Text>
+        <Text font="body">• AV1/损坏流验证失败给出可操作提示；格式列表标注编码</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.5 (2026-07-24)</Text>}>
+        <Text font="body">• 双流预览优先 H.264 视频轨，避免 AV1/HEVC 黑屏有声</Text>
+        <Text font="body">• probe 从 http_headers 回填 Referer；视频轨失败时停掉孤立音频</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.4 (2026-07-24)</Text>}>
+        <Text font="body">• 在线预览：DASH 纯视频配对 audioUrl 双流（不整包同步 player skill）</Text>
+        <Text font="body">• 关闭预览页不再因 12 秒超时误报「在线预览失败」</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.2 (2026-07-24)</Text>}>
+        <Text font="body">• 运行日志改为单一 runtime.jsonl（主链里程碑 + warn/error）</Text>
+        <Text font="body">• 设置页始终可查看/清空运行日志；临时详细日志约 15 分钟</Text>
+        <Text font="body">• 不改变下载与在线预览主链逻辑</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.1 (2026-07-22)</Text>}>
+        <Text font="body">• 重构在线预览功能，使用 media-player-skill 的 HLSPlayerService</Text>
+        <Text font="body">• 移除旧的登录重试流程和下载兜底逻辑</Text>
+        <Text font="body">• 完整使用 skill 的 headers/referer/origin/baseUrl 配置</Text>
+        <Text font="body">• 诚实降级：Referer/Origin 由 WebView 上下文处理，原生 HLS 回退明确报告 customHeadersApplied: false</Text>
+      </Section>
+      <Section header={<Text>版本 1.1.0</Text>}>
+        <Text font="body">• 新增三标签页架构：记录 / 下载 / 设置</Text>
+        <Text font="body">• 新增偏好设置持久化，自动迁移旧配置</Text>
+        <Text font="body">• 新增下载历史记录管理（保留、清理、删除）</Text>
+        <Text font="body">• 新增简化版历史链接（最近 10 条）</Text>
+        <Text font="body">• 新增最小运行日志（脱敏、128 KB 滚动）</Text>
+        <Text font="body">• 新增 Assistant Tool 只读工具：读取最小运行日志</Text>
+        <Text font="body">• 修复抖音标题含 # 导致输出路径被截断的问题</Text>
+      </Section>
+      <Section header={<Text>版本 1.0.0</Text>}>
+        <Text font="body">• 初始版本：公开媒体链接下载、格式选择、登录重试、TLS 兼容、FFmpeg 合并、媒体验证</Text>
+      </Section>
+    </List>
   )
 }
 
-function AboutPage() {
+function AboutView() {
   const dismiss = Navigation.useDismiss()
-  const openUpstreamProject = async () => {
-    try {
-      await Safari.present("https://github.com/pablostanley/yoinks/tree/main", true)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      await Dialog.alert({ title: "无法打开项目页面", message })
-    }
-  }
-
   return (
-    <NavigationStack>
-      <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
-        <Section title="Yoinks">
-          <Text>Yoinks 是基于 Scripting 的公开媒体链接下载工具：先探测可用格式，再按选择下载和保存。</Text>
-          <Text font="caption" foregroundStyle="secondaryLabel">版本 {APP_VERSION}</Text>
-          <Button title="查看更新内容" systemImage="text.badge.checkmark" action={() => void Navigation.present({ element: <ReleaseNotesPage /> })} />
-        </Section>
-        <Section title="功能与特点">
-          <Text>支持格式优先选择、可用时的在线预览、音视频下载与 FFmpeg 合并，以及保存到相册或文件。</Text>
-          <Text>下载记录和本地原文件可统一管理；需要登录的平台会在探测或下载时提供登录重试。调试模式开启后可查看结构化运行日志。</Text>
-        </Section>
-        <Section title="原版兼容性">
-          <Text>Scripting 中的 Node.js 运行能力由 Swift 与 JavaScript 层模拟，并非完整的原生 Node.js 运行时。即使依赖包齐全，执行 Node 或 npm run 仍可能因 waitUntilExit 等兼容性问题无法正常运行。</Text>
-          <Text>因此当前版本保留 Yoinks 的名称与核心下载体验，未能完整复现原项目的全部能力。待 Scripting 作者进一步完善 npm 与 Node 运行支持后，脚本将继续跟进更新。</Text>
-        </Section>
-        <Section title="致谢">
-          <Button title="打开 Yoinks 开源项目" systemImage="arrow.up.right.square" action={() => void openUpstreamProject()} />
-          <Text font="caption" foregroundStyle="secondaryLabel">感谢 Pablo Stanley 与 Yoinks 开源项目提供的灵感。</Text>
-        </Section>
-      </List>
-    </NavigationStack>
+    <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <Section header={<Text>Yoinks for Scripting</Text>}>
+        <VStack alignment="leading" spacing={8} padding={{ vertical: 8 }}>
+          <Text font="headline">Yoinks</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">在 Scripting 中复刻 Yoinks 的核心下载体验</Text>
+          <HStack spacing={4}>
+            <Text font="caption" foregroundStyle="secondaryLabel">版本</Text>
+            <Text font="caption" foregroundStyle="secondaryLabel">1.1.1</Text>
+          </HStack>
+        </VStack>
+      </Section>
+      <Section header={<Text>技术说明</Text>}>
+        <VStack alignment="leading" spacing={6} padding={{ vertical: 4 }}>
+          <Text font="body" foregroundStyle="secondaryLabel">原版 Yoinks 基于 Node.js 生态（npm 依赖、完整 ffmpeg、完整 yt-dlp 等）。</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">Scripting 提供的是模拟 Node.js 运行时：</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">• 无 npm / package.json 支持</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">• 无完整 ffmpeg（仅内置 lgpl 版，无 libx264/265）</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">• Shell 执行受 waitUntilExit 兼容性限制</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">• Python 环境无法直接发现内置 ffmpeg</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">本项目保留 Yoinks 名称与核心下载体验，针对 Scripting 环境做了适配：使用 yt-dlp 独立二进制 + 内置 ffmpeg（videotoolbox 硬编），探测优先的格式选择、登录/Cookie 重试、结构化日志等均保留。</Text>
+        </VStack>
+      </Section>
+      <Section header={<Text>致谢</Text>}>
+        <VStack alignment="leading" spacing={6} padding={{ vertical: 4 }}>
+          <Text font="body" foregroundStyle="secondaryLabel">上游项目： https://github.com/pablostanley/yoinks/tree/main</Text>
+          <Text font="body" foregroundStyle="secondaryLabel">感谢 Pablo Stanley 创作原版 Yoinks。</Text>
+        </VStack>
+      </Section>
+    </List>
   )
-}
-
-function LogPage() {
-  const dismiss = Navigation.useDismiss()
-  const [filter, setFilter] = useState<LogFilter>("all")
-  const [limit, setLimit] = useState(INITIAL_LOG_EVENT_LIMIT)
-  const [loadingMore, setLoadingMore] = useState(false)
-  const [page, setPage] = useState<LogPageData>({ events: [], totalMatching: 0, totalAvailable: 0, hasMore: false, sizeBytes: 0 })
-
-  const refresh = async (nextFilter = filter, nextLimit = limit) => {
-    setPage(await readLogPage(nextFilter, 0, nextLimit))
-  }
-
-  useEffect(() => { void refresh("all", INITIAL_LOG_EVENT_LIMIT) }, [])
-
-  const loadNextEvent = async () => {
-    if (loadingMore || !page.hasMore) return
-    const nextLimit = limit + 1
-    setLoadingMore(true)
-    try {
-      setPage(await readLogPage(filter, 0, nextLimit))
-      setLimit(nextLimit)
-    } finally {
-      setLoadingMore(false)
-    }
-  }
-
-  const chooseFilter = async () => {
-    const filters: LogFilter[] = ["all", "info", "warn", "error"]
-    const selection = await Dialog.actionSheet({ title: "日志级别", actions: filters.map((value) => ({ label: LOG_FILTER_LABELS[value] })), cancelButton: true })
-    if (selection == null) return
-    const nextFilter = filters[selection]
-    setFilter(nextFilter)
-    setLimit(INITIAL_LOG_EVENT_LIMIT)
-    await refresh(nextFilter, INITIAL_LOG_EVENT_LIMIT)
-  }
-
-  const clear = async () => {
-    const confirmed = await Dialog.confirm({ title: "清空运行日志", message: "只会清空当前日志；按任务归档的历史日志将保留。", confirmLabel: "清空", cancelLabel: "取消" })
-    if (!confirmed) return
-    await clearLogs()
-    setLimit(INITIAL_LOG_EVENT_LIMIT)
-    await refresh(filter, INITIAL_LOG_EVENT_LIMIT)
-  }
-
-  const showDetail = async (event: YoinksLogEvent) => {
-    await Navigation.present({ element: <LogDetailPage event={event} /> })
-  }
-
-  return (
-    <NavigationStack>
-      <List navigationTitle="运行日志" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}> 
-        <Section title="筛选与维护">
-          <Button title={`级别：${LOG_FILTER_LABELS[filter]}`} systemImage="line.3.horizontal.decrease.circle" action={() => void chooseFilter()} />
-          <Button title="刷新日志" systemImage="arrow.clockwise" action={() => { setLimit(INITIAL_LOG_EVENT_LIMIT); void refresh(filter, INITIAL_LOG_EVENT_LIMIT) }} />
-          <Button title="清空运行日志" systemImage="trash" role="destructive" action={() => void clear()} />
-        </Section>
-        <Section title="状态">
-          <Text>当前记录：{page.totalAvailable} 条</Text>
-          <Text>筛选结果：{page.totalMatching} 条</Text>
-          <Text>文件大小：{formatLogSize(page.sizeBytes)}</Text>
-          <Text>最后写入：{formatLogTimestamp(page.lastWrittenAt)}</Text>
-        </Section>
-        <Section title="最近事件（新到旧）">
-          {page.events.map((event, index) => {
-            const style = LOG_LEVEL_STYLE[event.level]
-            return <Button key={`${event.timestamp}-${event.event}-${index}`} onAppear={index === page.events.length - 1 ? () => void loadNextEvent() : undefined} action={() => void showDetail(event)}>{
-              <HStack spacing={10}>
-                <Image systemName={style.icon} foregroundStyle={style.color as any} frame={{ width: 20 }} />
-                <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
-                  <Text font="subheadline" lineLimit={1}>{style.label.toUpperCase()} · {event.event}</Text>
-                  <Text font="caption" foregroundStyle="secondaryLabel">{formatLogTimestamp(event.timestamp)}</Text>
-                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{logSummary(event)}</Text>
-                </VStack>
-              </HStack>
-            }</Button>
-          })}
-          {!page.events.length ? <Text foregroundStyle="secondaryLabel">尚无符合条件的日志。</Text> : null}
-          {loadingMore ? <HStack><ProgressView /><Text font="caption" foregroundStyle="secondaryLabel">正在加载更早的日志</Text></HStack> : null}
-        </Section>
-      </List>
-    </NavigationStack>
-  )
-}
-
-function isHTTPURL(source: string): boolean {
-  try {
-    const url = new URL(source)
-    return url.protocol === "http:" || url.protocol === "https:"
-  } catch {
-    return false
-  }
-}
-
-function mediaSourceURL(source: string): string {
-  return isHTTPURL(source) ? source : `file://${encodeURI(source)}`
-}
-
-function safeJavaScriptString(value: string): string {
-  return JSON.stringify(value).replace(/</g, "\\u003c")
-}
-
-type PreviewPlaybackOutcome = "playing" | "media-error" | "open-failed" | "timeout"
-
-type PreviewPlaybackResult = {
-  outcome: PreviewPlaybackOutcome
-  errorCode?: number
-}
-
-const PREVIEW_PLAYBACK_TIMEOUT_MS = 12_000
-
-function playerHTML(source: string, autoplayMode: PreviewAutoplayMode, useRelativeLocalURL = false): string {
-  const mediaURL = safeJavaScriptString(
-    useRelativeLocalURL
-      ? encodeURI(source.slice(source.lastIndexOf("/") + 1))
-      : mediaSourceURL(source),
-  )
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<style>
-  html, body { width: 100%; height: 100%; margin: 0; background: #000; overflow: hidden; }
-  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-</style>
-</head>
-<body>
-<video id="player" controls autoplay playsinline></video>
-<script>
-  const player = document.getElementById("player")
-  player.muted = ${autoplayMode === "muted" ? "true" : "false"}
-   player.src = ${mediaURL}
-  const report = (event) => {
-    window.webkit.messageHandlers.mediaEvent.postMessage({
-      event,
-      currentTime: player.currentTime,
-      duration: player.duration,
-      errorCode: player.error ? player.error.code : null,
-    })
-  }
-  player.addEventListener("loadedmetadata", () => report("loadedmetadata"))
-  player.addEventListener("playing", () => report("playing"))
-  player.addEventListener("error", () => report("error"))
-  player.play().catch(() => report("play.failed"))
-</script>
-</body>
-</html>`
-}
-
-async function presentHTML5Player(source: string, title: string, autoplayMode: PreviewAutoplayMode, session?: GenericPreviewSession): Promise<PreviewPlaybackResult> {
-  const webView = session?.webView || new WebViewController({ ephemeral: true })
-  const ownsWebView = !session
-  const isRemote = isHTTPURL(source)
-  if (!isRemote && !source.startsWith("/")) return { outcome: "open-failed" }
-  const localDirectory = source.slice(0, source.lastIndexOf("/"))
-  const localPagePath = `${source}.yoinks-player.html`
-  let resolveOutcome: ((result: PreviewPlaybackResult) => void) | null = null
-  let settled = false
-  const settle = (result: PreviewPlaybackResult) => {
-    if (settled) return
-    settled = true
-    if (result.outcome !== "playing") webView.dismiss()
-    resolveOutcome?.(result)
-  }
-  try {
-    const outcome = new Promise<PreviewPlaybackResult>((resolve) => { resolveOutcome = resolve })
-    await webView.addScriptMessageHandler("mediaEvent", (details: Record<string, unknown> = {}) => {
-      const event = typeof details.event === "string" ? details.event : "unknown"
-      const errorCode = typeof details.errorCode === "number" ? details.errorCode : undefined
-      void logEvent({ level: event === "error" || event === "play.failed" ? "warn" : "info", event: "preview.player.event", details: { event, errorCode, title, isRemote, retry: !ownsWebView } })
-      if (event === "playing") settle({ outcome: "playing" })
-      if (event === "error") settle({ outcome: "media-error", errorCode })
-      return true
-    })
-    const loaded = isRemote
-      ? await webView.loadHTML(playerHTML(source, autoplayMode), source)
-      : await (async () => {
-          await FileManager.writeAsString(localPagePath, playerHTML(source, autoplayMode, true))
-          return webView.loadFile(localPagePath, localDirectory)
-        })()
-    if (!loaded) return { outcome: "open-failed" }
-    await logEvent({ level: "info", event: "preview.player.opened", details: { title, isRemote, retry: !ownsWebView } })
-    void webView.present({ fullscreen: true, navigationTitle: "播放" })
-      .catch(() => settle({ outcome: "open-failed" }))
-      .finally(async () => {
-        webView.dispose()
-        if (!isRemote && await FileManager.exists(localPagePath)) await FileManager.remove(localPagePath)
-      })
-    const timeout = new Promise<PreviewPlaybackResult>((resolve) => setTimeout(() => resolve({ outcome: "timeout" }), PREVIEW_PLAYBACK_TIMEOUT_MS))
-    const result = await Promise.race([outcome, timeout])
-    if (result.outcome !== "playing") settle(result)
-    return result
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    await logEvent({ level: "error", event: "preview.player.failed", details: { title, message, isRemote, retry: !ownsWebView } })
-    if (ownsWebView) webView.dispose()
-    if (!isRemote && await FileManager.exists(localPagePath)) await FileManager.remove(localPagePath)
-    return { outcome: "open-failed" }
-  }
 }
 
 function View() {
@@ -511,12 +300,11 @@ function View() {
   const [status, setStatus] = useState("粘贴一个公开媒体链接，然后选择输出格式。")
   const [result, setResult] = useState<DownloadResult | null>(null)
   const [completedSaveMode, setCompletedSaveMode] = useState<SaveMode | null>(null)
-  const [latestLog, setLatestLog] = useState("")
   const [history, setHistory] = useState<DownloadHistoryRecord[]>([])
   const [historyAvailability, setHistoryAvailability] = useState<Record<string, boolean>>({})
   const [historySummary, setHistorySummary] = useState<HistoryStorageSummary>({ totalRecords: 0, availableCount: 0, managedBytes: 0 })
   const [recentLinks, setRecentLinks] = useState<RecentLinkRecord[]>(() => listRecentLinks())
-  const [debugMode, setDebugModeState] = useState(() => isDebugModeEnabled())
+  const [verboseLog, setVerboseLogState] = useState(() => isVerboseLogEnabled())
   const [enteringURL, setEnteringURL] = useState(false)
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
@@ -525,6 +313,18 @@ function View() {
   const closingRef = useRef(false)
   const analysisGenerationRef = useRef(0)
   const launchClipboardSuppressedRef = useRef(false)
+  const previewPlayerRef = useRef<HLSPlayerService | null>(null)
+  /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
+  const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
+
+  const applyProgressUi = (p: DownloadProgress, force = false) => {
+    const pct = Math.round((p.fraction || 0) * 100)
+    const key = `${p.stage}|${pct}|${Math.floor((p.downloadedBytes || 0) / 100_000)}`
+    const now = Date.now()
+    if (!force && key === progressUiRef.current.lastKey && now - progressUiRef.current.lastAt < 450) return
+    progressUiRef.current = { lastAt: now, lastKey: key }
+    setProgress(p)
+  }
 
   const updateSaveMode = (next: SaveMode) => {
     const nextPreferences = setPreferences({ ...preferences, defaultSaveMode: next })
@@ -573,13 +373,10 @@ function View() {
     }
     try {
       await addHistoryRecord(record)
-      if (preferences.retainOriginalFiles) {
-        const pruned = await pruneHistoryStorage(preferences)
-        if (pruned.failedPaths.length) {
-          await logEvent({ level: "warn", event: "history.prune.partial", taskId: downloaded.taskId, details: { failedPaths: pruned.failedPaths, managedBytes: pruned.managedBytes, totalRecords: pruned.totalRecords } })
-        }
-      } else {
-        await removeHistoryManagedFile(record)
+      if (!preferences.retainOriginalFiles) await removeHistoryManagedFile(record)
+      const pruned = await pruneHistoryStorage(preferences)
+      if (pruned.failedPaths.length) {
+        await logEvent({ level: "warn", event: "history.prune.partial", taskId: downloaded.taskId, details: { failedPaths: pruned.failedPaths, managedBytes: pruned.managedBytes, totalRecords: pruned.totalRecords } })
       }
       await refreshHistory()
       return await isHistoryFileAvailable(record)
@@ -590,11 +387,10 @@ function View() {
     }
   }
 
-  const changeDebugMode = (enabled: boolean) => {
+  const changeVerboseLog = (enabled: boolean) => {
     void (async () => {
-      await setDebugModeEnabled(enabled)
-      setDebugModeState(enabled)
-      if (enabled) await logEvent({ level: "info", event: "debug-mode.enabled" })
+      await setVerboseLogEnabled(enabled)
+      setVerboseLogState(isVerboseLogEnabled())
     })()
   }
 
@@ -630,6 +426,16 @@ function View() {
     return () => {
       for (const session of Object.values(platformSessionsRef.current)) {
         if (session?.retention === "temporary") disposePlatformSession(session)
+      }
+    }
+  }, [])
+
+  // Cleanup preview player on unmount
+  useEffect(() => {
+    return () => {
+      if (previewPlayerRef.current) {
+        void previewPlayerRef.current.destroy()
+        previewPlayerRef.current = null
       }
     }
   }, [])
@@ -679,88 +485,187 @@ function View() {
       if (session) cookieFile = await createTaskCookieFile(session)
       return await probeMedia(sourceURL, { cookieFile: cookieFile || undefined, authorizedPlatform: session?.platform })
     } finally {
-      await removeTaskCookieFile(cookieFile)
+      if (cookieFile) await FileManager.remove(cookieFile).catch(() => {})
     }
   }
 
-  const downloadWithPlatformSession = async (sourceURL: string, choice: MediaChoice, platform: AuthPlatform | null, insecureTLS: boolean, session: PlatformAuthSession | null): Promise<DownloadResult> => {
-    let cookieFile: string | null = null
+  const analyzeMedia = async (nextURL?: string) => {
+    const gen = ++analysisGenerationRef.current
+    const sourceURL = extractFirstURL(nextURL || url)
+    if (!sourceURL) {
+      setStatus("请先粘贴或输入有效的公开链接。")
+      return
+    }
+    if (analyzing) return
+    setAnalyzing(true)
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    setProgress({ fraction: 0.02, stage: "正在解析媒体" })
+    const platform = detectMediaPlatform(sourceURL)
+    setStatus(platform === "douyin" ? "正在通过匿名 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
+
     try {
-      if (session) cookieFile = await createTaskCookieFile(session)
-      return await downloadMedia({
-        url: sourceURL,
-        choice,
-        concurrentFragments,
-        insecureTLS,
-        cookieFile: cookieFile || undefined,
-        authorizedPlatform: platform || undefined,
-        onProgress: (value) => {
-          setProgress(value)
-          setStatus(value.stage)
-        },
-        onCancelPath: setCancelPath,
-      })
+      // 抖音：全程匿名 WebView，不挂登录会话 / 不弹登录
+      let session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      let probeResult: MediaProbe
+      try {
+        probeResult = await probeWithPlatformSession(sourceURL, session)
+      } catch (firstError) {
+        if (gen !== analysisGenerationRef.current) return
+        const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
+        // 仅小红书等仍走 Cookie 登录重探；抖音永不进入登录分支
+        if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+          await logEvent({
+            level: "warn",
+            event: "probe.login-required",
+            details: { sourceURL, platform, message: firstMessage },
+          })
+          setStatus(`${authPlatformLabel(platform)}需要登录后才能继续探测。`)
+          const loggedIn = await loginForPlatform(platform)
+          if (gen !== analysisGenerationRef.current) return
+          if (!loggedIn) {
+            setProbe(null)
+            await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message: firstMessage, loginCancelled: true } })
+            setStatus(`探测失败：${firstMessage}`)
+            return
+          }
+          session = loggedIn
+          setStatus("登录完成，正在重新探测……")
+          probeResult = await probeWithPlatformSession(sourceURL, session)
+        } else {
+          throw firstError
+        }
+      }
+      if (gen !== analysisGenerationRef.current) return
+      setProbe(probeResult)
+      if (platform === "douyin" && probeResult.choices.length === 1) {
+        setSelectedChoice(probeResult.choices[0])
+      }
+      setStatus(
+        platform === "douyin"
+          ? `抖音解析完成：${probeResult.choices[0]?.label || "已生成候选"}`
+          : `探测完成：${probeResult.choices.length} 种可用格式，${probeResult.choices.length} 个格式条目。`
+      )
+      await logEvent({ level: "info", event: "probe.completed", taskId: sourceURL, details: { title: probeResult.title, choiceCount: probeResult.choices.length, formatCount: probeResult.choices.reduce((sum, c) => sum + (c.formatExpression ? 1 : 0), 0) } })
+    } catch (error) {
+      if (gen !== analysisGenerationRef.current) return
+      const message = error instanceof Error ? error.message : String(error)
+      setProbe(null)
+      await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message } })
+      setStatus(`探测失败：${message}`)
     } finally {
-      await removeTaskCookieFile(cookieFile)
+      if (gen === analysisGenerationRef.current) setAnalyzing(false)
     }
   }
 
-  const clearPlatformAuth = async () => {
-    const sessions = loggedInSessions
-    if (!sessions.length) return
-    let session = sessions[0]
-    if (sessions.length > 1) {
-      const choice = await Dialog.actionSheet({
-        title: "选择要清除的登录状态",
-        actions: sessions.map((item) => ({ label: item.accountLabel, role: "destructive" as const })),
-        cancelButton: true,
-      })
-      if (choice == null) return
-      session = sessions[choice]
-    }
-    const confirmed = await Dialog.confirm({
-      title: "清除登录状态",
-      message: `将清除 ${session.accountLabel} 的 Yoinks 登录状态。`,
-      confirmLabel: "清除",
-      cancelLabel: "取消",
-    })
+  const chooseFormat = async () => {
+    if (!probe) return
+    const actions = probe.choices.map((choice) => ({ label: choice.label }))
+    const choice = await Dialog.actionSheet({ title: probe.title, message: `共 ${probe.choices.length} 个格式条目`, actions, cancelButton: true })
+    if (choice == null) return
+    selectMediaChoice(probe.choices[choice])
+  }
+
+  const chooseSaveMode = async () => {
+    const actions = (["ask", "photos", "files"] as SaveMode[]).map((mode) => ({ label: SAVE_LABELS[mode] }))
+    const choice = await Dialog.actionSheet({ title: "默认保存方式", actions, cancelButton: true })
+    if (choice == null) return
+    updateSaveMode((Object.keys(SAVE_LABELS) as SaveMode[])[choice])
+  }
+
+  const chooseConcurrency = async () => {
+    const actions = ([1, 2, 4, 8] as const).map((c) => ({ label: CONCURRENCY_LABELS[c as ConcurrentDownloads] }))
+    const choice = await Dialog.actionSheet({ title: "下载并发线程数", actions, cancelButton: true })
+    if (choice == null) return
+    const next = ([1, 2, 4, 8] as ConcurrentDownloads[])[choice]
+    setConcurrentFragments(next)
+    updatePreferences({ ...preferences, concurrentFragments: next })
+  }
+
+  const choosePreviewAutoplayMode = async () => {
+    const actions = (["muted", "audible"] as PreviewAutoplayMode[]).map((m) => ({ label: PREVIEW_AUTOPLAY_LABELS[m] }))
+    const choice = await Dialog.actionSheet({ title: "在线预览自动播放模式", actions, cancelButton: true })
+    if (choice == null) return
+    const next = (["muted", "audible"] as PreviewAutoplayMode[])[choice]
+    updatePreferences({ ...preferences, previewAutoplayMode: next })
+  }
+
+  const chooseAutomaticDownloadFormat = async () => {
+    const actions = (["recommended", "highest-video", "highest-audio", "preferred-container"] as AutomaticDownloadFormatStrategy[]).map((s) => ({ label: AUTOMATIC_DOWNLOAD_FORMAT_LABELS[s] }))
+    const choice = await Dialog.actionSheet({ title: "自动下载格式策略", actions, cancelButton: true })
+    if (choice == null) return
+    const next = (["recommended", "highest-video", "highest-audio", "preferred-container"] as AutomaticDownloadFormatStrategy[])[choice]
+    updatePreferences({ ...preferences, automaticDownloadFormatStrategy: next })
+  }
+
+  const choosePreferredContainer = async () => {
+    const actions = (["mp4", "mkv", "avi", "wmv"] as PreferredContainer[]).map((c) => ({ label: PREFERRED_CONTAINER_LABELS[c] }))
+    const choice = await Dialog.actionSheet({ title: "指定视频容器格式", actions, cancelButton: true })
+    if (choice == null) return
+    const next = (["mp4", "mkv", "avi", "wmv"] as PreferredContainer[])[choice]
+    updatePreferences({ ...preferences, preferredContainer: next })
+  }
+
+  const chooseManagedBytes = async () => {
+    const actions = [
+      { label: "不限" },
+      { label: "512 MB" },
+      { label: "1 GB" },
+      { label: "2 GB（默认）" },
+      { label: "5 GB" },
+    ]
+    const choice = await Dialog.actionSheet({ title: "本地原文件存储上限", actions, cancelButton: true })
+    if (choice == null) return
+    const bytes = choice === 0 ? null : choice === 1 ? 512 * 1024 * 1024 : choice === 2 ? 1024 * 1024 * 1024 : choice === 3 ? 2 * 1024 * 1024 * 1024 : 5 * 1024 * 1024 * 1024
+    updatePreferences({ ...preferences, maxManagedBytes: bytes })
+  }
+
+  const chooseHistoryLimit = async () => {
+    const actions = [
+      { label: "不限" },
+      { label: "50 条" },
+      { label: "100 条（默认）" },
+      { label: "200 条" },
+      { label: "500 条" },
+    ]
+    const choice = await Dialog.actionSheet({ title: "下载记录数量上限", actions, cancelButton: true })
+    if (choice == null) return
+    const records = choice === 0 ? null : choice === 1 ? 50 : choice === 2 ? 100 : choice === 3 ? 200 : 500
+    updatePreferences({ ...preferences, maxHistoryRecords: records })
+  }
+
+  const install = async () => {
+    const name = "yt-dlp"
+    const detail = `将下载并安装 ${name}（约 15 MB）。安装后即可开始下载。`
+    const confirmed = await Dialog.confirm({ title: `安装 ${name}`, message: detail, confirmLabel: "安装", cancelLabel: "取消" })
     if (!confirmed) return
-    const removed = await clearPlatformLogin(session.platform)
-    disposePlatformSession(platformSessionsRef.current[session.platform])
-    updatePlatformSessions((current) => {
-      const next = { ...current }
-      delete next[session.platform]
-      return next
-    })
-    await logEvent({ level: "info", event: "platform-auth.cleared", details: { platform: session.platform, cookieCount: removed } })
-    setStatus("登录状态已清除。")
+    setInstalling(true)
+    setStatus(`正在安装 ${name}...`)
+    try {
+      const version = await installYtDlp()
+      setStatus(`${name} ${version} 已安装。`)
+      await refreshTools()
+    } catch (error) {
+      setStatus(`安装失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setInstalling(false)
+    }
   }
 
-
-  const showLogs = async () => {
-    await Navigation.present({ element: <LogPage /> })
-  }
-
-  const copyLogs = async () => {
-    const text = latestLog || await readLatestLog()
-    await Pasteboard.setString(text)
-    setStatus("最近日志已复制到剪贴板。")
-  }
-
-  const openLogFolder = async () => {
-    await QuickLook.previewURLs([getLogDirectory()], true)
-  }
-
-  const clearCurrentLink = () => {
+  const clearCurrentLink = (preserveResult = false) => {
     launchClipboardSuppressedRef.current = true
     analysisGenerationRef.current += 1
     disposeTemporarySession()
     setURL("")
     setProbe(null)
     setSelectedChoice(null)
-    setResult(null)
-    setCompletedSaveMode(null)
-    setStatus("当前链接已清除。")
+    if (!preserveResult) {
+      setResult(null)
+      setCompletedSaveMode(null)
+    }
+    setStatus(preserveResult ? "下载完成，当前链接已清除。" : "当前链接已清除。")
   }
 
   const closeYoinks = () => {
@@ -792,512 +697,14 @@ function View() {
       setStatus("尚无历史链接。")
       return
     }
-    const choice = await Dialog.actionSheet({
-      title: "历史链接",
-      message: "保留最近 10 条使用过的链接。",
-      actions: recentLinks.map((record) => ({ label: record.url })),
-      cancelButton: true,
-    })
-    if (choice == null) {
-      await logEvent({ level: "info", event: "recent-link.cancelled" })
-      return
-    }
-    const record = recentLinks[choice]
-    if (!record) {
-      await logEvent({ level: "warn", event: "recent-link.invalid-selection", details: { choice, available: recentLinks.length } })
-      return
-    }
-    await useRecentLink(record)
-  }
-
-  const rememberLink = (sourceURL: string) => {
-    setRecentLinks(rememberRecentLink(sourceURL))
-  }
-
-  const finishSuccessfulDownload = (sourceURL: string) => {
-    rememberLink(sourceURL)
-    clearCurrentLink()
-    setStatus("下载完成，当前链接已清除。")
-  }
-
-  const pasteURL = async () => {
-    await logEvent({ level: "info", event: "paste.requested" })
-    try {
-      if (!(await Pasteboard.hasStrings)) {
-        await logEvent({ level: "warn", event: "paste.empty" })
-        setStatus("剪贴板中没有文本链接。")
-        return
-      }
-      const next = extractFirstURL(await Pasteboard.getString())
-      if (!next) {
-        await logEvent({ level: "warn", event: "paste.invalid" })
-        setStatus("剪贴板中没有有效的公开 http 或 https 链接。")
-        return
-      }
-      launchClipboardSuppressedRef.current = false
-      analysisGenerationRef.current += 1
-      await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
-      rememberLink(next)
-      disposeTemporarySession()
-      setURL(next)
-      setProbe(null)
-      setSelectedChoice(null)
-      setResult(null)
-      setStatus("链接已粘贴，正在自动分析。")
-      await analyzeMedia(next)
-    } catch (error) {
-      await logEvent({ level: "error", event: "paste.failed", details: { message: error instanceof Error ? error.message : String(error) } })
-      setStatus("无法读取剪贴板。请在 设置 > Scripting > Paste from Other Apps 中允许访问。")
-    }
-  }
-
-  const checkLaunchClipboard = async () => {
-    if (launchClipboardCheckedRef.current || analyzing || downloading || url) return
-    launchClipboardCheckedRef.current = true
-    await logEvent({ level: "info", event: "clipboard-launch.checked" })
-    try {
-      if (!(await Pasteboard.hasStrings)) {
-        await logEvent({ level: "info", event: "clipboard-launch.empty" })
-        return
-      }
-      const next = extractFirstURL(await Pasteboard.getString())
-      if (!next) {
-        await logEvent({ level: "info", event: "clipboard-launch.invalid" })
-        return
-      }
-      if (launchClipboardSuppressedRef.current) {
-        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { sourceURL: next, reason: "cleared-during-launch-check" } })
-        return
-      }
-      if (consumeSkippedClipboardURL(next)) {
-        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { sourceURL: next, reason: "closed-with-current-link" } })
-        setStatus("已跳过上次关闭时的链接。")
-        return
-      }
-      launchClipboardSuppressedRef.current = false
-      analysisGenerationRef.current += 1
-      await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
-      rememberLink(next)
-      disposeTemporarySession()
-      setURL(next)
-      setProbe(null)
-      setSelectedChoice(null)
-      setResult(null)
-      setStatus("已检测到剪贴板链接，正在自动分析。")
-      await analyzeMedia(next, { automaticDownload: true })
-    } catch (error) {
-      await logEvent({ level: "warn", event: "auto-download.skipped", details: { reason: "clipboard-unavailable", message: error instanceof Error ? error.message : String(error) } })
-    }
-  }
-
-  useEffect(() => {
-    void checkLaunchClipboard()
-  }, [])
-
-  const enterURL = async () => {
-    if (enteringURL) return
-    setEnteringURL(true)
-    await logEvent({ level: "info", event: "manual-url.requested" })
-    try {
-      const raw = await Dialog.prompt({
-        title: "媒体链接",
-        message: "支持公开的 http 或 https 页面链接。",
-        placeholder: "https://...",
-        confirmLabel: "使用链接",
-        cancelLabel: "取消",
-        selectAll: true,
-      })
-      if (raw == null) {
-        await logEvent({ level: "info", event: "manual-url.cancelled" })
-        return
-      }
-      const next = extractFirstURL(raw)
-      if (!next) {
-        await logEvent({ level: "warn", event: "manual-url.invalid" })
-        setStatus("请输入有效的公开 http 或 https 链接。")
-        return
-      }
-      launchClipboardSuppressedRef.current = false
-      analysisGenerationRef.current += 1
-      await logEvent({ level: "info", event: "manual-url.accepted", details: { sourceURL: next, platform: detectMediaPlatform(next) } })
-      rememberLink(next)
-      disposeTemporarySession()
-      setURL(next)
-      setProbe(null)
-      setSelectedChoice(null)
-      setResult(null)
-      setStatus("媒体链接已设置，正在自动分析。")
-      await analyzeMedia(next)
-    } finally {
-      setEnteringURL(false)
-    }
-  }
-
-  const analyzeMedia = async (source?: string, options: { automaticDownload?: boolean } = {}) => {
-    if (analyzing || downloading || closingRef.current) return
-    const generation = analysisGenerationRef.current
-    const isCurrentAnalysis = () => !closingRef.current && generation === analysisGenerationRef.current
-    const validURL = extractFirstURL(source || url)
-    if (!validURL) {
-      setStatus("请先粘贴或输入有效的公开链接。")
-      return
-    }
-    let availableTools = tools
-    if (!availableTools?.ytDlpVersion) {
-      setStatus("正在检查下载引擎。")
-      try {
-        availableTools = await getToolStatus()
-        if (!isCurrentAnalysis()) return
-        setTools(availableTools)
-      } catch (error) {
-        setStatus(`工具检测失败：${error instanceof Error ? error.message : String(error)}`)
-        return
-      }
-    }
-    if (!availableTools.ytDlpVersion) {
-      setStatus("请先安装 yt-dlp。")
-      return
-    }
-    if (!isCurrentAnalysis()) return
-    setAnalyzing(true)
-    setProbe(null)
-    setSelectedChoice(null)
-    setStatus("正在分析媒体和可用格式。")
-    try {
-      const platform = detectMediaPlatform(validURL)
-      const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
-      const nextProbe = await probeWithPlatformSession(validURL, session)
-      if (!isCurrentAnalysis()) return
-      const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
-      setProbe(nextProbe)
-      selectMediaChoice(resolved.choice)
-      setStatus(`已找到 ${nextProbe.choices.length} 个可下载格式。`)
-      if (options.automaticDownload && preferences.automaticDownloadEnabled && resolved.choice) {
-        await logEvent({ level: "info", event: "auto-download.selected", details: { strategy: preferences.automaticDownloadFormatStrategy, preferredContainer: preferences.preferredContainer, choiceId: resolved.choice.id, usedFallback: resolved.usedFallback } })
-        await startDownload(false, { sourceURL: validURL, choice: resolved.choice, probeTitle: nextProbe.title, toolStatus: availableTools })
-      } else if (options.automaticDownload) {
-        await logEvent({ level: "info", event: "auto-download.skipped", details: { reason: preferences.automaticDownloadEnabled ? "no-choice" : "disabled" } })
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const platform = detectMediaPlatform(validURL)
-      if (isAuthPlatform(platform) && isFreshCookieError(message)) {
-        try {
-          const session = await loginForPlatform(platform)
-          if (session) {
-            setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新分析。`)
-            const nextProbe = await probeWithPlatformSession(validURL, session)
-            if (!isCurrentAnalysis()) return
-            const resolved = resolveAutomaticChoice(nextProbe.choices, options.automaticDownload ? preferences.automaticDownloadFormatStrategy : "recommended", preferences.preferredContainer)
-            setProbe(nextProbe)
-            selectMediaChoice(resolved.choice)
-            setStatus(`已找到 ${nextProbe.choices.length} 个可下载格式。`)
-            if (options.automaticDownload && preferences.automaticDownloadEnabled && resolved.choice) {
-              await logEvent({ level: "info", event: "auto-download.selected", details: { strategy: preferences.automaticDownloadFormatStrategy, preferredContainer: preferences.preferredContainer, choiceId: resolved.choice.id, usedFallback: resolved.usedFallback } })
-              await startDownload(false, { sourceURL: validURL, choice: resolved.choice, probeTitle: nextProbe.title, toolStatus: availableTools })
-            } else if (options.automaticDownload) {
-              await logEvent({ level: "info", event: "auto-download.skipped", details: { reason: preferences.automaticDownloadEnabled ? "no-choice" : "disabled" } })
-            }
-            return
-          }
-        } catch (loginError) {
-          const loginMessage = loginError instanceof Error ? loginError.message : String(loginError)
-          await logEvent({ level: "error", event: "platform-auth.login.failed", details: { platform, message: loginMessage } })
-          setStatus(loginMessage)
-          await Dialog.alert({ title: `${authPlatformLabel(platform)}登录未完成`, message: loginMessage })
-          return
-        }
-      }
-      await logEvent({ level: "error", event: "probe.failed", details: { sourceURL: validURL, message } })
-      setStatus(message)
-      setLatestLog(await readLatestLog())
-      await Dialog.alert({ title: "媒体分析失败", message: `${message}\n\n诊断日志已写入：${getLogDirectory()}` })
-    } finally {
-      setAnalyzing(false)
-    }
-  }
-
-  const chooseFormat = async () => {
-    if (!probe?.choices.length) {
-      setStatus("请先分析链接。")
-      return
-    }
-    const choice = await Dialog.actionSheet({
-      title: "可直接下载格式",
-      message: probe.title,
-      actions: probe.choices.map((item) => ({ label: item.label })),
-      cancelButton: true,
-    })
-    if (choice != null) {
-      const nextChoice = probe.choices[choice]
-      selectMediaChoice(nextChoice)
-    }
-  }
-
-  const chooseSaveMode = async () => {
-    const values: SaveMode[] = selectedChoice?.kind === "audio" ? ["ask", "files"] : ["ask", "photos", "files"]
-    const choice = await Dialog.actionSheet({
-      title: "下载完成后",
-      actions: values.map((value) => ({ label: SAVE_LABELS[value] })),
-      cancelButton: true,
-    })
-    if (choice != null) updateSaveMode(values[choice])
-  }
-
-  const choosePreviewAutoplayMode = async () => {
-    const values: PreviewAutoplayMode[] = ["muted", "audible"]
-    const choice = await Dialog.actionSheet({
-      title: "在线预览自动播放",
-      message: "有声自动播放可能被 iOS 拦截；被拦截时可使用播放器控制条手动播放。",
-      actions: values.map((value) => ({ label: PREVIEW_AUTOPLAY_LABELS[value] })),
-      cancelButton: true,
-    })
-    if (choice != null) updatePreferences({ ...preferences, previewAutoplayMode: values[choice] })
-  }
-
-  const chooseAutomaticDownloadFormat = async () => {
-    const values: AutomaticDownloadFormatStrategy[] = ["recommended", "highest-video", "highest-audio", "preferred-container"]
-    const choice = await Dialog.actionSheet({
-      title: "自动下载格式",
-      message: "指定视频格式只匹配来源原本提供的直出格式；未匹配时使用推荐格式。",
-      actions: values.map((value) => ({ label: AUTOMATIC_DOWNLOAD_FORMAT_LABELS[value] })),
-      cancelButton: true,
-    })
-    if (choice != null) updatePreferences({ ...preferences, automaticDownloadFormatStrategy: values[choice] })
-  }
-
-  const choosePreferredContainer = async () => {
-    const values: PreferredContainer[] = ["mp4", "mkv", "avi", "wmv"]
-    const choice = await Dialog.actionSheet({
-      title: "指定视频格式",
-      message: "仅选择来源直接提供且包含音频的视频格式；不存在时使用推荐格式。",
-      actions: values.map((value) => ({ label: PREFERRED_CONTAINER_LABELS[value] })),
-      cancelButton: true,
-    })
-    if (choice != null) updatePreferences({ ...preferences, preferredContainer: values[choice] })
-  }
-
-  const chooseConcurrency = async () => {
-    const values: ConcurrentDownloads[] = [1, 2, 4, 8]
-    const choice = await Dialog.actionSheet({
-      title: "下载并发",
-      message: "仅对支持分片的来源生效；单文件格式会保持单连接。",
-      actions: values.map((value) => ({ label: CONCURRENCY_LABELS[value] })),
-      cancelButton: true,
-    })
-    if (choice != null) {
-      const next = values[choice]
-      updatePreferences({ ...preferences, concurrentFragments: next })
-    }
-  }
-
-  const install = async () => {
-    const name = "yt-dlp"
-    const detail = "将执行 python3 -m pip install --upgrade yt-dlp。"
-    const confirmed = await Dialog.confirm({ title: `安装 ${name}`, message: detail, confirmLabel: "安装", cancelLabel: "取消" })
-    if (!confirmed) return
-    setInstalling(true)
-    setStatus(`正在安装 ${name}...`)
-    try {
-      const version = await installYtDlp()
-      setStatus(`${name} ${version} 已安装。`)
-      await refreshTools()
-    } catch (error) {
-      setStatus(`安装失败：${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      setInstalling(false)
-    }
-  }
-
-  const previewSelectedChoice = async () => {
-    if (!selectedChoice?.previewURL || !probe) {
-      setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
-      return
-    }
-    const showFallback = async (outcome: PreviewPlaybackOutcome, retry: boolean) => {
-      await logEvent({ level: "warn", event: "preview.fallback-download", details: { outcome, retry } })
-      setStatus("临时媒体链接无法稳定在线播放，请下载完后播放")
-      await Dialog.alert({ title: "在线预览失败", message: "临时媒体链接无法稳定在线播放，请下载完后播放" })
-    }
-    const firstResult = await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode)
-    if (firstResult.outcome === "playing") return
-    const sourceURL = extractFirstURL(url) || probe.webpageURL
-    if (!isHTTPURL(selectedChoice.previewURL) || !sourceURL) {
-      await showFallback(firstResult.outcome, false)
-      return
-    }
-    const hostname = (() => {
-      try { return new URL(sourceURL).hostname } catch { return "" }
-    })()
-    if (!hostname) {
-      await showFallback(firstResult.outcome, false)
-      return
-    }
-    const confirmed = await Dialog.confirm({
-      title: "登录后进行预览",
-      message: `在线播放失败，可能需要登录 ${hostname} 后才能访问媒体。是否前往登录？`,
-      confirmLabel: "前往登录",
-      cancelLabel: "取消",
-    })
-    if (!confirmed) {
-      await showFallback(firstResult.outcome, false)
-      return
-    }
-    let session: GenericPreviewSession | null = null
-    try {
-      await logEvent({ level: "info", event: "preview.login-requested", details: { hostname } })
-      session = await beginGenericPreviewLogin(sourceURL)
-      if (!session) {
-        await showFallback(firstResult.outcome, false)
-        return
-      }
-      setStatus("已获取临时登录状态，正在重新尝试预览。")
-      const retryResult = await presentHTML5Player(selectedChoice.previewURL, probe.title, preferences.previewAutoplayMode, session)
-      if (retryResult.outcome === "playing") {
-        session = null
-        await logEvent({ level: "info", event: "preview.retry-after-login.playing", details: { hostname } })
-        return
-      }
-      await logEvent({ level: "warn", event: "preview.retry-after-login.failed", details: { hostname, outcome: retryResult.outcome, errorCode: retryResult.errorCode } })
-      await showFallback(retryResult.outcome, true)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      await logEvent({ level: "warn", event: "preview.login.failed", details: { hostname, message } })
-      await showFallback(firstResult.outcome, false)
-    } finally {
-      disposeGenericPreviewSession(session)
-    }
-  }
-
-  const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
-    const availableTools = automatic?.toolStatus || tools
-    if (!availableTools?.ytDlpVersion) {
-      setStatus("请先安装 yt-dlp。")
-      return
-    }
-    const validURL = extractFirstURL(automatic?.sourceURL || url)
-    if (!validURL) {
-      setStatus("请先粘贴或输入有效的公开链接。")
-      return
-    }
-
-    const downloadChoice = automatic?.choice || selectedChoice
-    if (!downloadChoice) {
-      setStatus("请先分析链接并选择实际可用格式。")
-      return
-    }
-
-    setDownloading(true)
-    setCancelPath(null)
-    setResult(null)
-    setCompletedSaveMode(null)
-    setProgress({ fraction: 0.02, stage: "正在解析媒体" })
-    setStatus("yt-dlp 正在准备下载。")
-
-    try {
-      const platform = detectMediaPlatform(validURL)
-      const session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
-      const downloaded = await downloadWithPlatformSession(validURL, downloadChoice, isAuthPlatform(platform) ? platform : null, insecureTLS, session)
-      const effectiveSaveMode: SaveMode = downloaded.choice.kind === "audio" && saveMode === "photos" ? "files" : saveMode
-      if (effectiveSaveMode !== saveMode) updateSaveMode(effectiveSaveMode)
-      const saveStatus = await saveResult(downloaded.filePath, downloaded.fileName, effectiveSaveMode, downloaded.taskId)
-      setResult(downloaded)
-      setStatus(saveStatus)
-      if (effectiveSaveMode !== "ask") setCompletedSaveMode(effectiveSaveMode)
-      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, automatic?.probeTitle || probe?.title || downloaded.fileName)
-      if (!sourceFileAvailable) {
-        setResult(null)
-        setCompletedSaveMode(null)
-      }
-      finishSuccessfulDownload(validURL)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const logs = await readLatestLog()
-      setLatestLog(logs)
-      setStatus(message)
-      const platform = detectMediaPlatform(validURL)
-      if (isAuthPlatform(platform) && isFreshCookieError(message)) {
-        try {
-          const session = await loginForPlatform(platform)
-          if (session) {
-            setStatus(`正在使用${authPlatformLabel(platform)}登录状态重新下载。`)
-            const downloaded = await downloadWithPlatformSession(validURL, downloadChoice, platform, insecureTLS, session)
-            const effectiveSaveMode: SaveMode = downloaded.choice.kind === "audio" && saveMode === "photos" ? "files" : saveMode
-            if (effectiveSaveMode !== saveMode) updateSaveMode(effectiveSaveMode)
-            const saveStatus = await saveResult(downloaded.filePath, downloaded.fileName, effectiveSaveMode, downloaded.taskId)
-            setResult(downloaded)
-            setStatus(saveStatus)
-            if (effectiveSaveMode !== "ask") setCompletedSaveMode(effectiveSaveMode)
-      const sourceFileAvailable = await recordCompletedDownload(downloaded, effectiveSaveMode, automatic?.probeTitle || probe?.title || downloaded.fileName)
-      if (!sourceFileAvailable) {
-        setResult(null)
-        setCompletedSaveMode(null)
-      }
-            finishSuccessfulDownload(validURL)
-            return
-          }
-        } catch (loginError) {
-          const loginMessage = loginError instanceof Error ? loginError.message : String(loginError)
-          await logEvent({ level: "error", event: "platform-auth.download-login.failed", details: { platform, message: loginMessage } })
-          setStatus(loginMessage)
-          await Dialog.alert({ title: `${authPlatformLabel(platform)}登录未完成`, message: loginMessage })
-          return
-        }
-      }
-      if (!retriedTransientAccess && isTransientAccessError(message)) {
-        await logEvent({ level: "warn", event: "download.access.retry", details: { sourceURL: validURL, reason: "transient-access-error" } })
-        setStatus("来源暂时拒绝访问，正在重试下载。")
-        await startDownload(insecureTLS, automatic, true)
-        return
-      }
-      if (!insecureTLS && isCertificateError(message)) {
-        const retry = await Dialog.confirm({
-          title: "证书校验失败",
-          message: "当前网络返回了未受信任的 TLS 证书。兼容模式会仅对本次下载跳过证书校验。请只在你信任当前网络时继续。",
-          confirmLabel: "继续下载",
-          cancelLabel: "取消",
-        })
-        if (retry) {
-          setStatus("正在以证书兼容模式重试。")
-          await startDownload(true, automatic, retriedTransientAccess)
-          return
-        }
-      }
-      if (message !== "下载已取消") await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
-    } finally {
-      const platform = detectMediaPlatform(validURL)
-      if (isAuthPlatform(platform)) disposeTemporarySession(platform)
-      setDownloading(false)
-      setCancelPath(null)
-    }
-  }
-
-  const stopDownload = async () => {
-    if (!cancelPath) return
-    const confirmed = await Dialog.confirm({
-      title: "取消下载",
-      message: "当前下载将停止，未完成的临时文件会被清理。",
-      confirmLabel: "取消下载",
-      cancelLabel: "继续下载",
-    })
-    if (!confirmed) return
-    await cancelDownload(cancelPath)
-    setStatus("正在取消下载。")
-  }
-
-  const chooseLinkSource = async () => {
-    const choice = await Dialog.actionSheet({
-      title: "添加媒体链接",
-      actions: [{ label: "从剪贴板粘贴" }, { label: "手动输入" }],
-      cancelButton: true,
-    })
-    if (choice === 0) await pasteURL()
-    if (choice === 1) await enterURL()
+    const choice = await Dialog.actionSheet({ title: "历史链接", message: "保留最近 10 条使用过的链接。", actions: recentLinks.map((record) => ({ label: record.url })), cancelButton: true })
+    if (choice == null) return
+    await useRecentLink(recentLinks[choice])
   }
 
   const openHistoryActions = async (record: DownloadHistoryRecord) => {
     const available = await isHistoryFileAvailable(record)
-    const canSaveToPhotos = record.mediaKind === "video"
+    const canSaveToPhotos = record.mediaKind === "video" || record.mediaKind === "image"
     const actions = [
       ...(available ? [{ label: "播放" }, { label: "分享" }] : []),
       ...(available && canSaveToPhotos ? [{ label: "保存到相册" }] : []),
@@ -1311,7 +718,7 @@ function View() {
     if (choice == null) return
     const action = actions[choice].label
     try {
-      if (action === "播放") await QuickLook.previewURLs([record.filePath], true)
+      if (action === "播放") await QuickLook.previewURLs([record.filePath])
       if (action === "分享") await ShareSheet.present([record.filePath])
       if (action === "保存到相册") await saveResult(record.filePath, record.fileName, "photos", record.taskId)
       if (action === "导出到文件") await saveResult(record.filePath, record.fileName, "files", record.taskId)
@@ -1347,129 +754,402 @@ function View() {
     const result = await clearHistoryRecordsAndFiles()
     await refreshHistory()
     setStatus(`已清理 ${result.deletedRecords} 条记录和 ${result.deletedFiles} 个原文件。`)
-    if (result.failedPaths.length) await logEvent({ level: "warn", event: "history.clear.partial", details: { failedPaths: result.failedPaths } })
-  }
-
-  const chooseManagedBytes = async () => {
-    const values: Array<number | null> = [512 * 1024 * 1024, 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 5 * 1024 * 1024 * 1024, null]
-    const choice = await Dialog.actionSheet({ title: "本地文件上限", actions: values.map((value) => ({ label: value == null ? "不限" : formatBytes(value) })), cancelButton: true })
-    if (choice == null) return
-    const next = updatePreferences({ ...preferences, maxManagedBytes: values[choice] })
-    const result = await pruneHistoryStorage(next)
-    await refreshHistory()
-    if (result.failedPaths.length) setStatus("部分旧文件无法清理，请在记录页处理。")
-  }
-
-  const chooseHistoryLimit = async () => {
-    const values: Array<number | null> = [25, 50, 100, 200, null]
-    const choice = await Dialog.actionSheet({ title: "下载记录上限", actions: values.map((value) => ({ label: value == null ? "不限" : `${value} 条` })), cancelButton: true })
-    if (choice == null) return
-    const next = updatePreferences({ ...preferences, maxHistoryRecords: values[choice] })
-    const result = await pruneHistoryStorage(next)
-    await refreshHistory()
-    if (result.failedPaths.length) setStatus("部分旧文件无法清理，请在记录页处理。")
   }
 
   const changeRetention = async (enabled: boolean) => {
-    const next = updatePreferences({ ...preferences, retainOriginalFiles: enabled })
-    if (!enabled) return
-    const result = await pruneHistoryStorage(next)
-    await refreshHistory()
-    if (result.failedPaths.length) setStatus("部分旧文件无法清理，请在记录页处理。")
+    const next = setPreferences({ ...preferences, retainOriginalFiles: enabled })
+    setPreferencesState(next)
+    if (!enabled) {
+      const pruned = await pruneHistoryStorage(next)
+      await refreshHistory()
+      if (pruned.failedPaths.length) {
+        await logEvent({ level: "warn", event: "history.prune.partial", details: { failedPaths: pruned.failedPaths, managedBytes: pruned.managedBytes, totalRecords: pruned.totalRecords } })
+      }
+    }
   }
 
+  const clearPlatformAuth = async () => {
+    const confirmed = await Dialog.confirm({ title: "清除所有平台登录状态", message: "将清除所有平台的 Cookie 和持久化会话。", confirmLabel: "清除", cancelLabel: "取消" })
+    if (!confirmed) return
+    await Promise.all(supportedAuthPlatforms().map((platform) => clearPlatformLogin(platform)))
+    updatePlatformSessions(() => ({}))
+    setStatus("已清除登录状态。")
+  }
+
+  const pasteURL = async () => {
+    const clip = await Pasteboard.getString()
+    const valid = extractFirstURL(clip)
+    if (!valid) {
+      setStatus("剪贴板中未发现有效链接。")
+      await logEvent({ level: "info", event: "paste.invalid", details: { clipboard: clip } })
+      return
+    }
+    launchClipboardSuppressedRef.current = false
+    analysisGenerationRef.current += 1
+    await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
+    setURL(valid)
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    setStatus("正在分析链接。")
+    await analyzeMedia(valid)
+  }
+
+  const enterURL = async () => {
+    setEnteringURL(true)
+    const input = await Dialog.prompt({ title: "手动输入媒体链接", message: "请粘贴或输入公开的媒体链接。", placeholder: "https://...", confirmLabel: "确定", cancelLabel: "取消" })
+    setEnteringURL(false)
+    if (!input) return
+    const valid = extractFirstURL(input)
+    if (!valid) {
+      setStatus("输入的链接无效。")
+      return
+    }
+    launchClipboardSuppressedRef.current = false
+    analysisGenerationRef.current += 1
+    await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
+    setURL(valid)
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    setStatus("正在分析链接。")
+    await analyzeMedia(valid)
+  }
+
+  const chooseLinkSource = async () => {
+    const choice = await Dialog.actionSheet({ title: "添加媒体链接", actions: [{ label: "从剪贴板粘贴" }, { label: "手动输入" }], cancelButton: true })
+    if (choice === 0) await pasteURL()
+    if (choice === 1) await enterURL()
+  }
+
+  const previewSelectedChoice = async () => {
+    if (!selectedChoice?.previewURL || !probe) {
+      setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
+      return
+    }
+
+    const previewOptions: OnlinePreviewOptions = {
+      url: selectedChoice.previewURL,
+      title: probe.title,
+      autoplayMode: preferences.previewAutoplayMode,
+      webpageURL: probe.webpageURL,
+      previewReferer: selectedChoice.previewReferer,
+      previewHeaders: selectedChoice.previewHeaders,
+      // DASH video-only: pair separate audio stream (no full player-skill sync).
+      audioUrl: selectedChoice.previewAudioURL,
+    }
+
+    const result = await openOnlinePreview(previewOptions)
+
+    if (result.status === "presented") {
+      // Session player is disposed when the sheet dismisses.
+      previewPlayerRef.current = result.player
+      return
+    }
+
+    if (result.status === "invalid-url") {
+      setStatus("预览链接无效")
+      await Dialog.alert({ title: "在线预览失败", message: result.message })
+      return
+    }
+
+    // failed
+    setStatus("在线预览无法打开")
+    await Dialog.alert({ title: "在线预览失败", message: result.message })
+  }
+
+      const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
+    const availableTools = automatic?.toolStatus || tools
+    const validURL = extractFirstURL(automatic?.sourceURL || url)
+    if (!validURL) {
+      setStatus("请先粘贴或输入有效的公开链接。")
+      return
+    }
+    const earlyPlatform = detectMediaPlatform(validURL)
+    if (earlyPlatform !== "douyin" && !availableTools?.ytDlpVersion) {
+      setStatus("请先安装 yt-dlp。")
+      return
+    }
+
+    let downloadChoice = automatic?.choice || selectedChoice
+    // C: 纯 m3u8 直链常无法 yt-dlp 探测，给合成 choice 走 HLS 管线
+    if (!downloadChoice && /\.m3u8|application\/x-mpegurl|application\/vnd\.apple\.mpegurl/i.test(validURL)) {
+      downloadChoice = {
+        id: "m3u8",
+        label: "HLS / m3u8",
+        kind: "video",
+        formatExpression: "m3u8",
+        container: "mp4",
+      }
+    }
+    if (!downloadChoice) {
+      setStatus("请先分析链接并选择实际可用格式。")
+      return
+    }
+
+    setDownloading(true)
+    setCancelPath(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    progressUiRef.current = { lastAt: 0, lastKey: "" }
+    applyProgressUi({ fraction: 0.02, stage: "正在解析媒体" }, true)
+    setStatus(earlyPlatform === "douyin" ? "正在匿名下载抖音媒体…" : "yt-dlp 正在准备下载。")
+
+    try {
+      const platform = detectMediaPlatform(validURL)
+      // 抖音不走 Cookie 登录会话
+      const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      const downloaded = await downloadMedia({
+        url: validURL,
+        choice: downloadChoice,
+        cookieFile: session ? await createTaskCookieFile(session) : undefined,
+        concurrentFragments,
+        insecureTLS,
+        onProgress: (p: DownloadProgress) => applyProgressUi(p),
+        onCancelPath: (path: string) => setCancelPath(path),
+        authorizedPlatform: session?.platform,
+      })
+      setDownloading(false)
+      setCancelPath(null)
+
+      const available = await recordCompletedDownload(downloaded, saveMode, downloadChoice.label || probe?.title || "未知标题")
+      if (available) {
+        setResult(downloaded)
+        setCompletedSaveMode(saveMode)
+        setStatus("下载完成。")
+        await rememberRecentLink(validURL)
+        setRecentLinks(listRecentLinks())
+      } else {
+        setStatus("下载完成但文件不可用。")
+      }
+    } catch (error) {
+      setDownloading(false)
+      setCancelPath(null)
+      const message = error instanceof Error ? error.message : String(error)
+      if (!insecureTLS && message.includes("暂时无法访问")) {
+        setStatus("来源暂时拒绝访问，正在重试下载。")
+        await startDownload(insecureTLS, automatic, true)
+        return
+      }
+      if (!insecureTLS && isCertificateError(message)) {
+        const retry = await Dialog.confirm({
+          title: "证书校验失败",
+          message: "当前网络返回了未受信任的 TLS 证书。兼容模式会仅对本次下载跳过证书校验。请只在你信任当前网络时继续。",
+          confirmLabel: "继续下载",
+          cancelLabel: "取消",
+        })
+        if (retry) {
+          setStatus("正在以证书兼容模式重试。")
+          await startDownload(true, automatic, retriedTransientAccess)
+          return
+        }
+      }
+      if (message !== "下载已取消") await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
+    } finally {
+      const platform = detectMediaPlatform(validURL)
+      if (isAuthPlatform(platform)) disposeTemporarySession(platform)
+      setDownloading(false)
+      setCancelPath(null)
+    }
+  }
+  const stopDownload = async () => {
+    if (!cancelPath) return
+    const confirmed = await Dialog.confirm({
+      title: "取消下载",
+      message: "当前下载将停止，未完成的临时文件会被清理。",
+      confirmLabel: "取消下载",
+      cancelLabel: "继续下载",
+    })
+    if (!confirmed) return
+    await cancelDownload(cancelPath)
+    setStatus("正在取消下载。")
+  }
+
+  
+
+function HistoryView() {
+  const dismiss = Navigation.useDismiss()
   return (
+    <NavigationStack>
+      <List
+        navigationTitle="下载记录"
+        navigationBarTitleDisplayMode="inline"
+        toolbar={{
+          cancellationAction: <Button title="关闭" action={dismiss} />,
+          topBarTrailing: <Button title="" systemImage="arrow.clockwise" action={() => void refreshHistory()} />,
+        }}
+      >
+        <Section header={<Text>{`记录 ${historySummary.totalRecords} 条 · 本地文件 ${historySummary.availableCount} 个`}</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">仅管理 Yoinks 下载目录中的原文件，不会删除相册或文件 App 中的副本。</Text>}>
+          {history.length ? history.map((record) => (
+            <Button key={record.id} action={() => void openHistoryActions(record)}>
+              <HStack spacing={12}>
+                <Image systemName={record.mediaKind === "audio" ? "music.note" : record.mediaKind === "image" ? "photo" : "play.rectangle"} foregroundStyle={record.mediaKind === "audio" ? "purple" : record.mediaKind === "image" ? "orange" : "blue"} frame={{ width: 24 }} />
+                <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                  <Text font="headline" lineLimit={2}>{record.title || record.fileName}</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{record.formatLabel} · {historyAvailability[record.id] ? "本地文件可用" : "文件已清理"}</Text>
+                  <HStack>
+                    <Text font="caption2" foregroundStyle="secondaryLabel">{formatBytes(record.fileSizeBytes)}</Text>
+                    <Spacer />
+                    <Text font="caption2" foregroundStyle="secondaryLabel">{formatHistoryDate(record.createdAt)}</Text>
+                  </HStack>
+                </VStack>
+              </HStack>
+            </Button>
+          )) : <Text foregroundStyle="secondaryLabel">尚无下载记录。</Text>}
+        </Section>
+        <Section title="存储">
+          <Text foregroundStyle="secondaryLabel">已管理 {formatBytes(historySummary.managedBytes)}</Text>
+          <Button title="清空下载记录和原文件" systemImage="trash" role="destructive" action={() => void clearHistory()} disabled={!history.length} />
+        </Section>
+      </List>
+    </NavigationStack>
+  )
+}
+
+function DownloadView() {
+  return (
+    <NavigationStack>
+      <List
+        navigationTitle="Yoinks"
+        navigationBarTitleDisplayMode="inline"
+        toolbar={{
+          cancellationAction: <Button title="关闭" action={closeYoinks} />,
+          topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} />,
+        }}
+      >
+        {/* B: 紧凑进度置顶；取消改右下浮层，避免占 List 行程 */}
+        {downloading ? (
+          <Section header={<Text>下载中</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
+            <VStack alignment="leading" spacing={6} padding={{ vertical: 2 }}>
+              <HStack>
+                <Text font="subheadline" lineLimit={1}>{progress.stage}</Text>
+                <Spacer />
+                <Text font="caption" foregroundStyle="secondaryLabel">{Math.round(progress.fraction * 100)}%</Text>
+              </HStack>
+              <ProgressView value={progress.fraction} />
+              <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${formatDownloadBytes(progress.downloadedBytes || 0, progress.totalBytes || 0)} · ${formatDownloadSpeed(progress.speed || 0, progress.eta || 0)}`}</Text>
+            </VStack>
+          </Section>
+        ) : null}
+
+        <Section title="当前链接">
+          <VStack alignment="leading" spacing={5}>
+            <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
+            {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
+          </VStack>
+          {!url ? <Button title="添加媒体链接" systemImage="plus.circle" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} /> : null}
+          <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
+          {url ? <Button title={analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || downloading} /> : null}
+          {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
+        </Section>
+
+        <Section title="格式">
+          {!probe ? <Text foregroundStyle="secondaryLabel">添加链接后将自动识别可下载格式。</Text> : (
+            <>
+              <VStack alignment="leading" spacing={3}>
+                <Text font="headline" lineLimit={2}>{probe.title}</Text>
+                {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
+              </VStack>
+              <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing} />
+              <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing} />
+            </>
+          )}
+        </Section>
+
+        {!downloading ? (
+          <Section header={<Text>任务</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
+            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || installing || !selectedChoice || analyzing} />
+            {result && completedSaveMode && completedSaveMode !== "ask" ? <Button title="播放" systemImage="play.circle" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
+            {result ? <Button title="分享" systemImage="square.and.arrow.up" action={() => void ShareSheet.present([result.filePath])} /> : null}
+          </Section>
+        ) : null}
+      </List>
+    </NavigationStack>
+  )
+}
+
+
+
+  // LogListView - inline log viewer
+  const LogListView = () => {
+    const dismiss = Navigation.useDismiss()
+    const [page, setPage] = useState<LogPageData | null>(null)
+    const [filter, setFilter] = useState<LogFilter>("all")
+    const [loading, setLoading] = useState(false)
+
+    const loadPage = async (offset = 0) => {
+      setLoading(true)
+      try {
+        const data = await readLogPage(filter, offset, 20)
+        setPage(data)
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    useEffect(() => {
+      loadPage()
+    }, [filter])
+
+    return (
+      <List navigationTitle="运行日志" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+        <Section>
+          <HStack spacing={8}>
+            <Text font="caption" foregroundStyle="secondaryLabel">筛选：</Text>
+            {["all", "info", "warn", "error"].map((f) => (
+              <Button key={f} title={f === "all" ? "全部" : f} action={() => { setFilter(f as LogFilter); loadPage(); }} disabled={filter === f} />
+            ))}
+          </HStack>
+        </Section>
+        <Section header={<Text>{page ? `显示 ${page.events.length} 条 / 共 ${page.totalMatching} 条` : "加载中..."}</Text>}>
+          {page?.events.map((event) => (
+            <Button key={event.timestamp + event.event} action={() => void Navigation.present({ element: <LogDetailView event={event} /> })}>
+              <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                <HStack spacing={6}>
+                  <Text font="subheadline">{event.event}</Text>
+                  <Text font="caption2" foregroundStyle={event.level === "error" ? "red" : event.level === "warn" ? "orange" : event.level === "debug" ? "gray" : "green"}>
+                    {event.level.toUpperCase()}
+                  </Text>
+                  {event.taskId ? <Text font="caption2" foregroundStyle="secondaryLabel">{event.taskId}</Text> : null}
+                </HStack>
+                <Text font="caption2" foregroundStyle="tertiaryLabel">{event.timestamp}</Text>
+              </VStack>
+            </Button>
+          ))}
+          {page?.hasMore && !loading && (
+            <Button title="加载更早" systemImage="chevron.down" action={() => loadPage((page?.events.length || 0))} />
+          )}
+          {loading && <ProgressView />}
+        </Section>
+      </List>
+    )
+  }
+
+  // Helper function to check for certificate errors
+  const isCertificateError = (message: string): boolean => {
+    return /certificate|SSL|TLS|untrusted|verify.*cert|self.signed|expired|hostname.*mismatch/i.test(message)
+  }
+
+return (
+    <ZStack frame={{ maxWidth: "infinity", maxHeight: "infinity" }}>
     <TabView selection={activeTab as any} tint="systemGreen" tabViewStyle="sidebarAdaptable">
       <Tab title="记录" systemImage="clock.arrow.circlepath" value={HISTORY_TAB}>
-        <NavigationStack>
-          <List
-            navigationTitle="下载记录"
-            navigationBarTitleDisplayMode="inline"
-            toolbar={{
-              cancellationAction: <Button title="关闭" action={closeYoinks} />,
-              topBarTrailing: <Button title="" systemImage="arrow.clockwise" action={() => void refreshHistory()} />,
-            }}
-          >
-            <Section header={<Text>{`记录 ${historySummary.totalRecords} 条 · 本地文件 ${historySummary.availableCount} 个`}</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">仅管理 Yoinks 下载目录中的原文件，不会删除相册或文件 App 中的副本。</Text>}>
-              {history.length ? history.map((record) => (
-                <Button key={record.id} action={() => void openHistoryActions(record)}>{
-                  <HStack spacing={12}>
-                    <Image systemName={record.mediaKind === "audio" ? "music.note" : "play.rectangle"} foregroundStyle={record.mediaKind === "audio" ? "purple" : "blue"} frame={{ width: 24 }} />
-                    <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
-                      <Text font="headline" lineLimit={2}>{record.title || record.fileName}</Text>
-                      <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{record.formatLabel} · {historyAvailability[record.id] ? "本地文件可用" : "文件已清理"}</Text>
-                      <HStack>
-                        <Text font="caption2" foregroundStyle="secondaryLabel">{formatBytes(record.fileSizeBytes)}</Text>
-                        <Spacer />
-                        <Text font="caption2" foregroundStyle="secondaryLabel">{formatHistoryDate(record.createdAt)}</Text>
-                      </HStack>
-                    </VStack>
-                  </HStack>
-                }</Button>
-              )) : <Text foregroundStyle="secondaryLabel">尚无下载记录。</Text>}
-            </Section>
-            <Section title="存储">
-              <Text foregroundStyle="secondaryLabel">已管理 {formatBytes(historySummary.managedBytes)}</Text>
-              <Button title="清空下载记录和原文件" systemImage="trash" role="destructive" action={() => void clearHistory()} disabled={!history.length} />
-            </Section>
-          </List>
-        </NavigationStack>
+        <HistoryView />
       </Tab>
 
       <Tab title="下载" systemImage="arrow.down.circle.fill" value={DOWNLOAD_TAB}>
-        <NavigationStack>
-          <List
-            navigationTitle="Yoinks"
-            navigationBarTitleDisplayMode="inline"
-            toolbar={{
-              cancellationAction: <Button title="关闭" action={closeYoinks} />,
-              topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} />,
-            }}
-          >
-            <Section title="当前链接">
-              <VStack alignment="leading" spacing={5}>
-                <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
-                {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
-              </VStack>
-              <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
-              {url ? <Button title={analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={!tools?.ytDlpVersion || analyzing || downloading} /> : null}
-              {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
-            </Section>
-
-            <Section title="格式与保存">
-              {!probe ? <Text foregroundStyle="secondaryLabel">添加链接后将自动识别可下载格式。</Text> : (
-                <>
-                  <VStack alignment="leading" spacing={3}>
-                    <Text font="headline" lineLimit={2}>{probe.title}</Text>
-                    {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
-                  </VStack>
-                  <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing} />
-                  <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing} />
-                </>
-              )}
-              <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage={saveMode === "photos" ? "photo.on.rectangle" : saveMode === "files" ? "folder" : "questionmark.circle"} action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
-            </Section>
-
-            <Section header={<Text>{downloading ? "下载中" : "任务"}</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
-              {downloading ? (
-                <VStack alignment="leading" spacing={10} padding={{ vertical: 6 }}>
-                  <HStack><Text font="subheadline">{progress.stage}</Text><Spacer /><Text font="caption" foregroundStyle="secondaryLabel">{Math.round(progress.fraction * 100)}%</Text></HStack>
-                  <ProgressView value={progress.fraction} />
-                  <Text font="caption" foregroundStyle="secondaryLabel">{formatDownloadBytes(progress.downloadedBytes, progress.totalBytes)}</Text>
-                  <Text font="caption" foregroundStyle="secondaryLabel">{formatDownloadSpeed(progress.speed, progress.eta)}</Text>
-                  <Button title="取消下载" systemImage="xmark" role="destructive" action={() => void stopDownload()} />
-                </VStack>
-              ) : <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || !tools?.ytDlpVersion || installing || !selectedChoice || analyzing} />}
-              {result && completedSaveMode && completedSaveMode !== "ask" ? <Button title="播放" systemImage="play.circle" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
-              {result ? <Button title="分享" systemImage="square.and.arrow.up" action={() => void ShareSheet.present([result.filePath])} /> : null}
-            </Section>
-          </List>
-        </NavigationStack>
+        <DownloadView />
       </Tab>
 
       <Tab title="设置" systemImage="gearshape.fill" value={SETTINGS_TAB}>
         <NavigationStack>
-          <List navigationTitle="设置" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={closeYoinks} /> }}>
+          <List
+            navigationTitle="设置"
+            navigationBarTitleDisplayMode="inline"
+            toolbar={{ cancellationAction: <Button title="关闭" action={closeYoinks} /> }}
+          >
             <Section title="下载偏好">
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
@@ -1491,23 +1171,39 @@ function View() {
             <Section title="工具与登录">
               <HStack spacing={10}>
                 <Image systemName={statusIcon(Boolean(tools?.ytDlpVersion))} foregroundStyle={tools?.ytDlpVersion ? "green" : "orange"} />
-                <Text frame={{ maxWidth: "infinity", alignment: "leading" as any }}>{toolLabel(tools)}</Text>
+                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>{toolLabel(tools)}</Text>
                 {!tools?.ytDlpVersion ? <Button title={installing ? "安装中" : "安装"} action={() => void install()} disabled={installing || loadingTools} /> : null}
               </HStack>
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
-              {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : <Text font="caption" foregroundStyle="secondaryLabel">需要登录的平台会在探测或下载时请求登录。</Text>}
+              {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>}
             </Section>
-            <Section title="诊断日志">
-              <Toggle title="调试模式" systemImage="ladybug" value={debugMode} onChanged={changeDebugMode} />
-              {debugMode ? <><Button title="查看运行日志" systemImage="list.bullet.rectangle" action={() => void showLogs()} /><Button title="复制最近日志" systemImage="doc.on.doc" action={() => void copyLogs()} /><Button title="打开日志目录" systemImage="folder" action={() => void openLogFolder()} /></> : <Text font="caption" foregroundStyle="secondaryLabel">开启调试模式后记录并查看运行日志。</Text>}
-            </Section>
-            <Section title="关于">
-              <Button title="关于 Yoinks" systemImage="info.circle" action={() => void Navigation.present({ element: <AboutPage /> })} />
+            <Section title="运行日志">
+              <Button title="查看运行日志" systemImage="list.bullet" action={() => void Navigation.present({ element: <LogListView /> })} />
+              <Toggle title="临时详细日志（15 分钟）" systemImage="ladybug" value={verboseLog} onChanged={changeVerboseLog} />
+              <Button title="清空运行日志" systemImage="trash" role="destructive" action={() => void (async () => {
+                const confirmed = await Dialog.confirm({ title: "清空运行日志？", message: "仅删除本地 runtime 日志文件，不影响下载记录与媒体文件。" })
+                if (!confirmed) return
+                await clearLogs()
+                setStatus("运行日志已清空。")
+              })()} />
+              <Text font="caption" foregroundStyle="secondaryLabel">默认只记录主链里程碑与警告/错误。临时详细日志约 15 分钟后自动关闭，不影响下载与在线预览。</Text>
             </Section>
           </List>
         </NavigationStack>
       </Tab>
     </TabView>
+    {downloading ? (
+      <VStack
+        spacing={10}
+        padding={{ trailing: 18, bottom: 72 }}
+        frame={{ maxWidth: "infinity", maxHeight: "infinity", alignment: "bottomTrailing" as any }}
+      >
+        <Button action={() => void stopDownload()} frame={{ width: 58, height: 58 }} glassEffect>
+          <Image systemName="xmark.circle.fill" foregroundStyle="label" frame={{ width: 36, height: 36 }} />
+        </Button>
+      </VStack>
+    ) : null}
+    </ZStack>
   )
 }
 
@@ -1519,4 +1215,4 @@ async function run() {
   }
 }
 
-run()
+void run()

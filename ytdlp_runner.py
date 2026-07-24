@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
 
@@ -11,31 +12,20 @@ class DownloadCancelled(Exception):
     pass
 
 
-def media_files_under(directory, since):
-    extensions = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".m4a", ".aac", ".opus", ".mp3"}
-    if not os.path.isdir(directory):
-        return []
-
-    result = []
-    for root, _, files in os.walk(directory):
-        for name in files:
-            path = os.path.join(root, name)
-            if os.path.splitext(path)[1].lower() not in extensions:
-                continue
-            try:
-                if os.path.getmtime(path) >= since:
-                    result.append(os.path.abspath(path))
-            except OSError:
-                pass
-    return sorted(result, key=lambda item: os.path.getmtime(item) if os.path.exists(item) else 0)
+def safe_http_url(value):
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def cleanup_media_files(directory, since):
-    for path in media_files_under(directory, since):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+def require_path_within(value, root, name):
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise SystemExit(f"Invalid {name}")
+    path = os.path.abspath(value)
+    if os.path.commonpath([path, root]) != root:
+        raise SystemExit(f"Invalid {name}")
+    return path
 
 
 def best_thumbnail(info):
@@ -62,13 +52,23 @@ def main():
     if len(sys.argv) < 2:
         raise SystemExit("Missing config path")
 
-    with open(sys.argv[1], "r", encoding="utf-8") as file:
+    config_path = os.path.abspath(sys.argv[1])
+    task_root = os.path.dirname(config_path)
+    with open(config_path, "r", encoding="utf-8") as file:
         config = json.load(file)
 
-    started_at = time.time()
+    source_url = config.get("url")
+    output_directory = require_path_within(config.get("paths"), task_root, "output directory")
+    if not safe_http_url(source_url):
+        raise SystemExit("Invalid media URL")
+    if not isinstance(config.get("format"), str) or not config["format"]:
+        raise SystemExit("Invalid media format")
+    if not isinstance(config.get("output"), str) or not config["output"]:
+        raise SystemExit("Invalid output template")
+    progress_path = require_path_within(config.get("progress_path"), task_root, "progress path")
+    cancel_flag = require_path_within(config.get("cancel_flag"), task_root, "cancel path")
+
     finished_paths = []
-    cancel_flag = config.get("cancel_flag")
-    progress_path = config.get("progress_path")
 
     def write_progress(status):
         if not progress_path:
@@ -122,12 +122,13 @@ def main():
         "nocheckcertificate": bool(config.get("no_check_certificates", False)),
         "retries": 3,
         "fragment_retries": 3,
-        "overwrites": True,
+        "overwrites": False,
     }
 
     cookiefile = config.get("cookiefile")
     if cookiefile:
-        if not isinstance(cookiefile, str) or not os.path.isfile(cookiefile):
+        cookiefile = require_path_within(cookiefile, task_root, "cookie file")
+        if not os.path.isfile(cookiefile):
             raise SystemExit("Cookie file is unavailable")
         options["cookiefile"] = cookiefile
 
@@ -144,7 +145,7 @@ def main():
     options["concurrent_fragment_downloads"] = min(8, max(1, int(config.get("concurrent_fragments", 2))))
     options.update({
         "outtmpl": config["output"],
-        "paths": {"home": config["paths"]},
+        "paths": {"home": output_directory},
         "progress_hooks": [progress_hook],
     })
 
@@ -152,17 +153,15 @@ def main():
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(config["url"], download=True)
     except DownloadCancelled as error:
-        cleanup_media_files(config["paths"], started_at)
         print("MEDIA_DOWNLOADER_CANCELLED " + str(error))
         raise SystemExit(130)
     except BaseException:
         if cancel_flag and os.path.exists(cancel_flag):
-            cleanup_media_files(config["paths"], started_at)
             print("MEDIA_DOWNLOADER_CANCELLED Download canceled")
             raise SystemExit(130)
         raise
 
-    print_metadata(info, config["url"])
+    print_metadata(info, source_url)
 
     with YoutubeDL(options) as ydl:
         for item in info.get("requested_downloads") or []:
@@ -173,8 +172,6 @@ def main():
             path = ydl.prepare_filename(info)
             if path:
                 finished_paths.append(os.path.abspath(path))
-
-    finished_paths.extend(media_files_under(config["paths"], started_at))
 
     seen = set()
     for path in finished_paths:

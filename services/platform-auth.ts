@@ -2,7 +2,7 @@ import { Path, Script, type Cookie } from "scripting"
 import { createTaskId } from "./logs"
 import type { MediaPlatform } from "./media"
 
-export type AuthPlatform = Exclude<MediaPlatform, "generic">
+export type AuthPlatform = "xiaohongshu"
 export type LoginRetention = "temporary" | "persistent"
 
 export type PlatformAuthSession = {
@@ -16,11 +16,7 @@ const ROOT_DIR = Path.join(FileManager.documentsDirectory, "Yoinks")
 const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 
 const PLATFORM_CONFIG: Record<AuthPlatform, { label: string; loginURL: string; domains: string[] }> = {
-  douyin: {
-    label: "抖音",
-    loginURL: "https://www.douyin.com/",
-    domains: ["douyin.com", "iesdouyin.com", "amemv.com"],
-  },
+  // 抖音走匿名 WebView 直链下载，不提供用户登录 Cookie 路径。
   xiaohongshu: {
     label: "小红书",
     loginURL: "https://www.xiaohongshu.com/",
@@ -88,7 +84,7 @@ export function supportedAuthPlatforms(): AuthPlatform[] {
 }
 
 export function isAuthPlatform(platform: MediaPlatform): platform is AuthPlatform {
-  return platform === "douyin" || platform === "xiaohongshu"
+  return platform === "xiaohongshu"
 }
 
 export function authPlatformLabel(platform: AuthPlatform): string {
@@ -102,7 +98,7 @@ export function isFreshCookieError(message: string): boolean {
 export async function beginPlatformLogin(platform: AuthPlatform, retention: LoginRetention): Promise<PlatformAuthSession> {
   const webView = new WebViewController(retention === "temporary" ? { ephemeral: true } : undefined)
   try {
-    await webView.loadURL(PLATFORM_CONFIG[platform].loginURL)
+    if (!(await webView.loadURL(PLATFORM_CONFIG[platform].loginURL))) throw new Error(`无法打开${PLATFORM_CONFIG[platform].label}登录页面`)
     await webView.present({ navigationTitle: `${PLATFORM_CONFIG[platform].label}登录` })
     const cookies = await platformCookies(webView, platform)
     if (!cookies.length) throw new Error(`未检测到${PLATFORM_CONFIG[platform].label}会话数据。请完成页面操作后关闭登录页面再重试。`)
@@ -121,7 +117,7 @@ export async function restorePersistentPlatformSession(platform: AuthPlatform): 
       webView.dispose()
       return null
     }
-    await webView.loadURL(PLATFORM_CONFIG[platform].loginURL)
+    if (!(await webView.loadURL(PLATFORM_CONFIG[platform].loginURL))) throw new Error(`无法恢复${PLATFORM_CONFIG[platform].label}登录页面`)
     await webView.waitForLoad()
     return { platform, retention: "persistent", accountLabel: await readAccountLabel(webView, platform), webView }
   } catch (error) {

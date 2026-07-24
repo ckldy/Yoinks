@@ -1,7 +1,7 @@
 {
-  "displayName": "读取 Yoinks 最小运行日志",
+  "displayName": "读取 Yoinks 运行日志",
   "id": "read_minimal_runtime_log",
-  "description": "读取 Yoinks 在关闭调试模式时保留的、已脱敏的关键运行日志。最多返回最近 100 条。",
+  "description": "读取 Yoinks 已脱敏的主链运行日志（runtime.jsonl）。默认仅关键里程碑与 warn/error；最多返回最近 100 条。",
   "icon": "doc.text.magnifyingglass",
   "color": "systemOrange",
   "parameters": [],

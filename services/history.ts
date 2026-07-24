@@ -32,7 +32,7 @@ export type PruneResult = HistoryStorageSummary & {
 }
 
 function isManagedFilePath(filePath: string): boolean {
-  return filePath.startsWith(`${DOWNLOAD_DIRECTORY}/`)
+  return filePath.startsWith(`${DOWNLOAD_DIRECTORY}/`) && !filePath.split("/").includes("..")
 }
 
 function isHistoryRecord(value: unknown): value is DownloadHistoryRecord {
@@ -46,7 +46,7 @@ function isHistoryRecord(value: unknown): value is DownloadHistoryRecord {
     && typeof item.filePath === "string"
     && typeof item.fileName === "string"
     && typeof item.fileSizeBytes === "number"
-    && (item.mediaKind === "video" || item.mediaKind === "audio")
+    && (item.mediaKind === "video" || item.mediaKind === "audio" || item.mediaKind === "image")
     && typeof item.formatLabel === "string"
     && (item.saveMode === "ask" || item.saveMode === "photos" || item.saveMode === "files")
 }
