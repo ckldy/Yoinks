@@ -31,7 +31,7 @@
 在 iOS Safari 打开：
 
 ```text
-scripting://install?url=https://github.com/ckldy/Yoinks
+https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckldy%5C/Yoinks%22%5D
 ```
 
 或从仓库安装：
