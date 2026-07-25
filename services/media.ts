@@ -44,6 +44,8 @@ export type MediaChoice = {
   estimatedBytes?: number
   mergeAudioFormat?: string
   mergeExtension?: "mp4" | "mkv"
+  /** Source video codec family; used to avoid publishing iOS-unplayable AV1/VP9/HEVC. */
+  videoCodec?: "h264" | "av1" | "hevc" | "vp9" | "other"
   previewURL?: string
   previewReferer?: string
   previewHeaders?: Record<string, string>
@@ -98,7 +100,7 @@ export function quote(value: string): string {
 
 /** Scripting host noise that can mask real yt-dlp exit output. */
 const HOST_NOISE_LINE =
-  /Script window host view deinit|Transpile JSContext(?: released)?|webview viewmodel cleanup|WebViewController disposed|load start|load stop|set channel|\[WebView\]\s*\[LOG\]|\[WebView\]/i
+  /Script window host view deinit|Transpile JSContext(?: released)?|webview viewmodel cleanup|WebViewController disposed|load start|load stop|set channel|\[WebView\]\s*\[LOG\]|\[WebView\]|Write scripts settings successfully/i
 
 export function isHostDeinitNoise(value: string): boolean {
   const text = String(value || "").trim()
@@ -108,12 +110,22 @@ export function isHostDeinitNoise(value: string): boolean {
     .map((line) => line.trim())
     .filter(Boolean)
   const meaningful = lines.filter((line) => !HOST_NOISE_LINE.test(line))
-  // Pure host noise (deinit / WebView logs / JSContext) → treat as transient interrupt.
-  if (meaningful.length === 0) return lines.some((line) => HOST_NOISE_LINE.test(line)) || /deinit|WebView|JSContext/i.test(text)
+  // Pure host noise (deinit / WebView / settings write) → treat as transient interrupt.
+  if (meaningful.length === 0) {
+    return (
+      lines.some((line) => HOST_NOISE_LINE.test(line))
+      || /deinit|WebView|JSContext|Write scripts settings successfully/i.test(text)
+    )
+  }
   const collapsed = meaningful.join(" ").replace(/\s+/g, " ").trim()
   if (/^(?:Script window host view deinit\s*)+$/i.test(collapsed)) return true
+  if (/^(?:Write scripts settings successfully\s*)+$/i.test(collapsed)) return true
   // Short residual that is only host log tokens, e.g. "[WebView][LOG] [c0]"
-  if (collapsed.length <= 64 && /\[WebView\]|deinit|JSContext/i.test(collapsed) && !/ERROR:|Unable to|HTTP Error|Unsupported|timed out|certificate/i.test(collapsed)) {
+  if (
+    collapsed.length <= 64
+    && /\[WebView\]|deinit|JSContext|Write scripts settings/i.test(collapsed)
+    && !/ERROR:|Unable to|HTTP Error|Unsupported|timed out|certificate/i.test(collapsed)
+  ) {
     return true
   }
   return false
@@ -147,7 +159,7 @@ function compactMessage(value: string): string {
     return last
   }
   if (isHostDeinitNoise(value) && !cleaned) {
-    return "探测被宿主中断或日志干扰，未能识别格式。请再点「重新分析链接」。"
+    return "操作被宿主中断或日志干扰，请重试。"
   }
   if (/timed out|timeout|TransportError/i.test(source)) {
     return "打开页面超时，暂时识别不到格式。请检查网络后重试；短链可改完整视频页链接再分析。"
@@ -239,6 +251,36 @@ async function ensureDirectories() {
 
 async function runCommand(command: string, timeout: number) {
   return Shell.run(command, { cwd: Script.directory, timeout })
+}
+
+/** One automatic re-run when Shell captures pure host diagnostics instead of yt-dlp. */
+async function runYtdlpWithHostNoiseRetry(options: {
+  command: string
+  timeout: number
+  taskId: string
+  stage: string
+  isCancelFlagSet: () => boolean
+}) {
+  let result = await runCommand(options.command, options.timeout)
+  if (
+    result.exitCode !== 0
+    && result.exitCode !== 130
+    && !options.isCancelFlagSet()
+    && isHostDeinitNoise(result.output || "")
+  ) {
+    await logEvent({
+      level: "warn",
+      event: "download.host-noise.retry",
+      taskId: options.taskId,
+      details: { stage: options.stage, delayMilliseconds: 400 },
+    })
+    await new Promise<void>((resolve) => setTimeout(resolve, 400))
+    if (options.isCancelFlagSet()) {
+      return { ...result, exitCode: 130 }
+    }
+    result = await runCommand(options.command, options.timeout)
+  }
+  return result
 }
 
 function parseLastJSON(output: string): Record<string, unknown> {
@@ -371,7 +413,30 @@ function pickPreviewVideoSource(
   return item
 }
 
-function buildChoices(formats: RawFormat[]): MediaChoice[] {
+/** Codec early + always visible; container labeled as 容器 to avoid MP4 = playable confusion. */
+export function formatVideoChoiceLabel(options: {
+  height?: number
+  codecLabel: string
+  hardCodec: boolean
+  kindText: string
+  containerExt?: string
+  fps?: number
+  estimatedBytes?: number
+}): string {
+  const heightText = options.height ? `${options.height}p` : "视频"
+  const codecText = options.codecLabel || "编码未知"
+  const hardHint = options.hardCodec ? " · iOS可能无画面" : ""
+  const containerText = options.containerExt ? ` · 容器·${options.containerExt.toUpperCase()}` : ""
+  const fpsText = options.fps ? ` · ${Math.round(options.fps)} fps` : ""
+  const sizeText = options.estimatedBytes ? ` · 约 ${formatBytes(options.estimatedBytes)}` : ""
+  return `${heightText} · ${codecText}${hardHint} · ${options.kindText}${containerText}${fpsText}${sizeText}`
+}
+
+function heightCodecKey(item: RawFormat): string {
+  return `${item.height || 0}:${videoCodecKind(item)}`
+}
+
+export function buildChoices(formats: RawFormat[]): MediaChoice[] {
   const audioFormats = formats
     .filter((item) => item.formatId && item.acodec && item.acodec !== "none" && (!item.vcodec || item.vcodec === "none"))
     .sort((a, b) => {
@@ -381,35 +446,51 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
     })
   const muxedVideos = formats
     .filter(isMuxedVideo)
-    .sort((a, b) => (b.height || 0) - (a.height || 0) || formatScore(b) - formatScore(a))
+    .sort((a, b) => (b.height || 0) - (a.height || 0) || Number(isAvcCodec(b)) - Number(isAvcCodec(a)) || formatScore(b) - formatScore(a))
   const videoOnly = formats
     .filter((item) => item.formatId && item.vcodec && item.vcodec !== "none" && (!item.acodec || item.acodec === "none") && item.height)
-    // Height first, then H.264 for both listing/default download and device-friendly merges.
+    // Height first, then H.264, then quality — one entry per height+codec family.
     .sort((a, b) => (b.height || 0) - (a.height || 0) || Number(isAvcCodec(b)) - Number(isAvcCodec(a)) || formatScore(b) - formatScore(a))
 
-  const choices: MediaChoice[] = muxedVideos.map((item) => {
-    const codec = codecLabel(item)
-    return {
+  const choices: MediaChoice[] = []
+  const seenMuxedKeys = new Set<string>()
+  for (const item of muxedVideos) {
+    const key = heightCodecKey(item)
+    if (seenMuxedKeys.has(key)) continue
+    seenMuxedKeys.add(key)
+    const videoCodec = videoCodecKind(item)
+    const hardCodec = videoCodec === "av1" || videoCodec === "hevc" || videoCodec === "vp9"
+    choices.push({
       id: `video-${item.height}-${item.formatId}`,
-      label: `${item.height}p 视频${codec ? ` · ${codec}` : ""}${item.ext ? ` · ${item.ext.toUpperCase()}` : ""}${item.fps ? ` · ${Math.round(item.fps)} fps` : ""}${item.filesize ? ` · 约 ${formatBytes(item.filesize)}` : ""}`,
+      label: formatVideoChoiceLabel({
+        height: item.height,
+        codecLabel: codecLabel(item),
+        hardCodec,
+        kindText: "视频",
+        containerExt: item.ext,
+        fps: item.fps,
+        estimatedBytes: item.filesize,
+      }),
       kind: "video" as const,
       formatExpression: item.formatId,
       container: item.ext?.toLowerCase(),
       height: item.height,
       estimatedBytes: item.filesize,
+      videoCodec,
       previewURL: item.previewURL,
       previewReferer: item.previewReferer,
       previewHeaders: item.previewHeaders,
-    }
-  })
+    })
+  }
 
-  // One download choice per height: first item after sort is preferred (AVC over AV1).
-  // Avoid listing multiple 1080p AV1/HEVC variants that fail verify on device ffprobe.
-  const seenVideoHeights = new Set<number>()
+  // One choice per height+codec (e.g. 1080p H.264 and 1080p AV1 both listed).
+  const seenVideoOnlyKeys = new Set<string>()
   for (const item of videoOnly) {
     const height = item.height || 0
-    if (!height || seenVideoHeights.has(height)) continue
-    seenVideoHeights.add(height)
+    if (!height) continue
+    const key = heightCodecKey(item)
+    if (seenVideoOnlyKeys.has(key)) continue
+    seenVideoOnlyKeys.add(key)
 
     const audio = audioFormats.find((candidate) => item.ext === "mp4" || item.ext === "m4s" ? (candidate.ext === "m4a" || candidate.ext === "mp4") : candidate.ext === "webm") || audioFormats[0]
     const canMerge = Boolean(audio)
@@ -420,16 +501,27 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
     const previewDecodable = isAvcCodec(previewSource) || !isHardVideoCodec(previewSource)
     const needsSeparateAudio =
       previewDecodable && !previewIsMuxed && Boolean(audio?.previewURL)
-    const codec = codecLabel(item)
+    const videoCodec = videoCodecKind(item)
+    const hardCodec = videoCodec === "av1" || videoCodec === "hevc" || videoCodec === "vp9"
+    const estimatedBytes = (item.filesize || 0) + (audio?.filesize || 0) || undefined
     choices.push({
       id: `video-${item.height}-${item.formatId}${audio ? `-with-${audio.formatId}` : "-silent"}`,
-      label: `${item.height}p ${canMerge ? "视频 · 合并音频" : "无音轨视频"}${codec ? ` · ${codec}` : ""}${item.ext ? ` · ${item.ext.toUpperCase()}` : ""}${item.fps ? ` · ${Math.round(item.fps)} fps` : ""}${(item.filesize || audio?.filesize) ? ` · 约 ${formatBytes((item.filesize || 0) + (audio?.filesize || 0))}` : ""}`,
+      label: formatVideoChoiceLabel({
+        height: item.height,
+        codecLabel: codecLabel(item),
+        hardCodec,
+        kindText: canMerge ? "合并音频" : "无音轨视频",
+        containerExt: mergeExtension || item.ext,
+        fps: item.fps,
+        estimatedBytes,
+      }),
       kind: "video",
       formatExpression: item.formatId,
       height: item.height,
-      estimatedBytes: (item.filesize || 0) + (audio?.filesize || 0) || undefined,
+      estimatedBytes,
       mergeAudioFormat: audio?.formatId,
       mergeExtension: canMerge ? mergeExtension : undefined,
+      videoCodec,
       previewURL: previewSource.previewURL,
       previewReferer: previewSource.previewReferer || item.previewReferer,
       previewHeaders: previewSource.previewHeaders || item.previewHeaders,
@@ -439,7 +531,7 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
 
   choices.push(...audioFormats.map<MediaChoice>((item) => ({
     id: `audio-${item.formatId}`,
-    label: `仅音频${item.ext ? ` · ${item.ext.toUpperCase()}` : ""}${item.abr || item.tbr ? ` · ${Math.round(item.abr || item.tbr || 0)} kbps` : ""}${item.filesize ? ` · 约 ${formatBytes(item.filesize)}` : ""}`,
+    label: `仅音频${item.ext ? ` · 容器·${item.ext.toUpperCase()}` : ""}${item.abr || item.tbr ? ` · ${Math.round(item.abr || item.tbr || 0)} kbps` : ""}${item.filesize ? ` · 约 ${formatBytes(item.filesize)}` : ""}`,
     kind: "audio",
     formatExpression: item.formatId,
     container: item.ext?.toLowerCase(),
@@ -449,7 +541,17 @@ function buildChoices(formats: RawFormat[]): MediaChoice[] {
     previewHeaders: item.previewHeaders,
   })))
 
-  return choices
+  // Prefer device-playable H.264 over higher AV1/VP9/HEVC so list default and auto-select avoid 有声无画.
+  const videos = choices.filter((item) => item.kind === "video").sort((a, b) => {
+    const aHard = isDeviceHardVideoChoice(a) ? 1 : 0
+    const bHard = isDeviceHardVideoChoice(b) ? 1 : 0
+    if (aHard !== bHard) return aHard - bHard
+    if ((b.height || 0) !== (a.height || 0)) return (b.height || 0) - (a.height || 0)
+    // Same height: H.264 already preferred via hard flag; keep stable id order otherwise.
+    return a.id.localeCompare(b.id)
+  })
+  const audios = choices.filter((item) => item.kind === "audio")
+  return [...videos, ...audios]
 }
 
 export function resolveAutomaticChoice(
@@ -461,7 +563,14 @@ export function resolveAutomaticChoice(
   if (!recommended || strategy === "recommended") return { choice: recommended, usedFallback: false }
 
   if (strategy === "highest-video") {
-    const choice = choices.filter((item) => item.kind === "video").sort((a, b) => (b.height || 0) - (a.height || 0))[0] || recommended
+    const choice = choices
+      .filter((item) => item.kind === "video")
+      .sort((a, b) => {
+        const aHard = isDeviceHardVideoChoice(a) ? 1 : 0
+        const bHard = isDeviceHardVideoChoice(b) ? 1 : 0
+        if (aHard !== bHard) return aHard - bHard
+        return (b.height || 0) - (a.height || 0)
+      })[0] || recommended
     return { choice, usedFallback: choice === recommended && choice.kind !== "video" }
   }
 
@@ -880,6 +989,22 @@ function codecLabel(item: RawFormat): string {
   return ""
 }
 
+function videoCodecKind(item: RawFormat): NonNullable<MediaChoice["videoCodec"]> {
+  if (isAvcCodec(item)) return "h264"
+  const codec = (item.vcodec || "").toLowerCase()
+  if (/av01|av1/.test(codec)) return "av1"
+  if (/hev1|hvc1|hevc/.test(codec)) return "hevc"
+  if (/vp09|vp9/.test(codec)) return "vp9"
+  return "other"
+}
+
+/** AV1/VP9/HEVC often play as audio-only in iOS Quick Look / AVPlayer. */
+export function isDeviceHardVideoChoice(choice: Pick<MediaChoice, "videoCodec" | "label"> | null | undefined): boolean {
+  if (!choice) return false
+  if (choice.videoCodec === "av1" || choice.videoCodec === "hevc" || choice.videoCodec === "vp9") return true
+  return /\bAV1\b|\bVP9\b|\bHEVC\b/i.test(choice.label || "")
+}
+
 async function verifyMediaFile(filePath: string, choice: MediaChoice, taskId: string) {
   // Prefer stream type lines; -v error still surfaces codec open failures on this n5.0.1 build.
   const result = await runCommand(`ffprobe -v error -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 ${quote(filePath)}`, 60)
@@ -1053,7 +1178,13 @@ export async function downloadMedia(options: {
       clearProgressFile(progressPath)
       tracker.emit(0.02, "正在下载视频流")
       const stopVideoPoll = tracker.startPolling(progressPath, 0.02, 0.5, "下载视频流")
-      const videoResult = await runCommand(`python3 ${quote(RUNNER_PATH)} ${quote(videoConfigPath)}`, 7200)
+      const videoResult = await runYtdlpWithHostNoiseRetry({
+        command: `python3 ${quote(RUNNER_PATH)} ${quote(videoConfigPath)}`,
+        timeout: 7200,
+        taskId,
+        stage: "video",
+        isCancelFlagSet,
+      })
       stopVideoPoll()
       clearProgressFile(progressPath)
       await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output } })
@@ -1074,7 +1205,13 @@ export async function downloadMedia(options: {
 
       tracker.emit(0.5, "正在下载音频流")
       const stopAudioPoll = tracker.startPolling(progressPath, 0.5, 0.9, "下载音频流")
-      const audioResult = await runCommand(`python3 ${quote(RUNNER_PATH)} ${quote(audioConfigPath)}`, 7200)
+      const audioResult = await runYtdlpWithHostNoiseRetry({
+        command: `python3 ${quote(RUNNER_PATH)} ${quote(audioConfigPath)}`,
+        timeout: 7200,
+        taskId,
+        stage: "audio",
+        isCancelFlagSet,
+      })
       stopAudioPoll()
       clearProgressFile(progressPath)
       await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output } })
@@ -1090,23 +1227,37 @@ export async function downloadMedia(options: {
       tracker.emit(0.9, "正在使用内置 FFmpeg 合并")
       const mergeResult = await runCommand(`ffmpeg -y -i ${quote(videoPath)} -i ${quote(audioPath)} -map 0:v:0 -map 1:a:0 -c copy${fastStart} ${quote(workPath)}`, 900)
       await logEvent({ level: mergeResult.exitCode === 0 ? "info" : "error", event: "merge.ffmpeg.completed", taskId, details: { exitCode: mergeResult.exitCode, output: mergeResult.output, videoPath, audioPath, workPath } })
-      if (mergeResult.exitCode !== 0) {
-        // MD-style fallback: VideoToolbox re-encode when stream copy fails
-        tracker.emit(0.92, "无损合并失败，正在转码为兼容 MP4")
+      const needsDeviceTranscode = isDeviceHardVideoChoice(options.choice)
+      if (mergeResult.exitCode !== 0 || needsDeviceTranscode) {
+        // Stream-copy keeps AV1/VP9/HEVC → iOS Quick Look often plays audio only; force H.264.
+        tracker.emit(0.92, needsDeviceTranscode ? "正在转码为 iOS 可播放 H.264" : "无损合并失败，正在转码为兼容 MP4")
         await FileManager.remove(workPath).catch(() => {})
         const mp4Path = workPath.replace(/\.[^.]+$/, ".mp4")
         const transcode = await runCommand(
           `ffmpeg -y -i ${quote(videoPath)} -i ${quote(audioPath)} -map 0:v:0 -map 1:a:0 -c:v h264_videotoolbox -c:a aac -movflags +faststart ${quote(mp4Path)}`,
           7200,
         )
-        await logEvent({ level: transcode.exitCode === 0 ? "info" : "error", event: "merge.ffmpeg.transcode.completed", taskId, details: { exitCode: transcode.exitCode, output: transcode.output } })
+        await logEvent({
+          level: transcode.exitCode === 0 ? "info" : "error",
+          event: "merge.ffmpeg.transcode.completed",
+          taskId,
+          details: {
+            exitCode: transcode.exitCode,
+            output: transcode.output,
+            reason: needsDeviceTranscode ? "device-hard-codec" : "stream-copy-failed",
+            sourceVideoCodec: options.choice.videoCodec || null,
+          },
+        })
         if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
+          if (needsDeviceTranscode) {
+            throw new Error("该清晰度为 AV1/VP9/HEVC，本机无法可靠转码为可播放视频。请改选带 H.264 的清晰度后重试。")
+          }
           throw new Error(compactMessage(mergeResult.output || transcode.output || "FFmpeg 合并失败"))
         }
         await verifyMediaFile(mp4Path, options.choice, taskId)
         const filePath = await publishMediaFile(mp4Path, taskId)
         tracker.emit(1, "下载、转码并验证完成")
-        await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, mergedWithFFmpeg: true, transcoded: true } })
+        await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, mergedWithFFmpeg: true, transcoded: true, sourceVideoCodec: options.choice.videoCodec || null } })
         return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
       }
       await verifyMediaFile(workPath, options.choice, taskId)
@@ -1119,20 +1270,49 @@ export async function downloadMedia(options: {
     clearProgressFile(progressPath)
     tracker.emit(0.02, "正在下载")
     const stopPoll = tracker.startPolling(progressPath, 0.02, 0.95, "正在下载")
-    const result = await runCommand(`python3 ${quote(RUNNER_PATH)} ${quote(configPath)}`, 7200)
+    const result = await runYtdlpWithHostNoiseRetry({
+      command: `python3 ${quote(RUNNER_PATH)} ${quote(configPath)}`,
+      timeout: 7200,
+      taskId,
+      stage: "single",
+      isCancelFlagSet,
+    })
     stopPoll()
     clearProgressFile(progressPath)
     await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "download.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output } })
     if (result.exitCode === 130) throw new Error("下载已取消")
     if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "yt-dlp 下载失败"))
     const paths = parseOutputPaths(result.output)
-    const filePath = [...paths].reverse().find((path) => FileManager.existsSync(path))
+    let filePath = [...paths].reverse().find((path) => FileManager.existsSync(path))
     if (!filePath) throw new Error("下载完成但未找到输出文件")
+    if (options.choice.kind === "video" && isDeviceHardVideoChoice(options.choice)) {
+      tracker.emit(0.92, "正在转码为 iOS 可播放 H.264")
+      const mp4Path = Path.join(workDirectory, `${Path.basename(filePath).replace(/\.[^.]+$/, "")}.h264.mp4`)
+      const transcode = await runCommand(
+        `ffmpeg -y -i ${quote(filePath)} -map 0:v:0 -map 0:a:0? -c:v h264_videotoolbox -c:a aac -movflags +faststart ${quote(mp4Path)}`,
+        7200,
+      )
+      await logEvent({
+        level: transcode.exitCode === 0 ? "info" : "error",
+        event: "merge.ffmpeg.transcode.completed",
+        taskId,
+        details: {
+          exitCode: transcode.exitCode,
+          output: transcode.output,
+          reason: "device-hard-codec-single",
+          sourceVideoCodec: options.choice.videoCodec || null,
+        },
+      })
+      if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
+        throw new Error("该清晰度为 AV1/VP9/HEVC，本机无法可靠转码为可播放视频。请改选带 H.264 的清晰度后重试。")
+      }
+      filePath = mp4Path
+    }
     tracker.emit(0.96, "正在验证文件")
     await verifyMediaFile(filePath, options.choice, taskId)
     const publishedPath = await publishMediaFile(filePath, taskId)
     tracker.emit(1, "下载并验证完成")
-    await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath: publishedPath, choiceId: options.choice.id } })
+    await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath: publishedPath, choiceId: options.choice.id, transcoded: isDeviceHardVideoChoice(options.choice) || undefined, sourceVideoCodec: options.choice.videoCodec || null } })
     return { filePath: publishedPath, fileName: Path.basename(publishedPath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(publishedPath) }
   } catch (error) {
     await logEvent({ level: "error", event: "download.failed", taskId, details: { message: error instanceof Error ? error.message : String(error) } })

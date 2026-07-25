@@ -26,6 +26,10 @@ check(
   isHostDeinitNoise("[WebView][LOG] [c0]"),
 )
 check(
+  "Write scripts settings is noise",
+  isHostDeinitNoise("Write scripts settings successfully Write scripts settings successfully"),
+)
+check(
   "real ERROR is not noise",
   !isHostDeinitNoise("ERROR: [Douyin] x: Fresh cookies (not necessarily logged in) are needed"),
 )
@@ -46,6 +50,10 @@ check(
   isTransientProbeFailure("[WebView][LOG] [c0]"),
 )
 check(
+  "Write scripts settings is transient",
+  isTransientProbeFailure("Write scripts settings successfully Write scripts settings successfully"),
+)
+check(
   "fresh cookies not transient",
   !isTransientProbeFailure("[Douyin] x: Fresh cookies (not necessarily logged in) are needed"),
 )
@@ -62,5 +70,5 @@ check(
   !isFreshCookieError("SSL: CERTIFICATE_VERIFY_FAILED"),
 )
 
-console.log(`\nverify_probe_resilience: ${passed}/11 passed`)
+console.log(`\nverify_probe_resilience: ${passed}/13 passed`)
 Script.exit({ passed })
