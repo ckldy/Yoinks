@@ -475,7 +475,14 @@ function formatScore(item: RawFormat): number {
 /** WKWebView progressive <video> decodes H.264 reliably; AV1/VP9/HEVC often black-screen. */
 function isAvcCodec(item: RawFormat): boolean {
   const codec = (item.vcodec || "").toLowerCase()
-  return codec.startsWith("avc") || codec.includes("h264") || codec.includes("avc1")
+  if (codec.startsWith("avc") || codec.includes("h264") || codec.includes("avc1")) return true
+  // Some extractors (e.g. X/Twitter progressive MP4) omit vcodec even though the path contains avc1.
+  try {
+    const pathname = new URL(item.previewURL || "").pathname.toLowerCase()
+    return pathname.includes("/avc1/") || pathname.includes("avc1.")
+  } catch {
+    return false
+  }
 }
 
 function isHardVideoCodec(item: RawFormat): boolean {
@@ -500,12 +507,31 @@ function isMuxedVideo(item: RawFormat): boolean {
   return item.formatId.startsWith("http-") && item.ext === "mp4" && Boolean(item.filesize)
 }
 
-/** Pick best progressive URL for WKWebView preview (prefer H.264). Download format stays on `item`. */
+function isHlsVideoOnlyUrl(url: string): boolean {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase()
+    return pathname.endsWith(".m3u8") || pathname.includes(".m3u8")
+  } catch {
+    return /\.m3u8(?:[?#]|$)/i.test(url)
+  }
+}
+
+/** Pick best progressive URL for WKWebView preview (prefer H.264, muxed, decodable). Download format stays on `item`. */
 function pickPreviewVideoSource(
   item: RawFormat,
   muxedVideos: RawFormat[],
   videoOnly: RawFormat[],
 ): RawFormat {
+  // X/Twitter serves HLS video-only playlists with separate HLS audio playlists.
+  // Current HLS player cannot pair them, so prefer a same-height muxed progressive MP4 if available.
+  const itemIsHlsVideoOnly = isHlsVideoOnlyUrl(item.previewURL || "") && (!item.acodec || item.acodec === "none")
+  if (itemIsHlsVideoOnly) {
+    const sameHeightMuxedAvc = muxedVideos
+      .filter((m) => m.height === item.height && m.previewURL && isAvcCodec(m))
+      .sort(previewVideoPreference)
+    if (sameHeightMuxedAvc[0]) return sameHeightMuxedAvc[0]
+  }
+
   // Prefer ANY AVC (same height → lower height) before hard codecs — WKWebView black-screens AV1/HEVC/VP9.
   const anyAvc = [...muxedVideos, ...videoOnly]
     .filter((v) => v.previewURL && isAvcCodec(v) && (v.height || 0) > 0)
@@ -559,7 +585,15 @@ function heightCodecKey(item: RawFormat): string {
 
 export function buildChoices(formats: RawFormat[]): MediaChoice[] {
   const audioFormats = formats
-    .filter((item) => item.formatId && item.acodec && item.acodec !== "none" && (!item.vcodec || item.vcodec === "none"))
+    .filter((item) => {
+      if (!item.formatId) return false
+      const isVideoDisabled = !item.vcodec || item.vcodec === "none"
+      // Standard audio-only: acodec present and not "none".
+      if (isVideoDisabled && item.acodec && item.acodec !== "none") return true
+      // X/Twitter HLS audio playlists report acodec=null but format_id/path clearly mark them as audio-only.
+      if (isVideoDisabled && (item.formatId.toLowerCase().includes("audio") || /\/mp4a\//i.test(item.previewURL || ""))) return true
+      return false
+    })
     .sort((a, b) => {
       const aPreference = (a.ext === "m4a" ? 100_000 : 0) + (a.abr || a.tbr || 0)
       const bPreference = (b.ext === "m4a" ? 100_000 : 0) + (b.abr || b.tbr || 0)
