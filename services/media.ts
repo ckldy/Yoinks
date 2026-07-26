@@ -44,7 +44,7 @@ export type MediaChoice = {
   estimatedBytes?: number
   mergeAudioFormat?: string
   mergeExtension?: "mp4" | "mkv"
-  /** Source video codec family; used to avoid publishing iOS-unplayable AV1/VP9/HEVC. */
+  /** Source video codec family; hard codecs (AV1/VP9/HEVC) mux to MKV for external players. */
   videoCodec?: "h264" | "av1" | "hevc" | "vp9" | "other"
   previewURL?: string
   previewReferer?: string
@@ -92,7 +92,8 @@ const DOWNLOAD_DIR = Path.join(ROOT_DIR, "Downloads")
 const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
-const MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".m4a", ".aac", ".opus", ".mp3"])
+/** Final containers + common yt-dlp intermediates (Bilibili DASH often uses .m4s). */
+const MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".m4a", ".aac", ".opus", ".mp3", ".m4s", ".ts", ".flv"])
 
 export function quote(value: string): string {
   return `"${value.replace(/["\\$`]/g, "\\$&")}"`
@@ -138,6 +139,18 @@ export function isTransientProbeFailure(value: string): boolean {
   return /timed out|timeout|TransportError|ECONNRESET|Connection reset|temporarily unavailable|Temporary failure|Network is unreachable|nodename nor servname/i.test(text)
 }
 
+/** Download-stage TLS/handshake timeouts (mid-file SSL), distinct from probe webpage open. */
+export function isDownloadTlsTimeout(value: string): boolean {
+  const text = String(value || "")
+  if (!text) return false
+  if (/handshake operation timed out/i.test(text)) return true
+  if (/_ssl\.c:\d+.*timed out/i.test(text)) return true
+  if (/Got error:.*(?:timed out|timeout)/i.test(text) && !/Unable to download webpage/i.test(text)) return true
+  if (/\[download\].*(?:Got error:|ERROR:).*(?:timed out|timeout)/i.test(text)) return true
+  if (/ERROR:\s*\[download\].*(?:timed out|timeout)/i.test(text)) return true
+  return false
+}
+
 function stripHostNoise(value: string): string {
   return value
     .split(/\r?\n/)
@@ -147,12 +160,40 @@ function stripHostNoise(value: string): string {
     .join("\n")
 }
 
-function compactMessage(value: string): string {
+/** Extract yt-dlp ERROR snippets even when glued to a progress line without newline. */
+function extractErrorSnippets(source: string): string[] {
+  const snippets: string[] = []
+  for (const match of source.matchAll(/(?:^|[\s\r\n])ERROR:\s*([^\r\n]+)/gi)) {
+    const body = (match[1] || "").trim()
+    if (body) snippets.push(body)
+  }
+  for (const match of source.matchAll(/\[download\]\s*Got error:\s*([^\r\n]+)/gi)) {
+    const body = (match[1] || "").trim()
+    if (body) snippets.push(`[download] Got error: ${body}`)
+  }
+  for (const line of source.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    if (line.startsWith("ERROR:") || /^ERROR\b/i.test(line) || /Unable to download webpage/i.test(line)) {
+      snippets.push(line.replace(/^ERROR:\s*/i, ""))
+    }
+  }
+  return snippets
+}
+
+export function compactMessage(value: string): string {
   const cleaned = stripHostNoise(value)
   const source = cleaned || value
-  const errors = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith("ERROR:") || /^ERROR\b/i.test(line) || /Unable to download webpage/i.test(line))
+  if (isDownloadTlsTimeout(source)) {
+    return "下载过程中网络 TLS/握手超时，请检查网络后重试；可改选 H.264 清晰度或稍后再试。"
+  }
+  const errors = extractErrorSnippets(source)
   if (errors.length) {
     const last = errors[errors.length - 1].replace(/^ERROR:\s*/i, "").slice(0, 800)
+    if (/Unable to download webpage/i.test(last) && /timed out|timeout|TransportError/i.test(last)) {
+      return "打开页面超时，暂时识别不到格式。请检查网络后重试；短链可改完整视频页链接再分析。"
+    }
+    if (/timed out|timeout|TransportError/i.test(last) && !/Unable to download webpage/i.test(last)) {
+      return "下载过程中网络超时，请检查网络后重试。"
+    }
     if (/timed out|timeout|TransportError/i.test(last)) {
       return "打开页面超时，暂时识别不到格式。请检查网络后重试；短链可改完整视频页链接再分析。"
     }
@@ -161,8 +202,11 @@ function compactMessage(value: string): string {
   if (isHostDeinitNoise(value) && !cleaned) {
     return "操作被宿主中断或日志干扰，请重试。"
   }
-  if (/timed out|timeout|TransportError/i.test(source)) {
+  if (/Unable to download webpage/i.test(source) && /timed out|timeout|TransportError/i.test(source)) {
     return "打开页面超时，暂时识别不到格式。请检查网络后重试；短链可改完整视频页链接再分析。"
+  }
+  if (/timed out|timeout|TransportError/i.test(source)) {
+    return "下载过程中网络超时，请检查网络后重试。"
   }
   return source.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(-800)
 }
@@ -244,6 +288,54 @@ export function extractFirstURL(value: string | null | undefined): string | null
   return isAllowedURL(candidate) ? candidate : null
 }
 
+/** Normalize for batch dedupe: drop trailing slashes so site vs generic matches collapse. */
+function batchURLDedupeKey(url: string): string {
+  return url.replace(/\/+$/, "") || url
+}
+
+/** Batch add: collect public http(s) URLs in document order; site patterns preferred at same index; dedupe. */
+export function extractAllURLs(value: string | null | undefined): string[] {
+  if (!value) return []
+  type Hit = { start: number; raw: string; priority: number }
+  const hits: Hit[] = []
+
+  for (const pattern of [...XIAOHONGSHU_URL_PATTERNS, ...DOUYIN_URL_PATTERNS]) {
+    const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`)
+    for (const match of value.matchAll(global)) {
+      if (match[0] != null && typeof match.index === "number") {
+        hits.push({ start: match.index, raw: match[0], priority: 0 })
+      }
+    }
+  }
+
+  const generic = /https?:\/\/[^\s<>"']+/gi
+  for (const match of value.matchAll(generic)) {
+    if (match[0] != null && typeof match.index === "number") {
+      hits.push({ start: match.index, raw: match[0], priority: 1 })
+    }
+  }
+
+  hits.sort((a, b) => a.start - b.start || a.priority - b.priority)
+
+  const found: string[] = []
+  const seen = new Set<string>()
+  for (const hit of hits) {
+    const candidate = sanitizeExtractedURL(hit.raw)
+    if (!isAllowedURL(candidate)) continue
+    const key = batchURLDedupeKey(candidate)
+    if (seen.has(key)) continue
+    seen.add(key)
+    // Prefer canonical form without trailing slash for queue identity.
+    found.push(key.startsWith("http") ? key : candidate)
+  }
+
+  return found
+}
+
+/** Spec caps for batch add / session queue (docs/superpowers/specs/2026-07-26-yoinks-batch-download-design.md). */
+export const BATCH_ADD_MAX = 20
+export const BATCH_QUEUE_MAX = 30
+
 async function ensureDirectories() {
   if (!(await FileManager.exists(DOWNLOAD_DIR))) await FileManager.createDirectory(DOWNLOAD_DIR, true)
   if (!(await FileManager.exists(TEMP_DIR))) await FileManager.createDirectory(TEMP_DIR, true)
@@ -253,7 +345,7 @@ async function runCommand(command: string, timeout: number) {
   return Shell.run(command, { cwd: Script.directory, timeout })
 }
 
-/** One automatic re-run when Shell captures pure host diagnostics instead of yt-dlp. */
+/** One automatic re-run for host noise or download TLS/handshake timeouts. */
 async function runYtdlpWithHostNoiseRetry(options: {
   command: string
   timeout: number
@@ -275,6 +367,24 @@ async function runYtdlpWithHostNoiseRetry(options: {
       details: { stage: options.stage, delayMilliseconds: 400 },
     })
     await new Promise<void>((resolve) => setTimeout(resolve, 400))
+    if (options.isCancelFlagSet()) {
+      return { ...result, exitCode: 130 }
+    }
+    result = await runCommand(options.command, options.timeout)
+  }
+  if (
+    result.exitCode !== 0
+    && result.exitCode !== 130
+    && !options.isCancelFlagSet()
+    && isDownloadTlsTimeout(result.output || "")
+  ) {
+    await logEvent({
+      level: "warn",
+      event: "download.tls-timeout.retry",
+      taskId: options.taskId,
+      details: { stage: options.stage, delayMilliseconds: 800 },
+    })
+    await new Promise<void>((resolve) => setTimeout(resolve, 800))
     if (options.isCancelFlagSet()) {
       return { ...result, exitCode: 130 }
     }
@@ -425,7 +535,7 @@ export function formatVideoChoiceLabel(options: {
 }): string {
   const heightText = options.height ? `${options.height}p` : "视频"
   const codecText = options.codecLabel || "编码未知"
-  const hardHint = options.hardCodec ? " · iOS可能无画面" : ""
+  const hardHint = options.hardCodec ? " · 外部播放器" : ""
   const containerText = options.containerExt ? ` · 容器·${options.containerExt.toUpperCase()}` : ""
   const fpsText = options.fps ? ` · ${Math.round(options.fps)} fps` : ""
   const sizeText = options.estimatedBytes ? ` · 约 ${formatBytes(options.estimatedBytes)}` : ""
@@ -494,15 +604,20 @@ export function buildChoices(formats: RawFormat[]): MediaChoice[] {
 
     const audio = audioFormats.find((candidate) => item.ext === "mp4" || item.ext === "m4s" ? (candidate.ext === "m4a" || candidate.ext === "mp4") : candidate.ext === "webm") || audioFormats[0]
     const canMerge = Boolean(audio)
-    const mergeExtension = (item.ext === "mp4" || item.ext === "m4s") && (audio?.ext === "m4a" || audio?.ext === "mp4") ? "mp4" : "mkv"
+    const videoCodec = videoCodecKind(item)
+    const hardCodec = videoCodec === "av1" || videoCodec === "hevc" || videoCodec === "vp9"
+    // HEVC/AV1/VP9: always MKV stream-copy for external players; H.264+AAC stays MP4.
+    const mergeExtension: "mp4" | "mkv" = hardCodec
+      ? "mkv"
+      : (item.ext === "mp4" || item.ext === "m4s") && (audio?.ext === "m4a" || audio?.ext === "mp4")
+        ? "mp4"
+        : "mkv"
     const previewSource = pickPreviewVideoSource(item, muxedVideos, videoOnly)
     const previewIsMuxed = isMuxedVideo(previewSource)
     // Hard codecs in WKWebView often black-screen; never pair separate audio for them (avoids 有声无画).
     const previewDecodable = isAvcCodec(previewSource) || !isHardVideoCodec(previewSource)
     const needsSeparateAudio =
       previewDecodable && !previewIsMuxed && Boolean(audio?.previewURL)
-    const videoCodec = videoCodecKind(item)
-    const hardCodec = videoCodec === "av1" || videoCodec === "hevc" || videoCodec === "vp9"
     const estimatedBytes = (item.filesize || 0) + (audio?.filesize || 0) || undefined
     choices.push({
       id: `video-${item.height}-${item.formatId}${audio ? `-with-${audio.formatId}` : "-silent"}`,
@@ -958,8 +1073,103 @@ function isM3U8URL(url: string): boolean {
   return lower.includes(".m3u8") || lower.includes("application/x-mpegurl") || lower.includes("application/vnd.apple.mpegurl")
 }
 
-function parseOutputPaths(output: string): string[] {
-  return uniquePaths(output.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith("/") && MEDIA_EXTENSIONS.has(extensionOf(line))))
+/** Absolute media paths printed by ytdlp_runner or embedded in yt-dlp log lines. */
+export function parseOutputPaths(output: string): string[] {
+  const found: string[] = []
+  for (const raw of String(output || "").split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    if (line.startsWith("/") && MEDIA_EXTENSIONS.has(extensionOf(line))) {
+      found.push(line)
+      continue
+    }
+    // [download] Destination: /abs/path.mp4
+    const destination = line.match(/(?:^|\s)Destination:\s*(\/\S+)/i)
+    if (destination?.[1] && MEDIA_EXTENSIONS.has(extensionOf(destination[1]))) {
+      found.push(destination[1])
+      continue
+    }
+    // [download] /abs/path.mp4 has already been downloaded
+    const already = line.match(/(?:^|\s)(\/\S+)\s+has already been downloaded/i)
+    if (already?.[1] && MEDIA_EXTENSIONS.has(extensionOf(already[1]))) {
+      found.push(already[1])
+      continue
+    }
+    // Merging formats into "/abs/path.mp4"
+    const merged = line.match(/Merging formats into\s+"(\/[^"]+)"/i)
+    if (merged?.[1] && MEDIA_EXTENSIONS.has(extensionOf(merged[1]))) {
+      found.push(merged[1])
+    }
+  }
+  return uniquePaths(found)
+}
+
+/** Prefer stage-tagged files (`.video.` / `.audio.`) then any media under work dir. */
+export function listWorkMediaFiles(directory: string, nameHint?: string): string[] {
+  try {
+    if (!directory || !FileManager.existsSync(directory)) return []
+    const names = FileManager.readDirectorySync(directory)
+    const candidates: { path: string; mtime: number }[] = []
+    for (const name of names) {
+      if (!name || name.startsWith(".")) continue
+      if (name.endsWith(".part") || name.endsWith(".ytdl") || name.endsWith(".temp")) continue
+      const full = Path.join(directory, name)
+      if (!MEDIA_EXTENSIONS.has(extensionOf(full))) continue
+      if (nameHint && !name.includes(nameHint)) continue
+      try {
+        if (!FileManager.existsSync(full)) continue
+        const stat = FileManager.statSync(full)
+        const mtime = typeof stat.modificationDate === "number" ? stat.modificationDate : 0
+        const size = typeof stat.size === "number" ? stat.size : 0
+        if (size <= 0) continue
+        candidates.push({ path: full, mtime })
+      } catch {
+        // skip unreadable entries
+      }
+    }
+    candidates.sort((a, b) => b.mtime - a.mtime || b.path.localeCompare(a.path))
+    return candidates.map((item) => item.path)
+  } catch {
+    return []
+  }
+}
+
+/** Resolve downloaded media: stdout paths first, then work-directory scan. */
+export function resolveDownloadedMediaPath(options: {
+  output: string
+  workDirectory: string
+  nameHint?: string
+  excludePaths?: string[]
+}): string | undefined {
+  const excluded = new Set(options.excludePaths || [])
+  const usable = (path: string) => {
+    if (excluded.has(path)) return false
+    try {
+      return FileManager.existsSync(path)
+    } catch {
+      return false
+    }
+  }
+  const fromOutput = [...parseOutputPaths(options.output)].reverse().find((path) => usable(path))
+  if (fromOutput) return fromOutput
+  const fromDir = listWorkMediaFiles(options.workDirectory, options.nameHint).filter((path) => usable(path))
+  if (fromDir.length) return fromDir[0]
+  // Stage hint miss: prefer files that do not belong to the other merge stage.
+  if (options.nameHint) {
+    const otherHint = options.nameHint.includes("video")
+      ? ".audio."
+      : options.nameHint.includes("audio")
+        ? ".video."
+        : ""
+    const any = listWorkMediaFiles(options.workDirectory).filter((path) => {
+      if (!usable(path)) return false
+      const base = Path.basename(path)
+      if (otherHint && base.includes(otherHint)) return false
+      return true
+    })
+    if (any.length) return any[0]
+  }
+  return undefined
 }
 
 function extractProbeStreamTypes(output: string): string[] {
@@ -998,7 +1208,7 @@ function videoCodecKind(item: RawFormat): NonNullable<MediaChoice["videoCodec"]>
   return "other"
 }
 
-/** AV1/VP9/HEVC often play as audio-only in iOS Quick Look / AVPlayer. */
+/** AV1/VP9/HEVC: keep original; open with external players (Infuse/VLC/nPlayer). */
 export function isDeviceHardVideoChoice(choice: Pick<MediaChoice, "videoCodec" | "label"> | null | undefined): boolean {
   if (!choice) return false
   if (choice.videoCodec === "av1" || choice.videoCodec === "hevc" || choice.videoCodec === "vp9") return true
@@ -1010,14 +1220,35 @@ async function verifyMediaFile(filePath: string, choice: MediaChoice, taskId: st
   const result = await runCommand(`ffprobe -v error -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 ${quote(filePath)}`, 60)
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "verify.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output, filePath } })
   if (result.exitCode !== 0) {
-    if (/\bav1\b|av01|Failed to read extradata|Failed to read unit/i.test(result.output || "")) {
-      throw new Error("下载文件验证失败：视频为 AV1/损坏流，本机 ffprobe 无法解析。请改选 H.264（AVC）清晰度后重试。")
+    // Hard codecs often make this LGPL ffprobe fail while the MKV is fine for external players.
+    if (isDeviceHardVideoChoice(choice)) {
+      const size = await fileSizeBytes(filePath)
+      if (size > 0) {
+        await logEvent({
+          level: "warn",
+          event: "verify.soft.completed",
+          taskId,
+          details: { filePath, fileSizeBytes: size, reason: "hard-codec-ffprobe-unreliable", sourceVideoCodec: choice.videoCodec || null },
+        })
+        return
+      }
     }
     throw new Error("下载文件验证失败：ffprobe 无法读取输出")
   }
   const types = extractProbeStreamTypes(result.output)
   const expected = choice.kind === "audio" ? "audio" : "video"
-  if (!types.includes(expected)) throw new Error(`下载文件验证失败：缺少${expected === "audio" ? "音频" : "视频"}流`)
+  if (!types.includes(expected)) {
+    if (isDeviceHardVideoChoice(choice) && (await fileSizeBytes(filePath)) > 0) {
+      await logEvent({
+        level: "warn",
+        event: "verify.soft.completed",
+        taskId,
+        details: { filePath, streamTypes: types, expected, reason: "hard-codec-stream-types-missing" },
+      })
+      return
+    }
+    throw new Error(`下载文件验证失败：缺少${expected === "audio" ? "音频" : "视频"}流`)
+  }
   if (choice.mergeAudioFormat && !types.includes("audio")) throw new Error("下载文件验证失败：合并结果缺少音频流")
   await logEvent({ level: "info", event: "verify.completed", taskId, details: { filePath, streamTypes: types, expected } })
 }
@@ -1187,7 +1418,7 @@ export async function downloadMedia(options: {
       })
       stopVideoPoll()
       clearProgressFile(progressPath)
-      await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output } })
+      await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output, workFiles: listWorkMediaFiles(workDirectory) } })
       if (videoResult.exitCode === 130) throw new Error("下载已取消")
       if (videoResult.exitCode !== 0) {
         if (isBilibiliPremiumMissing(videoResult.output || "")) {
@@ -1195,12 +1426,16 @@ export async function downloadMedia(options: {
         }
         throw new Error(compactMessage(videoResult.output || "视频流下载失败"))
       }
-      const videoPath = [...parseOutputPaths(videoResult.output)].reverse().find((path) => FileManager.existsSync(path))
+      const videoFromOutput = parseOutputPaths(videoResult.output).some((path) => FileManager.existsSync(path))
+      const videoPath = resolveDownloadedMediaPath({ output: videoResult.output, workDirectory, nameHint: ".video." })
       if (!videoPath) {
         if (isBilibiliPremiumMissing(videoResult.output || "")) {
           throw new Error("视频流未写出文件：该清晰度可能需大会员。请改选 H.264 清晰度或登录后重试。")
         }
         throw new Error("视频流下载完成但未找到输出文件")
+      }
+      if (!videoFromOutput) {
+        await logEvent({ level: "warn", event: "download.output.fallback", taskId, details: { stage: "video", filePath: videoPath, workFiles: listWorkMediaFiles(workDirectory) } })
       }
 
       tracker.emit(0.5, "正在下载音频流")
@@ -1214,23 +1449,46 @@ export async function downloadMedia(options: {
       })
       stopAudioPoll()
       clearProgressFile(progressPath)
-      await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output } })
+      await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output, workFiles: listWorkMediaFiles(workDirectory) } })
       if (audioResult.exitCode === 130) throw new Error("下载已取消")
       if (audioResult.exitCode !== 0) throw new Error(compactMessage(audioResult.output || "音频流下载失败"))
-      const audioPath = [...parseOutputPaths(audioResult.output)].reverse().find((path) => FileManager.existsSync(path))
+      const audioFromOutput = parseOutputPaths(audioResult.output).some((path) => FileManager.existsSync(path))
+      const audioPath = resolveDownloadedMediaPath({ output: audioResult.output, workDirectory, nameHint: ".audio.", excludePaths: [videoPath] })
       if (!audioPath) throw new Error("音频流下载完成但未找到输出文件")
+      if (!audioFromOutput) {
+        await logEvent({ level: "warn", event: "download.output.fallback", taskId, details: { stage: "audio", filePath: audioPath, workFiles: listWorkMediaFiles(workDirectory) } })
+      }
 
-      const extension = options.choice.mergeExtension || "mkv"
-      const fileName = `${Path.basename(videoPath).replace(/\.video\.[^.]+$/, "")}.${extension}`
+      const hardCodec = isDeviceHardVideoChoice(options.choice)
+      // Hard codecs always MKV (stream-copy only); H.264 prefers choice.mergeExtension / mp4.
+      const extension = hardCodec ? "mkv" : options.choice.mergeExtension || "mkv"
+      const videoBase = Path.basename(videoPath).replace(/\.video\.[^.]+$/i, "").replace(/\.[^.]+$/, "")
+      const fileName = `${videoBase}.${extension}`
       const workPath = Path.join(workDirectory, fileName)
       const fastStart = extension === "mp4" ? " -movflags +faststart" : ""
-      tracker.emit(0.9, "正在使用内置 FFmpeg 合并")
+      tracker.emit(0.9, hardCodec ? "正在合成 MKV（无损，供外部播放器）" : "正在使用内置 FFmpeg 合并")
       const mergeResult = await runCommand(`ffmpeg -y -i ${quote(videoPath)} -i ${quote(audioPath)} -map 0:v:0 -map 1:a:0 -c copy${fastStart} ${quote(workPath)}`, 900)
-      await logEvent({ level: mergeResult.exitCode === 0 ? "info" : "error", event: "merge.ffmpeg.completed", taskId, details: { exitCode: mergeResult.exitCode, output: mergeResult.output, videoPath, audioPath, workPath } })
-      const needsDeviceTranscode = isDeviceHardVideoChoice(options.choice)
-      if (mergeResult.exitCode !== 0 || needsDeviceTranscode) {
-        // Stream-copy keeps AV1/VP9/HEVC → iOS Quick Look often plays audio only; force H.264.
-        tracker.emit(0.92, needsDeviceTranscode ? "正在转码为 iOS 可播放 H.264" : "无损合并失败，正在转码为兼容 MP4")
+      await logEvent({
+        level: mergeResult.exitCode === 0 ? "info" : "error",
+        event: "merge.ffmpeg.completed",
+        taskId,
+        details: {
+          exitCode: mergeResult.exitCode,
+          output: mergeResult.output,
+          videoPath,
+          audioPath,
+          workPath,
+          container: extension,
+          sourceVideoCodec: options.choice.videoCodec || null,
+          streamCopyOnly: hardCodec || undefined,
+        },
+      })
+      if (mergeResult.exitCode !== 0 || !FileManager.existsSync(workPath)) {
+        if (hardCodec) {
+          throw new Error(compactMessage(mergeResult.output || "HEVC/AV1/VP9 流拷贝合成 MKV 失败。请改选 H.264，或检查下载完整性后重试。"))
+        }
+        // H.264 path only: stream-copy failed → optional compatibility transcode.
+        tracker.emit(0.92, "无损合并失败，正在转码为兼容 MP4")
         await FileManager.remove(workPath).catch(() => {})
         const mp4Path = workPath.replace(/\.[^.]+$/, ".mp4")
         const transcode = await runCommand(
@@ -1244,14 +1502,11 @@ export async function downloadMedia(options: {
           details: {
             exitCode: transcode.exitCode,
             output: transcode.output,
-            reason: needsDeviceTranscode ? "device-hard-codec" : "stream-copy-failed",
+            reason: "stream-copy-failed",
             sourceVideoCodec: options.choice.videoCodec || null,
           },
         })
         if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
-          if (needsDeviceTranscode) {
-            throw new Error("该清晰度为 AV1/VP9/HEVC，本机无法可靠转码为可播放视频。请改选带 H.264 的清晰度后重试。")
-          }
           throw new Error(compactMessage(mergeResult.output || transcode.output || "FFmpeg 合并失败"))
         }
         await verifyMediaFile(mp4Path, options.choice, taskId)
@@ -1262,8 +1517,20 @@ export async function downloadMedia(options: {
       }
       await verifyMediaFile(workPath, options.choice, taskId)
       const filePath = await publishMediaFile(workPath, taskId)
-      tracker.emit(1, "下载、合并并验证完成")
-      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, mergedWithFFmpeg: true } })
+      tracker.emit(1, hardCodec ? "下载并合成 MKV 完成（请用外部播放器打开）" : "下载、合并并验证完成")
+      await logEvent({
+        level: "info",
+        event: "download.completed",
+        taskId,
+        details: {
+          filePath,
+          choiceId: options.choice.id,
+          mergedWithFFmpeg: true,
+          container: extension,
+          sourceVideoCodec: options.choice.videoCodec || null,
+          streamCopyOnly: hardCodec || undefined,
+        },
+      })
       return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
     }
 
@@ -1279,40 +1546,32 @@ export async function downloadMedia(options: {
     })
     stopPoll()
     clearProgressFile(progressPath)
-    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "download.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output } })
+    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "download.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output, workFiles: listWorkMediaFiles(workDirectory) } })
     if (result.exitCode === 130) throw new Error("下载已取消")
     if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "yt-dlp 下载失败"))
-    const paths = parseOutputPaths(result.output)
-    let filePath = [...paths].reverse().find((path) => FileManager.existsSync(path))
+    const singleFromOutput = parseOutputPaths(result.output).some((path) => FileManager.existsSync(path))
+    let filePath = resolveDownloadedMediaPath({ output: result.output, workDirectory })
     if (!filePath) throw new Error("下载完成但未找到输出文件")
-    if (options.choice.kind === "video" && isDeviceHardVideoChoice(options.choice)) {
-      tracker.emit(0.92, "正在转码为 iOS 可播放 H.264")
-      const mp4Path = Path.join(workDirectory, `${Path.basename(filePath).replace(/\.[^.]+$/, "")}.h264.mp4`)
-      const transcode = await runCommand(
-        `ffmpeg -y -i ${quote(filePath)} -map 0:v:0 -map 0:a:0? -c:v h264_videotoolbox -c:a aac -movflags +faststart ${quote(mp4Path)}`,
-        7200,
-      )
-      await logEvent({
-        level: transcode.exitCode === 0 ? "info" : "error",
-        event: "merge.ffmpeg.transcode.completed",
-        taskId,
-        details: {
-          exitCode: transcode.exitCode,
-          output: transcode.output,
-          reason: "device-hard-codec-single",
-          sourceVideoCodec: options.choice.videoCodec || null,
-        },
-      })
-      if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
-        throw new Error("该清晰度为 AV1/VP9/HEVC，本机无法可靠转码为可播放视频。请改选带 H.264 的清晰度后重试。")
-      }
-      filePath = mp4Path
+    if (!singleFromOutput) {
+      await logEvent({ level: "warn", event: "download.output.fallback", taskId, details: { stage: "single", filePath, workFiles: listWorkMediaFiles(workDirectory) } })
     }
+    // Single-file HEVC/AV1/VP9: keep original container; open with external players (no H.264 transcode).
     tracker.emit(0.96, "正在验证文件")
     await verifyMediaFile(filePath, options.choice, taskId)
     const publishedPath = await publishMediaFile(filePath, taskId)
-    tracker.emit(1, "下载并验证完成")
-    await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath: publishedPath, choiceId: options.choice.id, transcoded: isDeviceHardVideoChoice(options.choice) || undefined, sourceVideoCodec: options.choice.videoCodec || null } })
+    const hardSingle = options.choice.kind === "video" && isDeviceHardVideoChoice(options.choice)
+    tracker.emit(1, hardSingle ? "下载完成（请用外部播放器打开）" : "下载并验证完成")
+    await logEvent({
+      level: "info",
+      event: "download.completed",
+      taskId,
+      details: {
+        filePath: publishedPath,
+        choiceId: options.choice.id,
+        sourceVideoCodec: options.choice.videoCodec || null,
+        streamCopyOnly: hardSingle || undefined,
+      },
+    })
     return { filePath: publishedPath, fileName: Path.basename(publishedPath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(publishedPath) }
   } catch (error) {
     await logEvent({ level: "error", event: "download.failed", taskId, details: { message: error instanceof Error ? error.message : String(error) } })

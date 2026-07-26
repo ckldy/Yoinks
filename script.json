@@ -2,16 +2,16 @@
   "name": "Yoinks",
   "icon": "arrow.down.to.line.compact",
   "color": "rgba(52, 199, 89, 1)",
-  "version": "1.3.3",
+  "version": "1.4.5",
   "runInApp": true,
   "intentInputTypes": ["URLs", "Text"],
-  "description": "Download public media with a focused Yoinks-style workflow.",
+  "description": "Download public media with a focused Yoinks-style workflow, including sequential batch queues.",
   "localizedNames": {
     "en": "Yoinks",
     "zh": "Yoinks"
   },
   "localizedDescriptions": {
     "en": "Paste or share a public media link, choose an output format, then save it to Photos or Files.",
-    "zh": "粘贴或分享公开媒体链接，选择输出格式后保存到相册或文件。"
+    "zh": "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。"
   }
 }
