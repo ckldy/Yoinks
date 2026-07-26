@@ -6,6 +6,19 @@
 - 次版本：向后兼容的新功能。
 - 修订版本：向后兼容的问题修复与小幅优化。
 
+## 1.4.6 - 2026-07-26
+
+### 修复
+
+- **YouTube 在线预览无画面**：yt-dlp 返回的 YouTube video-only 流为 DASH movie-fragment MP4，现在识别 `googlevideo.com` 域名并统一走 `DashPlayerService` 播放。
+- **YouTube VP9 预览失败**：VP9 格式音频轨道为 webm/opus，`DashPlayerService` 仅支持 MP4 DASH init/index；预览时自动将 webm 音频回退到同链接的 m4a AAC，实际以 H.264 视频 + AAC 音频完成预览。
+- DASH init/index 探测 Range 从 512KB 放宽到 2MB，覆盖更大的 `moov+sidx`。
+
+### 验证
+
+- TypeScript 诊断 0 错误；`verify_online_preview.ts` 6 组测试通过。
+- 真机验证：YouTube H.264 / VP9 / AV1、B 站 `.m4s` DASH 在线预览均正常播放。
+
 ## 1.4.5 - 2026-07-26
 
 ### 变更

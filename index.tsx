@@ -120,6 +120,7 @@ import {
   supportedAuthPlatforms,
 } from "./services/platform-auth"
 import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-preview"
+import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
 
 const HISTORY_TAB = 0
@@ -350,7 +351,7 @@ function View() {
   const closingRef = useRef(false)
   const analysisGenerationRef = useRef(0)
   const launchClipboardSuppressedRef = useRef(false)
-  const previewPlayerRef = useRef<HLSPlayerService | null>(null)
+  const previewPlayerRef = useRef<HLSPlayerService | DashPlayerService | null>(null)
   /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
   const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
 
@@ -1483,6 +1484,9 @@ function View() {
       previewHeaders: selectedChoice.previewHeaders,
       // DASH video-only: pair separate audio stream (no full player-skill sync).
       audioUrl: selectedChoice.previewAudioURL,
+      duration: probe.duration,
+      videoCodec: selectedChoice.previewVideoCodec,
+      audioCodec: selectedChoice.previewAudioCodec,
     }
 
     const result = await openOnlinePreview(previewOptions)

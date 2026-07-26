@@ -242,7 +242,7 @@ export interface PlayerErrorEvent extends PlayerEvent {
 // Request Mode Reporting
 // ============================================
 
-export type RequestMode = "hls.js" | "native-fallback" | "unknown"
+export type RequestMode = "direct" | "hls.js" | "dash.js" | "native-fallback" | "unknown"
 
 export interface RequestModeEvent extends PlayerEvent {
   type: "requestmode"

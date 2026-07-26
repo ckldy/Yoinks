@@ -1,6 +1,7 @@
 import { logEvent, safeText } from "./logs"
 import type { PreviewAutoplayMode } from "./preferences"
 import { createPlayer, type PlayerConfig, type HLSPlayerService } from "./player/hls-player-service"
+import { createDashPlayer, type DashPlayerService } from "./player/dash-player-service"
 
 export type OnlinePreviewOptions = {
   url: string
@@ -13,12 +14,44 @@ export type OnlinePreviewOptions = {
   previewHeaders?: Record<string, string>
   /** Separate audio for DASH video-only preview (Bilibili/YouTube). */
   audioUrl?: string
+  /** Media duration in seconds; required for DASH MPD generation. */
+  duration?: number
+  /** Actual video codec string for DASH MPD (e.g. avc1.640033). */
+  videoCodec?: string
+  /** Actual audio codec string for DASH MPD (e.g. mp4a.40.2). */
+  audioCodec?: string
 }
 
 export type OnlinePreviewResult =
-  | { status: "presented"; player: HLSPlayerService | null; played: boolean }
+  | { status: "presented"; player: HLSPlayerService | DashPlayerService | null; played: boolean }
   | { status: "invalid-url"; message: string }
   | { status: "failed"; message: string }
+
+function isDashSegment(url: string): boolean {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase()
+    return pathname.endsWith(".m4s") || pathname.includes(".m4s")
+  } catch {
+    return /\.m4s(?:[?#]|$)/i.test(url)
+  }
+}
+
+/**
+ * YouTube video-only streams are served from googlevideo.com as complete
+ * DASH movie-fragment ISO BMFF files (ftyp → moov → sidx → moof → mdat).
+ * Safari/WKWebView cannot decode these with a plain <video> element, so they
+ * must go through DashPlayerService like Bilibili .m4s segments.
+ * Muxed YouTube formats (itag 18/22) have no separate audioUrl and will keep
+ * using the direct progressive path.
+ */
+export function isGoogleVideoDashUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase()
+    return hostname.includes("googlevideo.com")
+  } catch {
+    return false
+  }
+}
 
 export const PREVIEW_PLAYBACK_TIMEOUT_MS = 12_000
 
@@ -32,7 +65,7 @@ type PlaybackWait = {
   dispose: (reason?: "dismissed" | "cancel") => void
 }
 
-function waitForPlayback(player: HLSPlayerService): PlaybackWait {
+function waitForPlayback(player: HLSPlayerService | DashPlayerService): PlaybackWait {
   let settled = false
   let timeout: ReturnType<typeof setTimeout> | null = null
   let offPlay: (() => void) | null = null
@@ -91,15 +124,30 @@ function waitForPlayback(player: HLSPlayerService): PlaybackWait {
   }
 }
 
+function isBilibiliStreamUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase()
+    return hostname.includes("bilibili") || hostname.includes("bilivideo")
+  } catch {
+    return false
+  }
+}
+
 function resolveEffectiveReferer(options: OnlinePreviewOptions): string {
-  return options.previewReferer ?? options.webpageURL ?? options.referer ?? options.url
+  const candidate = options.previewReferer ?? options.webpageURL ?? options.referer ?? options.url
+  // Never use the .m4s/stream URL itself as the document base for Bilibili;
+  // that would make Referer point to the CDN and cause 403.
+  if (isBilibiliStreamUrl(candidate) && candidate === options.url) {
+    return options.webpageURL ?? options.referer ?? "https://www.bilibili.com/"
+  }
+  return candidate
 }
 
 function resolveEffectiveHeaders(options: OnlinePreviewOptions): Record<string, string> {
   return options.previewHeaders ?? options.headers ?? {}
 }
 
-async function safeDestroy(player: HLSPlayerService | null | undefined): Promise<void> {
+async function safeDestroy(player: HLSPlayerService | DashPlayerService | null | undefined): Promise<void> {
   if (!player) return
   try {
     await player.destroy()
@@ -151,9 +199,17 @@ export async function openOnlinePreview(
     playsInline: true,
     hlsJsUrl: "https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js",
     audioUrl: options.audioUrl,
+    videoCodec: options.videoCodec,
+    audioCodec: options.audioCodec,
   }
 
-  const player = createPlayer(playerConfig)
+  const useDash = (isDashSegment(url) || isGoogleVideoDashUrl(url)) && Boolean(options.audioUrl)
+  const player = useDash
+    ? createDashPlayer({ ...playerConfig, audioUrl: options.audioUrl })
+    : createPlayer(playerConfig)
+  if (useDash) {
+    ;(player as DashPlayerService).prepare(url, options.audioUrl || "", options.duration || 0)
+  }
   let wait: PlaybackWait | null = null
   let played = false
   let mediaFailed: string | null = null
@@ -182,7 +238,7 @@ export async function openOnlinePreview(
       wait.dispose("dismissed")
       try { await playTask } catch { /* ignore */ }
       try { await confirmationTask } catch { /* ignore */ }
-      await safeDestroy(player)
+      await safeDestroy(player as any)
     }
 
     // Hard fail only for fatal media errors. Timeout while sheet was open must not
@@ -234,7 +290,7 @@ export async function openOnlinePreview(
     return { status: "presented", player: null, played }
   } catch (error) {
     wait?.dispose("cancel")
-    await safeDestroy(player)
+    await safeDestroy(player as any)
     const message = error instanceof Error ? error.message : String(error)
     await logEvent({
       level: "error",

@@ -154,11 +154,20 @@ export interface PlayerConfig {
   // hls.js URL (optional, for local bundle)
   hlsJsUrl?: string
 
+  // dash.js URL (optional, for local bundle)
+  dashJsUrl?: string
+
   // Base URL for WebView
   baseUrl?: string
 
   /** Separate audio stream for DASH video-only preview (Bilibili/YouTube). */
   audioUrl?: string
+
+  /** Actual video codec string for DASH MPD (e.g. avc1.640033). */
+  videoCodec?: string
+
+  /** Actual audio codec string for DASH MPD (e.g. mp4a.40.2). */
+  audioCodec?: string
 }
 
 export interface HlsConfig {
@@ -245,7 +254,7 @@ export interface PlayerErrorEvent extends PlayerEvent {
 // Request Mode Reporting
 // ============================================
 
-export type RequestMode = "direct" | "hls.js" | "native-fallback" | "unknown"
+export type RequestMode = "direct" | "hls.js" | "dash.js" | "native-fallback" | "unknown"
 
 export interface RequestModeEvent extends PlayerEvent {
   type: "requestmode"

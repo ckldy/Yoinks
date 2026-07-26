@@ -1,6 +1,7 @@
 import { Path, Script } from "scripting"
 import { createTaskId, logEvent } from "./logs"
 import type { AuthPlatform } from "./platform-auth"
+import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
 import { cancelBackgroundDownloads, downloadURLToFileWithProgress } from "./background-download"
 import {
   buildDownloadCandidates,
@@ -51,6 +52,10 @@ export type MediaChoice = {
   previewHeaders?: Record<string, string>
   /** Separate audio stream for DASH video-only online preview. */
   previewAudioURL?: string
+  /** Actual video codec string (e.g. avc1.640033) for DASH MPD. */
+  previewVideoCodec?: string
+  /** Actual audio codec string (e.g. mp4a.40.2) for DASH MPD. */
+  previewAudioCodec?: string
 }
 
 export type MediaProbe = {
@@ -137,6 +142,12 @@ export function isTransientProbeFailure(value: string): boolean {
   if (isHostDeinitNoise(value)) return true
   const text = String(value || "")
   return /timed out|timeout|TransportError|ECONNRESET|Connection reset|temporarily unavailable|Temporary failure|Network is unreachable|nodename nor servname/i.test(text)
+}
+
+/** TLS certificate verification failures, e.g. caused by an on-device HTTPS capture/MITM. */
+export function isCertificateVerifyFailure(value: string): boolean {
+  const text = String(value || "")
+  return /CERTIFICATE_VERIFY_FAILED|certificate verify failed|unable to get local issuer certificate/i.test(text)
 }
 
 /** Download-stage TLS/handshake timeouts (mid-file SSL), distinct from probe webpage open. */
@@ -602,7 +613,15 @@ export function buildChoices(formats: RawFormat[]): MediaChoice[] {
     if (seenVideoOnlyKeys.has(key)) continue
     seenVideoOnlyKeys.add(key)
 
-    const audio = audioFormats.find((candidate) => item.ext === "mp4" || item.ext === "m4s" ? (candidate.ext === "m4a" || candidate.ext === "mp4") : candidate.ext === "webm") || audioFormats[0]
+    const matchingAudios = audioFormats.filter((candidate) => item.ext === "mp4" || item.ext === "m4s" ? (candidate.ext === "m4a" || candidate.ext === "mp4") : candidate.ext === "webm")
+    const audio = matchingAudios[0] || audioFormats[0]
+    // For preview, prefer an audio URL that survives HW-mirror rewriting (COS-signed URLs return 403).
+    let previewAudio = matchingAudios.find((candidate) => isHwCompatibleBilibiliUrl(candidate.previewURL || "")) || audio
+    // DashPlayerService only parses MP4 DASH init/index; webm/opus audio cannot be used as the DASH audio stream.
+    // Fall back to AAC (m4a/mp4) so YouTube VP9/AV1 choices can still preview via the H.264 video source.
+    if (previewAudio?.ext === "webm") {
+      previewAudio = audioFormats.find((candidate) => candidate.ext === "m4a" || candidate.ext === "mp4") || previewAudio
+    }
     const canMerge = Boolean(audio)
     const videoCodec = videoCodecKind(item)
     const hardCodec = videoCodec === "av1" || videoCodec === "hevc" || videoCodec === "vp9"
@@ -617,7 +636,7 @@ export function buildChoices(formats: RawFormat[]): MediaChoice[] {
     // Hard codecs in WKWebView often black-screen; never pair separate audio for them (avoids 有声无画).
     const previewDecodable = isAvcCodec(previewSource) || !isHardVideoCodec(previewSource)
     const needsSeparateAudio =
-      previewDecodable && !previewIsMuxed && Boolean(audio?.previewURL)
+      previewDecodable && !previewIsMuxed && Boolean(previewAudio?.previewURL)
     const estimatedBytes = (item.filesize || 0) + (audio?.filesize || 0) || undefined
     choices.push({
       id: `video-${item.height}-${item.formatId}${audio ? `-with-${audio.formatId}` : "-silent"}`,
@@ -640,7 +659,9 @@ export function buildChoices(formats: RawFormat[]): MediaChoice[] {
       previewURL: previewSource.previewURL,
       previewReferer: previewSource.previewReferer || item.previewReferer,
       previewHeaders: previewSource.previewHeaders || item.previewHeaders,
-      previewAudioURL: needsSeparateAudio ? audio?.previewURL : undefined,
+      previewAudioURL: needsSeparateAudio ? previewAudio?.previewURL : undefined,
+      previewVideoCodec: previewSource.vcodec || item.vcodec || undefined,
+      previewAudioCodec: previewAudio?.acodec || undefined,
     })
   }
 
@@ -909,7 +930,8 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   const taskId = createTaskId()
   await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile) } })
   const cookieArgument = options.cookieFile ? ` ${quote(options.cookieFile)}` : ""
-  const runProbe = () => runCommand(`python3 ${quote(PROBE_PATH)} ${quote(sourceURL)}${cookieArgument}`, 120)
+  const runProbe = (insecure = false) =>
+    runCommand(`python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""} ${quote(sourceURL)}${cookieArgument}`, 120)
 
   let result = await runProbe()
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
@@ -934,6 +956,28 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
         output: result.exitCode === 0 ? "媒体信息已返回" : result.output,
         afterTransientRetry: true,
         retryReason: reason,
+      },
+    })
+  }
+
+  // On-device HTTPS capture (MITM) often uses a cert that the system trusts but Python's CA bundle does not.
+  // Retry once with certificate verification disabled so testing with capture enabled still works.
+  if (result.exitCode !== 0 && isCertificateVerifyFailure(result.output || "")) {
+    await logEvent({
+      level: "warn",
+      event: "probe.ssl.retry",
+      taskId,
+      details: { reason: "certificate_verify_failed", insecure: true },
+    })
+    result = await runProbe(true)
+    await logEvent({
+      level: result.exitCode === 0 ? "info" : "error",
+      event: "probe.command.completed",
+      taskId,
+      details: {
+        exitCode: result.exitCode,
+        output: result.exitCode === 0 ? "媒体信息已返回" : result.output,
+        afterSslRetry: true,
       },
     })
   }

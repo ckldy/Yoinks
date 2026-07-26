@@ -8,6 +8,10 @@ import type {
   QualityOption,
   HlsConfig
 } from "./types"
+import {
+  BILIBILI_DESKTOP_UA,
+  rewriteBilibiliCdnUrl,
+} from "./bilibili-cdn"
 
 export type { PlayerConfig }
 
@@ -462,6 +466,10 @@ export class HLSPlayerService {
 
     const html = this.buildHtml()
     this.controller = new WebViewController()
+    // Bilibili CDN mirrors enforce UA checks; use a desktop Chrome UA by default.
+    try {
+      this.controller.setCustomUserAgent(this.config.userAgent || BILIBILI_DESKTOP_UA)
+    } catch { /* UA setting is best-effort */ }
     await this.controller.loadHTML(html, this.baseUrl)
 
     await this.setupMessageHandlers()
@@ -546,7 +554,10 @@ export class HLSPlayerService {
 
   async play(url: string, audioUrl?: string): Promise<void> {
     if (this.isDestroyed) throw new Error("Player destroyed")
-    this.currentUrl = url
+    // Rewrite Bilibili CDN hosts to the CORS-free mirror when possible.
+    const playbackUrl = rewriteBilibiliCdnUrl(url)
+    const pairedAudio = rewriteBilibiliCdnUrl(audioUrl || this.config.audioUrl || "")
+    this.currentUrl = playbackUrl
 
     if (!this.controller) await this.initialize()
 
@@ -555,12 +566,11 @@ export class HLSPlayerService {
       return () => clearTimeout(id)
     })
 
-    const pairedAudio = audioUrl || this.config.audioUrl || ""
-    const js = `play(${JSON.stringify(url)}, ${JSON.stringify(pairedAudio)})`
+    const js = `play(${JSON.stringify(playbackUrl)}, ${JSON.stringify(pairedAudio)})`
     await this.controller.evaluateJavaScript(js)
 
     // Unconfirmed intent only — waitForPlayback requires confirmed: true from WebView.
-    this.emit({ type: "play", timestamp: Date.now(), data: { url } })
+    this.emit({ type: "play", timestamp: Date.now(), data: { url: playbackUrl } })
   }
 
   async pause(): Promise<void> {

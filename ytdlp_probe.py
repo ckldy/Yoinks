@@ -66,12 +66,17 @@ def compact_format(item: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]
 
 
 def main() -> None:
-    if len(sys.argv) not in {2, 3}:
+    args = sys.argv[1:]
+    insecure = False
+    if args and args[0] == "--insecure":
+        insecure = True
+        args = args[1:]
+    if len(args) not in {1, 2}:
         print(json.dumps({"ok": False, "error": "missing URL"}))
         raise SystemExit(2)
 
-    url = sys.argv[1]
-    cookiefile = sys.argv[2] if len(sys.argv) == 3 else None
+    url = args[0]
+    cookiefile = args[1] if len(args) == 2 else None
     if not safe_url(url):
         print(json.dumps({"ok": False, "error": "invalid public http or https URL"}))
         raise SystemExit(2)
@@ -88,6 +93,7 @@ def main() -> None:
         "socket_timeout": 45,
         "retries": 3,
         "extractor_retries": 3,
+        "nocheckcertificate": insecure,
     }
     if cookiefile:
         options["cookiefile"] = cookiefile

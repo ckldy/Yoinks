@@ -2,7 +2,7 @@
 // Verification for Yoinks online-preview service
 
 import { Script } from "scripting"
-import { PREVIEW_PLAYBACK_TIMEOUT_MS, type OnlinePreviewOptions } from "./services/online-preview"
+import { isGoogleVideoDashUrl, PREVIEW_PLAYBACK_TIMEOUT_MS, type OnlinePreviewOptions } from "./services/online-preview"
 import { createPlayer } from "./services/player/hls-player-service"
 
 function assert(condition: boolean, message: string) {
@@ -81,6 +81,23 @@ async function runTests() {
   console.log("测试 5: 超时与请求模式契约")
   assert(PREVIEW_PLAYBACK_TIMEOUT_MS === 12_000, "播放确认超时为 12 秒")
   assert(player.getRequestMode() === "unknown", "初始请求模式正确")
+  console.log()
+
+  // Test 6: YouTube DASH URL 识别
+  console.log("测试 6: YouTube DASH URL 识别")
+  assert(
+    isGoogleVideoDashUrl("https://rr1---sn-a5msen7s.googlevideo.com/videoplayback?itag=137"),
+    "googlevideo.com videoplayback 应识别为 DASH"
+  )
+  assert(
+    !isGoogleVideoDashUrl("https://example.com/video.mp4"),
+    "普通 MP4 直链不应识别为 DASH"
+  )
+  assert(
+    !isGoogleVideoDashUrl("https://www.youtube.com/watch?v=roIDfcDzZ4c"),
+    "YouTube 页面 URL 不应识别为 DASH"
+  )
+  assert(!isGoogleVideoDashUrl("not-a-url"), "无效 URL 应安全返回 false")
   console.log()
 
   console.log("=== 所有静态验证通过 ===")
