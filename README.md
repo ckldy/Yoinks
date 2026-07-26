@@ -2,7 +2,7 @@
 
 面向 [Scripting](https://scripting.fun) 的 iOS 媒体下载脚本。粘贴或分享公开媒体链接，探测可选格式后下载，并可保存到相册或文件。
 
-当前版本：**1.4.5**
+当前版本：**1.4.7**
 
 > 本项目受 [Pablo Stanley / Yoinks](https://github.com/pablostanley/yoinks) 启发，在 Scripting 运行时中重新实现核心下载体验。Scripting 的模拟 Node.js 环境无法完整运行原版 `node` / `npm` 工作流，因此这里保留名称与使用路径，并针对 iOS 与宿主能力做了适配。
 
@@ -37,7 +37,7 @@ https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckld
 或从仓库安装：
 
 - GitHub：https://github.com/ckldy/Yoinks
-- 标签：https://github.com/ckldy/Yoinks/releases/tag/v1.4.5
+- 标签：https://github.com/ckldy/Yoinks/releases/tag/v1.4.7
 
 ### 手动安装
 
@@ -148,6 +148,9 @@ Git 工作流可使用 Scripting 的 [isomorphic-git](https://github.com/isomorp
 
 | 版本 | 要点 |
 |------|------|
+| 1.4.7 | X 视频预览：默认使用带音频的 progressive MP4 |
+| 1.4.6 | YouTube 预览走 DashPlayerService；VP9 音频回退到 AAC |
+| 1.4.5 | 硬编码下载改为 MKV 流拷贝 + 外部播放器 |
 | 1.3.3 | 格式标签显示编码；同高多编码并列 |
 | 1.3.2 | 下载硬编码黑屏：H.264 优先与转码/提示 |
 | 1.3.1 | 宿主诊断噪音导致误报下载失败时自动重试 |
