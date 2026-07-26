@@ -6,6 +6,17 @@
 - 次版本：向后兼容的新功能。
 - 修订版本：向后兼容的问题修复与小幅优化。
 
+## 1.4.7 - 2026-07-26
+
+### 修复
+
+- **X（Twitter）视频在线预览无声音**：X 的 HLS 流分为 video-only 和 audio-only playlist，默认选中的 HLS video-only 在播放器中没有音轨。现在当目标是 HLS video-only 时，优先选择同高度的 muxed progressive MP4 作为预览源，并正确识别 X 的 `hls-audio-*` 音频格式用于下载合并。
+
+### 验证
+
+- TypeScript 诊断 0 错误；`verify_x_preview_audio.ts` 回归通过；`verify_online_preview.ts`、`verify_hard_codec_choice.ts` 保持通过。
+- 真机验证：X 视频在线预览可正常播放并有声音。
+
 ## 1.4.6 - 2026-07-26
 
 ### 修复
