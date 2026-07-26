@@ -2,7 +2,7 @@
 
 面向 [Scripting](https://scripting.fun) 的 iOS 媒体下载脚本。粘贴或分享公开媒体链接，探测可选格式后下载，并可保存到相册或文件。
 
-当前版本：**1.3.3**
+当前版本：**1.4.5**
 
 > 本项目受 [Pablo Stanley / Yoinks](https://github.com/pablostanley/yoinks) 启发，在 Scripting 运行时中重新实现核心下载体验。Scripting 的模拟 Node.js 环境无法完整运行原版 `node` / `npm` 工作流，因此这里保留名称与使用路径，并针对 iOS 与宿主能力做了适配。
 
@@ -10,9 +10,9 @@
 
 ## 功能
 
-- **链接输入**：剪贴板粘贴、手动输入、Share Sheet / Intent 分享链接
+- **链接输入**：剪贴板粘贴、手动输入、Share Sheet / Intent 分享链接；**批量添加**多条链接入队后顺序下载；队列内可直贴剪贴板、左滑删除
 - **格式探测**：`yt-dlp` 探测标题、时长、清晰度与音视频流；格式标签显示分辨率、编码、类型与容器
-- **下载**：单文件 / 分离音视频后用内置 `ffmpeg` 合并；支持仅音频（MP3）、一键最佳质量
+- **下载**：单文件 / 分离音视频后用内置 `ffmpeg` 合并；H.264 优先 MP4；**HEVC / AV1 / VP9 流拷贝合成 MKV**（外部播放器）；支持仅音频（MP3）、一键最佳质量
 - **站点分流**
   - 抖音：匿名 WebView 抓取详情候选后流式/图文下载（不登录、不接第三方解析 API）
   - 小红书、YouTube、B 站等：以 `yt-dlp` 为主；必要时 Cookie / 登录重试、TLS 兼容重试
@@ -20,7 +20,7 @@
 - **保存**：相册、Files / 自定义输出目录；可选保留 Yoinks 本地原文件
 - **记录**：下载历史、最近链接复用、可用性检查与限额清理
 - **日志**：运行日志（主链 + warn/error）；调试时可开临时详细日志
-- **设置**：默认保存方式、原文件保留与限额、输出目录、yt-dlp 更新、关于页与更新说明
+- **设置**：默认保存方式、批量统一格式默认、原文件保留与限额、输出目录、yt-dlp 更新、关于页与更新说明
 
 ---
 
@@ -37,7 +37,7 @@ https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckld
 或从仓库安装：
 
 - GitHub：https://github.com/ckldy/Yoinks
-- 标签：https://github.com/ckldy/Yoinks/releases/tag/v1.3.3
+- 标签：https://github.com/ckldy/Yoinks/releases/tag/v1.4.5
 
 ### 手动安装
 
@@ -68,7 +68,7 @@ https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckld
 | 标签 | 说明 |
 |------|------|
 | 记录 | 历史下载、预览/分享/删除、滚动加载更多 |
-| 下载 | 当前链接、格式列表、任务进度与结果操作 |
+| 下载 | 当前链接、格式列表、批量队列（非空时）、任务进度与结果操作 |
 | 设置 | 偏好、工具状态、日志、关于与更新说明 |
 
 ---

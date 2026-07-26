@@ -117,8 +117,9 @@ def main():
         "format": config["format"],
         "format_sort": config.get("format_sort") or [],
         "noplaylist": True,
-        "quiet": False,
-        "no_warnings": False,
+        # Progress is written via progress_hooks; keep stdout small so Shell.run keeps final path lines.
+        "quiet": True,
+        "no_warnings": True,
         "nocheckcertificate": bool(config.get("no_check_certificates", False)),
         "retries": 3,
         "fragment_retries": 3,
@@ -174,13 +175,24 @@ def main():
                 finished_paths.append(os.path.abspath(path))
 
     seen = set()
+    existing = []
+    missing = []
     for path in finished_paths:
-        if not os.path.exists(path):
-            continue
         if path in seen:
             continue
         seen.add(path)
-        print(path)
+        if os.path.exists(path):
+            existing.append(path)
+            print(path)
+        else:
+            missing.append(path)
+
+    if not existing:
+        if missing:
+            print("ERROR: finished paths missing on disk: " + "; ".join(missing))
+        else:
+            print("ERROR: no output file produced")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

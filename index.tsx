@@ -36,9 +36,12 @@ import {
   type YoinksLogEvent,
 } from "./services/logs"
 import {
+  BATCH_ADD_MAX,
+  BATCH_QUEUE_MAX,
   cancelDownload,
   detectMediaPlatform,
   downloadMedia,
+  extractAllURLs,
   extractFirstURL,
   getToolStatus,
   installYtDlp,
@@ -54,6 +57,30 @@ import {
   type SaveMode,
   type ToolStatus,
 } from "./services/media"
+import {
+  batchItemSubtitle,
+  batchItemTitle,
+  batchStatusIcon,
+  beginBatchRun,
+  clearBatchQueue,
+  clearFinishedBatchItems,
+  countBatchItems,
+  createBatchQueueState,
+  displayBatchItems,
+  endBatchRun,
+  enqueueURLs,
+  formatBatchHeader,
+  nextPendingItem,
+  removeBatchItem,
+  requestBatchStop,
+  retryAllFailed,
+  retryBatchItem,
+  setBatchFormatStrategy,
+  shortenBatchURL,
+  updateBatchItem,
+  type BatchItem,
+  type BatchQueueState,
+} from "./services/batch-queue"
 import {
   addHistoryRecord,
   clearHistoryRecordsAndFiles,
@@ -189,6 +216,11 @@ function ChangelogView() {
   const dismiss = Navigation.useDismiss()
   return (
     <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
+      <Section header={<Text>版本 1.4.5 (2026-07-26)</Text>}>
+        <Text font="body">• HEVC / AV1 / VP9：下载后仅流拷贝合成 MKV，不再强制转码 H.264</Text>
+        <Text font="body">• 格式列表标注「外部播放器 · 容器·MKV」；请用 Infuse / VLC / nPlayer 等打开</Text>
+        <Text font="body">• H.264 + AAC 仍合并为 MP4；本机 ffprobe 对硬编码不可靠时改为软验证放行</Text>
+      </Section>
       <Section header={<Text>版本 1.2.0 (2026-07-24)</Text>}>
         <Text font="body">• A：下载进度分段映射 + 阶段清 progress + UI 节流，避免进度回跳与高频刷新</Text>
         <Text font="body">• B：紧凑进度置顶 + 右下浮层取消，下载中可正常滑动列表</Text>
@@ -306,6 +338,11 @@ function View() {
   const [recentLinks, setRecentLinks] = useState<RecentLinkRecord[]>(() => listRecentLinks())
   const [verboseLog, setVerboseLogState] = useState(() => isVerboseLogEnabled())
   const [enteringURL, setEnteringURL] = useState(false)
+  const [batchQueue, setBatchQueue] = useState<BatchQueueState>(() =>
+    createBatchQueueState(getPreferences().automaticDownloadFormatStrategy, getPreferences().preferredContainer),
+  )
+  const batchQueueRef = useRef<BatchQueueState>(batchQueue)
+  const batchCancelPathRef = useRef<string | null>(null)
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
@@ -317,6 +354,10 @@ function View() {
   /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
   const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
 
+  const isCertificateError = (message: string): boolean => {
+    return /certificate|SSL|TLS|untrusted|verify.*cert|self.signed|expired|hostname.*mismatch/i.test(message)
+  }
+
   const applyProgressUi = (p: DownloadProgress, force = false) => {
     const pct = Math.round((p.fraction || 0) * 100)
     const key = `${p.stage}|${pct}|${Math.floor((p.downloadedBytes || 0) / 100_000)}`
@@ -324,6 +365,21 @@ function View() {
     if (!force && key === progressUiRef.current.lastKey && now - progressUiRef.current.lastAt < 450) return
     progressUiRef.current = { lastAt: now, lastKey: key }
     setProgress(p)
+  }
+
+  const setBatchQueueSynced = (next: BatchQueueState | ((current: BatchQueueState) => BatchQueueState)) => {
+    setBatchQueue((current) => {
+      const resolved = typeof next === "function" ? next(current) : next
+      batchQueueRef.current = resolved
+      return resolved
+    })
+  }
+
+  const patchBatchItem = (
+    itemId: string,
+    patch: Partial<Omit<BatchItem, "id" | "sourceURL" | "addedAt">>,
+  ) => {
+    setBatchQueueSynced((current) => updateBatchItem(current, itemId, patch))
   }
 
   const updateSaveMode = (next: SaveMode) => {
@@ -497,6 +553,10 @@ function View() {
       return
     }
     if (analyzing) return
+    if (batchQueueRef.current.running) {
+      setStatus("批量下载进行中，请用「批量添加」追加链接。")
+      return
+    }
     setAnalyzing(true)
     setProbe(null)
     setSelectedChoice(null)
@@ -592,12 +652,30 @@ function View() {
     updatePreferences({ ...preferences, previewAutoplayMode: next })
   }
 
+  /** Shared default for auto-download and new/idle batch queues. */
+  const applyDefaultFormatStrategy = (next: AutomaticDownloadFormatStrategy, preferredContainer = preferences.preferredContainer) => {
+    const saved = updatePreferences({
+      ...preferences,
+      automaticDownloadFormatStrategy: next,
+      preferredContainer,
+    })
+    if (!batchQueueRef.current.running) {
+      setBatchQueueSynced(setBatchFormatStrategy(batchQueueRef.current, saved.automaticDownloadFormatStrategy, saved.preferredContainer))
+    }
+    return saved
+  }
+
   const chooseAutomaticDownloadFormat = async () => {
     const actions = (["recommended", "highest-video", "highest-audio", "preferred-container"] as AutomaticDownloadFormatStrategy[]).map((s) => ({ label: AUTOMATIC_DOWNLOAD_FORMAT_LABELS[s] }))
-    const choice = await Dialog.actionSheet({ title: "自动下载格式策略", actions, cancelButton: true })
+    const choice = await Dialog.actionSheet({ title: "默认统一格式", actions, cancelButton: true })
     if (choice == null) return
     const next = (["recommended", "highest-video", "highest-audio", "preferred-container"] as AutomaticDownloadFormatStrategy[])[choice]
-    updatePreferences({ ...preferences, automaticDownloadFormatStrategy: next })
+    applyDefaultFormatStrategy(next)
+    setStatus(
+      batchQueueRef.current.running
+        ? "默认格式已保存，将用于下次批量（当前批次不改）。"
+        : "默认统一格式已更新。",
+    )
   }
 
   const choosePreferredContainer = async () => {
@@ -605,7 +683,7 @@ function View() {
     const choice = await Dialog.actionSheet({ title: "指定视频容器格式", actions, cancelButton: true })
     if (choice == null) return
     const next = (["mp4", "mkv", "avi", "wmv"] as PreferredContainer[])[choice]
-    updatePreferences({ ...preferences, preferredContainer: next })
+    applyDefaultFormatStrategy(preferences.automaticDownloadFormatStrategy, next)
   }
 
   const chooseManagedBytes = async () => {
@@ -818,10 +896,576 @@ function View() {
     await analyzeMedia(valid)
   }
 
+  const confirmAndEnqueueURLs = async (urls: string[]) => {
+    if (!urls.length) {
+      setStatus("未找到有效的公开链接。")
+      return
+    }
+    const capped = urls.slice(0, BATCH_ADD_MAX)
+    const truncated = urls.length - capped.length
+    const room = Math.max(0, BATCH_QUEUE_MAX - batchQueueRef.current.items.length)
+    if (room <= 0) {
+      setStatus(`队列已满（最多 ${BATCH_QUEUE_MAX} 条），请先清空或移出部分任务。`)
+      return
+    }
+    const willAdd = Math.min(capped.length, room)
+    const previewSource = capped.slice(0, willAdd)
+    const previewLines = previewSource.slice(0, 5).map((item, index) => `${index + 1}. ${shortenBatchURL(item, 56)}`)
+    if (previewSource.length > 5) previewLines.push(`…其余 ${previewSource.length - 5} 条`)
+    if (truncated > 0) previewLines.push(`单次上限 ${BATCH_ADD_MAX}，已截取前 ${BATCH_ADD_MAX} 条`)
+    if (capped.length > room) previewLines.push(`队列剩余空位 ${room}，将只加入 ${willAdd} 条`)
+    const confirmed = await Dialog.confirm({
+      title: willAdd === urls.length ? `识别到 ${urls.length} 条链接` : `将加入 ${willAdd} / ${urls.length} 条`,
+      message: previewLines.join("\n"),
+      confirmLabel: "加入队列",
+      cancelLabel: "取消",
+    })
+    if (!confirmed) return
+    const result = enqueueURLs(batchQueueRef.current, capped, BATCH_ADD_MAX)
+    setBatchQueueSynced(result.state)
+    await logEvent({
+      level: "info",
+      event: "batch.add",
+      details: {
+        added: result.added,
+        skippedDuplicate: result.skippedDuplicate,
+        truncated: result.truncated || truncated,
+        rejectedFull: result.rejectedFull,
+        queueSize: result.state.items.length,
+      },
+    })
+    if (result.added === 0 && result.skippedDuplicate > 0) {
+      setStatus("这些链接已在队列中。")
+      return
+    }
+    if (result.added === 0) {
+      setStatus(result.rejectedFull ? `队列已满，未能加入。最多 ${BATCH_QUEUE_MAX} 条。` : "没有新链接加入队列。")
+      return
+    }
+    const notes: string[] = [`已加入队列 ${result.added} 条`]
+    if (result.skippedDuplicate) notes.push(`跳过重复 ${result.skippedDuplicate}`)
+    if (result.truncated || truncated) notes.push(`截断 ${result.truncated || truncated}`)
+    if (result.rejectedFull) notes.push(`空位不足未入 ${result.rejectedFull}`)
+    setStatus(`${notes.join(" · ")}。共 ${result.state.items.length} 条，可点「开始批量下载」。`)
+  }
+
+  /** Queue-local: paste clipboard URLs into batch with no confirm dialogs. */
+  const quickEnqueueFromClipboard = async () => {
+    const clip = await Pasteboard.getString()
+    const urls = extractAllURLs(clip)
+    if (!urls.length) {
+      setStatus("剪贴板中未发现有效链接。")
+      await logEvent({ level: "info", event: "batch.add", details: { mode: "clipboard-direct", added: 0, empty: true } })
+      return
+    }
+    if (batchQueueRef.current.items.length >= BATCH_QUEUE_MAX) {
+      setStatus(`队列已满（最多 ${BATCH_QUEUE_MAX} 条），请先清理或移出部分任务。`)
+      return
+    }
+    const result = enqueueURLs(batchQueueRef.current, urls, BATCH_ADD_MAX)
+    setBatchQueueSynced(result.state)
+    await logEvent({
+      level: "info",
+      event: "batch.add",
+      details: {
+        mode: "clipboard-direct",
+        added: result.added,
+        skippedDuplicate: result.skippedDuplicate,
+        truncated: result.truncated,
+        rejectedFull: result.rejectedFull,
+        queueSize: result.state.items.length,
+      },
+    })
+    if (result.added === 0 && result.skippedDuplicate > 0) {
+      setStatus("这些链接已在队列中。")
+      return
+    }
+    if (result.added === 0) {
+      setStatus(result.rejectedFull ? `队列已满，未能加入。最多 ${BATCH_QUEUE_MAX} 条。` : "没有新链接加入队列。")
+      return
+    }
+    const notes: string[] = [`已从剪贴板加入 ${result.added} 条`]
+    if (result.skippedDuplicate) notes.push(`跳过重复 ${result.skippedDuplicate}`)
+    if (result.truncated) notes.push(`截断 ${result.truncated}`)
+    if (result.rejectedFull) notes.push(`空位不足未入 ${result.rejectedFull}`)
+    setStatus(`${notes.join(" · ")}。共 ${result.state.items.length} 条。`)
+  }
+
+  const removeBatchItemSwipe = async (item: BatchItem) => {
+    if (item.status === "probing" || item.status === "downloading") {
+      setStatus("进行中的条目无法删除，请先停止或等其结束。")
+      return
+    }
+    const next = removeBatchItem(batchQueueRef.current, item.id)
+    if (next.items.length === batchQueueRef.current.items.length) {
+      setStatus("无法删除该条目。")
+      return
+    }
+    setBatchQueueSynced(next)
+    await logEvent({
+      level: "info",
+      event: "batch.item.removed",
+      details: { itemId: item.id, status: item.status, remaining: next.items.length },
+    })
+    setStatus(next.items.length ? "已从队列删除。" : "已从队列删除，队列已空。")
+  }
+
+  const batchAddFromClipboard = async () => {
+    const clip = await Pasteboard.getString()
+    await confirmAndEnqueueURLs(extractAllURLs(clip))
+  }
+
+  const batchAddFromPrompt = async () => {
+    setEnteringURL(true)
+    const input = await Dialog.prompt({
+      title: "批量添加链接",
+      message: `每行一条或空格分隔，单次最多 ${BATCH_ADD_MAX} 条。`,
+      placeholder: "https://...\nhttps://...",
+      confirmLabel: "识别",
+      cancelLabel: "取消",
+    })
+    setEnteringURL(false)
+    if (!input) return
+    await confirmAndEnqueueURLs(extractAllURLs(input))
+  }
+
+  const chooseBatchAddSource = async () => {
+    const choice = await Dialog.actionSheet({
+      title: "批量添加",
+      actions: [{ label: "从剪贴板提取全部链接" }, { label: "多行粘贴 / 手动输入" }],
+      cancelButton: true,
+    })
+    if (choice === 0) await batchAddFromClipboard()
+    if (choice === 1) await batchAddFromPrompt()
+  }
+
   const chooseLinkSource = async () => {
-    const choice = await Dialog.actionSheet({ title: "添加媒体链接", actions: [{ label: "从剪贴板粘贴" }, { label: "手动输入" }], cancelButton: true })
+    // Spec: while batch running, only allow batch append.
+    if (batchQueueRef.current.running) {
+      await chooseBatchAddSource()
+      return
+    }
+    const choice = await Dialog.actionSheet({
+      title: "添加媒体链接",
+      actions: [{ label: "从剪贴板粘贴" }, { label: "手动输入" }, { label: "批量添加…" }],
+      cancelButton: true,
+    })
     if (choice === 0) await pasteURL()
     if (choice === 1) await enterURL()
+    if (choice === 2) await chooseBatchAddSource()
+  }
+
+  const chooseBatchFormatStrategy = async () => {
+    if (batchQueueRef.current.running) return
+    const strategies = ["recommended", "highest-video", "highest-audio", "preferred-container"] as AutomaticDownloadFormatStrategy[]
+    const choice = await Dialog.actionSheet({
+      title: "批量统一格式",
+      actions: strategies.map((s) => ({ label: AUTOMATIC_DOWNLOAD_FORMAT_LABELS[s] })),
+      cancelButton: true,
+    })
+    if (choice == null) return
+    const nextStrategy = strategies[choice]
+    let nextContainer = batchQueueRef.current.preferredContainer
+    if (nextStrategy === "preferred-container") {
+      const containers = ["mp4", "mkv", "avi", "wmv"] as PreferredContainer[]
+      const containerChoice = await Dialog.actionSheet({
+        title: "指定容器格式",
+        actions: containers.map((c) => ({ label: PREFERRED_CONTAINER_LABELS[c] })),
+        cancelButton: true,
+      })
+      if (containerChoice == null) return
+      nextContainer = containers[containerChoice]
+    }
+    setBatchQueueSynced(setBatchFormatStrategy(batchQueueRef.current, nextStrategy, nextContainer))
+  }
+
+  const openBatchItemActions = async (item: BatchItem) => {
+    const canRemove = item.status !== "probing" && item.status !== "downloading"
+    const canRetry = item.status === "failed" || item.status === "cancelled"
+    const filePath = item.result?.filePath
+    const fileAvailable = Boolean(filePath && item.status === "completed" && FileManager.existsSync(filePath))
+    const actions = [
+      ...(fileAvailable ? [{ label: "播放" }, { label: "分享" }] : []),
+      { label: "复制链接" },
+      ...(canRetry ? [{ label: "重试" }] : []),
+      ...(canRemove ? [{ label: "移出队列", role: "destructive" as const }] : []),
+    ]
+    const choice = await Dialog.actionSheet({
+      title: batchItemTitle(item),
+      message: batchItemSubtitle(item),
+      actions,
+      cancelButton: true,
+    })
+    if (choice == null) return
+    const action = actions[choice].label
+    try {
+      if (action === "播放" && filePath) {
+        await QuickLook.previewURLs([filePath], true)
+        return
+      }
+      if (action === "分享" && filePath) {
+        await ShareSheet.present([filePath])
+        return
+      }
+      if (action === "复制链接") {
+        await Pasteboard.setString(item.sourceURL)
+        setStatus("链接已复制。")
+        return
+      }
+      if (action === "重试") {
+        setBatchQueueSynced(retryBatchItem(batchQueueRef.current, item.id))
+        setStatus("已重新加入等待队列。")
+        return
+      }
+      if (action === "移出队列") {
+        setBatchQueueSynced(removeBatchItem(batchQueueRef.current, item.id))
+        setStatus("已移出队列。")
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await Dialog.alert({ title: "操作失败", message })
+    }
+  }
+
+  const clearBatchFinished = () => {
+    const next = clearFinishedBatchItems(batchQueueRef.current)
+    const removed = batchQueueRef.current.items.length - next.items.length
+    setBatchQueueSynced(next)
+    setStatus(removed > 0 ? `已清理 ${removed} 条已完成/已取消项。` : "没有可清理的已完成项。")
+  }
+
+  const clearBatchAll = async () => {
+    if (batchQueueRef.current.running) {
+      setStatus("批量进行中，无法清空队列。")
+      return
+    }
+    const confirmed = await Dialog.confirm({
+      title: "清空批量队列",
+      message: "将移除所有等待、失败与已完成条目（不删除已下载文件）。",
+      confirmLabel: "清空",
+      cancelLabel: "取消",
+    })
+    if (!confirmed) return
+    setBatchQueueSynced(clearBatchQueue(batchQueueRef.current))
+    setStatus("批量队列已清空。")
+  }
+
+  const retryBatchFailed = () => {
+    const before = countBatchItems(batchQueueRef.current.items)
+    const next = retryAllFailed(batchQueueRef.current)
+    const after = countBatchItems(next.items)
+    setBatchQueueSynced(next)
+    const recovered = after.pending - before.pending
+    setStatus(recovered > 0 ? `已将 ${recovered} 条失败/取消项重新加入等待。` : "没有可重试的项。")
+  }
+
+  const stopWholeBatch = async () => {
+    if (!batchQueueRef.current.running) return
+    const confirmed = await Dialog.confirm({
+      title: "停止整批",
+      message: "将取消当前下载，剩余等待项保留，可再次开始。",
+      confirmLabel: "停止整批",
+      cancelLabel: "继续",
+    })
+    if (!confirmed) return
+    setBatchQueueSynced(requestBatchStop(batchQueueRef.current))
+    await logEvent({
+      level: "info",
+      event: "batch.stop",
+      details: {
+        activeItemId: batchQueueRef.current.activeItemId,
+        pending: countBatchItems(batchQueueRef.current.items).pending,
+      },
+    })
+    const path = batchCancelPathRef.current || cancelPath
+    if (path) {
+      await cancelDownload(path)
+      setStatus("正在停止整批…")
+    } else {
+      setStatus("已请求停止整批。")
+    }
+  }
+
+  const startBatchDownload = async () => {
+    if (batchQueueRef.current.running) {
+      await stopWholeBatch()
+      return
+    }
+    const counts = countBatchItems(batchQueueRef.current.items)
+    if (!counts.pending) {
+      setStatus(counts.failed ? "没有等待中的任务。可先重试失败项。" : "没有等待中的任务。")
+      return
+    }
+    if (analyzing || downloading) {
+      setStatus("请等待当前单链分析或下载结束后再开始批量。")
+      return
+    }
+
+    setBatchQueueSynced(beginBatchRun(batchQueueRef.current))
+    setDownloading(true)
+    setCancelPath(null)
+    batchCancelPathRef.current = null
+    setResult(null)
+    setCompletedSaveMode(null)
+    progressUiRef.current = { lastAt: 0, lastKey: "" }
+    await logEvent({ level: "info", event: "batch.start", details: { pending: counts.pending, total: counts.total } })
+
+    let ok = 0
+    let fail = 0
+    let cancelledCount = 0
+
+    try {
+      while (true) {
+        const state = batchQueueRef.current
+        if (state.stopRequested) break
+        const item = nextPendingItem(state)
+        if (!item) break
+
+        const indexLabel = () => {
+          const items = batchQueueRef.current.items
+          const ordinal = items.findIndex((i) => i.id === item.id) + 1
+          return `${Math.max(ordinal, 1)}/${items.length}`
+        }
+
+        setBatchQueueSynced((current) => ({
+          ...updateBatchItem(current, item.id, { status: "probing", errorMessage: undefined }),
+          activeItemId: item.id,
+        }))
+        applyProgressUi({ fraction: 0.02, stage: `批量 ${indexLabel()} · 正在分析` }, true)
+        setStatus(`批量 ${indexLabel()} · 分析中`)
+        await logEvent({
+          level: "info",
+          event: "batch.item.probe",
+          details: { itemId: item.id, index: indexLabel(), platform: detectMediaPlatform(item.sourceURL) },
+        })
+
+        const platform = detectMediaPlatform(item.sourceURL)
+        if (platform !== "douyin" && !tools?.ytDlpVersion) {
+          fail += 1
+          patchBatchItem(item.id, { status: "failed", errorMessage: "请先安装 yt-dlp" })
+          await logEvent({ level: "error", event: "batch.item.failed", details: { itemId: item.id, reason: "no-ytdlp" } })
+          continue
+        }
+
+        let probeResult: MediaProbe
+        try {
+          const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+          try {
+            probeResult = await probeWithPlatformSession(item.sourceURL, session)
+          } catch (firstError) {
+            const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
+            if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+              fail += 1
+              const msg = `需先登录${authPlatformLabel(platform)}（设置或单链流程）后再重试`
+              patchBatchItem(item.id, { status: "failed", errorMessage: msg })
+              await logEvent({
+                level: "warn",
+                event: "batch.item.failed",
+                details: { itemId: item.id, reason: "login-required", platform },
+              })
+              continue
+            }
+            throw firstError
+          }
+        } catch (error) {
+          if (batchQueueRef.current.stopRequested) {
+            cancelledCount += 1
+            patchBatchItem(item.id, { status: "cancelled", errorMessage: "已取消" })
+            await logEvent({
+              level: "info",
+              event: "batch.item.cancelled",
+              details: { itemId: item.id, stage: "probe", stopWhole: true },
+            })
+            break
+          }
+          fail += 1
+          const message = error instanceof Error ? error.message : String(error)
+          patchBatchItem(item.id, { status: "failed", errorMessage: message.slice(0, 200) })
+          await logEvent({ level: "error", event: "batch.item.failed", details: { itemId: item.id, stage: "probe", message } })
+          continue
+        }
+
+        if (batchQueueRef.current.stopRequested) {
+          cancelledCount += 1
+          patchBatchItem(item.id, { status: "cancelled", errorMessage: "已取消" })
+          await logEvent({
+            level: "info",
+            event: "batch.item.cancelled",
+            details: { itemId: item.id, stage: "after-probe", stopWhole: true },
+          })
+          break
+        }
+
+        const resolved = resolveAutomaticChoice(
+          probeResult.choices,
+          batchQueueRef.current.formatStrategy,
+          batchQueueRef.current.preferredContainer,
+        )
+        const choice = resolved.choice
+        if (!choice) {
+          fail += 1
+          patchBatchItem(item.id, {
+            status: "failed",
+            title: probeResult.title,
+            errorMessage: "没有可用格式",
+          })
+          await logEvent({
+            level: "error",
+            event: "batch.item.failed",
+            details: { itemId: item.id, stage: "format", reason: "no-choice" },
+          })
+          continue
+        }
+
+        patchBatchItem(item.id, {
+          status: "downloading",
+          title: probeResult.title,
+          choiceLabel: choice.label,
+        })
+        applyProgressUi({ fraction: 0.05, stage: `批量 ${indexLabel()} · 准备下载` }, true)
+        setStatus(`批量 ${indexLabel()} · ${probeResult.title}`)
+        await logEvent({
+          level: "info",
+          event: "batch.item.download",
+          details: {
+            itemId: item.id,
+            index: indexLabel(),
+            choiceId: choice.id,
+            choiceLabel: choice.label,
+            title: probeResult.title,
+          },
+        })
+
+        const runOneDownload = async (insecureTLS: boolean): Promise<DownloadResult> => {
+          const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+          let cookieFile: string | undefined
+          try {
+            if (session) cookieFile = await createTaskCookieFile(session)
+            return await downloadMedia({
+              url: item.sourceURL,
+              choice,
+              cookieFile,
+              concurrentFragments,
+              insecureTLS,
+              onProgress: (p: DownloadProgress) => {
+                applyProgressUi({
+                  ...p,
+                  stage: `批量 ${indexLabel()} · ${p.stage}`,
+                })
+              },
+              onCancelPath: (path: string) => {
+                batchCancelPathRef.current = path
+                setCancelPath(path)
+              },
+              authorizedPlatform: session?.platform,
+            })
+          } finally {
+            if (cookieFile) await FileManager.remove(cookieFile).catch(() => {})
+            if (session?.retention === "temporary") disposeTemporarySession(platform as AuthPlatform)
+          }
+        }
+
+        try {
+          let downloaded: DownloadResult
+          try {
+            downloaded = await runOneDownload(false)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (message === "下载已取消" || batchQueueRef.current.stopRequested) throw error
+            if (isCertificateError(message)) {
+              await logEvent({
+                level: "warn",
+                event: "batch.item.tls-retry",
+                details: { itemId: item.id },
+              })
+              downloaded = await runOneDownload(true)
+            } else {
+              throw error
+            }
+          }
+
+          // Save policy: photos auto; ask/files keep originals only (no DocumentPicker / ask loops).
+          const batchSaveMode: SaveMode = saveMode === "photos" ? "photos" : "ask"
+          if (batchSaveMode === "photos" && (choice.kind === "video" || choice.kind === "image")) {
+            try {
+              await saveResult(downloaded.filePath, downloaded.fileName, "photos", downloaded.taskId)
+            } catch (saveError) {
+              await logEvent({
+                level: "warn",
+                event: "batch.item.save.failed",
+                details: {
+                  itemId: item.id,
+                  message: saveError instanceof Error ? saveError.message : String(saveError),
+                },
+              })
+            }
+          }
+
+          await recordCompletedDownload(downloaded, batchSaveMode === "photos" ? "photos" : "ask", probeResult.title || choice.label)
+          await rememberRecentLink(item.sourceURL)
+          setRecentLinks(listRecentLinks())
+
+          ok += 1
+          patchBatchItem(item.id, {
+            status: "completed",
+            title: probeResult.title,
+            choiceLabel: choice.label,
+            result: downloaded,
+            errorMessage: undefined,
+          })
+          await logEvent({
+            level: "info",
+            event: "batch.item.completed",
+            details: { itemId: item.id, taskId: downloaded.taskId },
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (message === "下载已取消" || batchQueueRef.current.stopRequested) {
+            cancelledCount += 1
+            patchBatchItem(item.id, { status: "cancelled", errorMessage: "已取消" })
+            await logEvent({
+              level: "info",
+              event: "batch.item.cancelled",
+              details: {
+                itemId: item.id,
+                stopWhole: batchQueueRef.current.stopRequested,
+              },
+            })
+            if (batchQueueRef.current.stopRequested) break
+            // cancel current only → continue next pending
+            continue
+          }
+          fail += 1
+          patchBatchItem(item.id, {
+            status: "failed",
+            title: probeResult.title,
+            choiceLabel: choice.label,
+            errorMessage: message.slice(0, 200),
+          })
+          await logEvent({
+            level: "error",
+            event: "batch.item.failed",
+            details: { itemId: item.id, stage: "download", message },
+          })
+        } finally {
+          batchCancelPathRef.current = null
+          setCancelPath(null)
+        }
+      }
+    } finally {
+      setBatchQueueSynced(endBatchRun(batchQueueRef.current))
+      setDownloading(false)
+      setCancelPath(null)
+      batchCancelPathRef.current = null
+      const summary = `批量完成：成功 ${ok} · 失败 ${fail} · 取消 ${cancelledCount}`
+      setStatus(summary)
+      applyProgressUi({ fraction: fail === 0 && cancelledCount === 0 && ok > 0 ? 1 : 0, stage: summary }, true)
+      await logEvent({
+        level: "info",
+        event: "batch.finished",
+        details: { ok, fail, cancelled: cancelledCount },
+      })
+    }
   }
 
   const previewSelectedChoice = async () => {
@@ -955,16 +1599,20 @@ function View() {
     }
   }
   const stopDownload = async () => {
-    if (!cancelPath) return
+    const path = cancelPath || batchCancelPathRef.current
+    if (!path) return
+    const isBatch = batchQueueRef.current.running
     const confirmed = await Dialog.confirm({
-      title: "取消下载",
-      message: "当前下载将停止，未完成的临时文件会被清理。",
-      confirmLabel: "取消下载",
+      title: isBatch ? "取消当前下载" : "取消下载",
+      message: isBatch
+        ? "将停止当前这一条。若未点「停止整批」，将继续队列中的下一项。"
+        : "当前下载将停止，未完成的临时文件会被清理。",
+      confirmLabel: isBatch ? "取消当前" : "取消下载",
       cancelLabel: "继续下载",
     })
     if (!confirmed) return
-    await cancelDownload(cancelPath)
-    setStatus("正在取消下载。")
+    await cancelDownload(path)
+    setStatus(isBatch ? "正在取消当前批量项…" : "正在取消下载。")
   }
 
   
@@ -1016,12 +1664,15 @@ function DownloadView() {
         navigationBarTitleDisplayMode="inline"
         toolbar={{
           cancellationAction: <Button title="关闭" action={closeYoinks} />,
-          topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} />,
+          topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={enteringURL || analyzing || (downloading && !batchQueue.running)} />,
         }}
       >
         {/* B: 紧凑进度置顶；取消改右下浮层，避免占 List 行程 */}
         {downloading ? (
-          <Section header={<Text>下载中</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
+          <Section
+            header={<Text>{batchQueue.running ? "批量下载中" : "下载中"}</Text>}
+            footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}
+          >
             <VStack alignment="leading" spacing={6} padding={{ vertical: 2 }}>
               <HStack>
                 <Text font="subheadline" lineLimit={1}>{progress.stage}</Text>
@@ -1034,15 +1685,95 @@ function DownloadView() {
           </Section>
         ) : null}
 
+        {batchQueue.items.length > 0 ? (() => {
+          const counts = countBatchItems(batchQueue.items)
+          const formatLabel = batchQueue.formatStrategy === "preferred-container"
+            ? `${AUTOMATIC_DOWNLOAD_FORMAT_LABELS[batchQueue.formatStrategy]} · ${PREFERRED_CONTAINER_LABELS[batchQueue.preferredContainer]}`
+            : AUTOMATIC_DOWNLOAD_FORMAT_LABELS[batchQueue.formatStrategy]
+          const retryable = counts.failed + counts.cancelled
+          const finished = counts.completed + counts.cancelled
+          const rows = displayBatchItems(batchQueue.items)
+          return (
+            <Section
+              header={<Text>{formatBatchHeader(counts)}</Text>}
+              footer={<Text font="caption" foregroundStyle="secondaryLabel">「从剪贴板添加」直接入队不弹确认；左滑可删除。点条目可播放/分享。</Text>}
+            >
+              <Button
+                title="从剪贴板添加"
+                systemImage="doc.on.clipboard"
+                action={() => void quickEnqueueFromClipboard()}
+                disabled={enteringURL || analyzing}
+              />
+              <Button
+                title={`统一格式：${formatLabel}`}
+                systemImage="slider.horizontal.3"
+                action={() => void chooseBatchFormatStrategy()}
+                disabled={batchQueue.running || analyzing}
+              />
+              <Button
+                title={batchQueue.running ? "停止整批" : "开始批量下载"}
+                systemImage={batchQueue.running ? "stop.circle" : "arrow.down.circle.fill"}
+                action={() => void startBatchDownload()}
+                disabled={batchQueue.running ? false : (analyzing || downloading || !counts.pending)}
+              />
+              {retryable > 0 && !batchQueue.running ? (
+                <Button title={`重试失败/取消（${retryable}）`} systemImage="arrow.clockwise" action={retryBatchFailed} />
+              ) : null}
+              {finished > 0 ? (
+                <Button title={`清理已结束（${finished}）`} systemImage="checkmark.circle" action={clearBatchFinished} disabled={batchQueue.running} />
+              ) : null}
+              <Button title="清空队列" systemImage="trash" role="destructive" action={() => void clearBatchAll()} disabled={batchQueue.running} />
+              {rows.map((item) => {
+                const canSwipeDelete = item.status !== "probing" && item.status !== "downloading"
+                return (
+                  <HStack
+                    key={item.id}
+                    spacing={12}
+                    trailingSwipeActions={canSwipeDelete ? {
+                      allowsFullSwipe: true,
+                      actions: [
+                        <Button
+                          title="删除"
+                          role="destructive"
+                          action={() => void removeBatchItemSwipe(item)}
+                        />,
+                      ],
+                    } : undefined}
+                  >
+                    <Button action={() => void openBatchItemActions(item)} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                      <HStack spacing={12}>
+                        <Image
+                          systemName={batchStatusIcon(item.status)}
+                          foregroundStyle={
+                            item.status === "failed" ? "red"
+                              : item.status === "completed" ? "green"
+                                : item.status === "downloading" || item.status === "probing" ? "blue"
+                                  : "secondaryLabel"
+                          }
+                          frame={{ width: 22 }}
+                        />
+                        <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                          <Text font="subheadline" lineLimit={2}>{batchItemTitle(item)}</Text>
+                          <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={2}>{batchItemSubtitle(item)}</Text>
+                        </VStack>
+                      </HStack>
+                    </Button>
+                  </HStack>
+                )
+              })}
+            </Section>
+          )
+        })() : null}
+
         <Section title="当前链接">
           <VStack alignment="leading" spacing={5}>
             <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
             {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
           </VStack>
-          {!url ? <Button title="添加媒体链接" systemImage="plus.circle" action={() => void chooseLinkSource()} disabled={downloading || analyzing || enteringURL} /> : null}
-          <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading} />
-          {url ? <Button title={analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || downloading} /> : null}
-          {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading} /> : null}
+          {!url ? <Button title="添加媒体链接" systemImage="plus.circle" action={() => void chooseLinkSource()} disabled={enteringURL || analyzing || (downloading && !batchQueue.running)} /> : null}
+          <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || downloading || batchQueue.running} />
+          {url ? <Button title={analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || downloading || batchQueue.running} /> : null}
+          {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || downloading || batchQueue.running} /> : null}
         </Section>
 
         <Section title="格式">
@@ -1052,15 +1783,15 @@ function DownloadView() {
                 <Text font="headline" lineLimit={2}>{probe.title}</Text>
                 {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
               </VStack>
-              <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing} />
-              <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing} />
+              <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing || batchQueue.running} />
+              <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing || batchQueue.running} />
             </>
           )}
         </Section>
 
         {!downloading ? (
           <Section header={<Text>任务</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
-            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || installing || !selectedChoice || analyzing} />
+            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || installing || !selectedChoice || analyzing || batchQueue.running} />
             {result && completedSaveMode && completedSaveMode !== "ask" ? <Button title="播放" systemImage="play.circle" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
             {result ? <Button title="分享" systemImage="square.and.arrow.up" action={() => void ShareSheet.present([result.filePath])} /> : null}
           </Section>
@@ -1127,11 +1858,6 @@ function DownloadView() {
     )
   }
 
-  // Helper function to check for certificate errors
-  const isCertificateError = (message: string): boolean => {
-    return /certificate|SSL|TLS|untrusted|verify.*cert|self.signed|expired|hostname.*mismatch/i.test(message)
-  }
-
 return (
     <ZStack frame={{ maxWidth: "infinity", maxHeight: "infinity" }}>
     <TabView selection={activeTab as any} tint="systemGreen" tabViewStyle="sidebarAdaptable">
@@ -1157,9 +1883,24 @@ return (
             </Section>
             <Section title="自动下载">
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
-              <Button title={`自动下载格式：${AUTOMATIC_DOWNLOAD_FORMAT_LABELS[preferences.automaticDownloadFormatStrategy]}`} systemImage="slider.horizontal.3" action={() => void chooseAutomaticDownloadFormat()} disabled={downloading || analyzing} />
-              {preferences.automaticDownloadFormatStrategy === "preferred-container" ? <Button title={`指定视频格式：${PREFERRED_CONTAINER_LABELS[preferences.preferredContainer]}`} systemImage="film" action={() => void choosePreferredContainer()} disabled={downloading || analyzing} /> : null}
-              <Text font="caption" foregroundStyle="secondaryLabel">启动进入下载页时会自动分析剪贴板中的公开链接。自动下载默认关闭。</Text>
+              <Text font="caption" foregroundStyle="secondaryLabel">启动进入下载页时会自动分析剪贴板中的公开链接。自动下载默认关闭。格式默认见下方「批量下载」。</Text>
+            </Section>
+            <Section title="批量下载">
+              <Button
+                title={`统一格式：${AUTOMATIC_DOWNLOAD_FORMAT_LABELS[preferences.automaticDownloadFormatStrategy]}`}
+                systemImage="slider.horizontal.3"
+                action={() => void chooseAutomaticDownloadFormat()}
+                disabled={downloading || analyzing}
+              />
+              {preferences.automaticDownloadFormatStrategy === "preferred-container" ? (
+                <Button
+                  title={`指定容器：${PREFERRED_CONTAINER_LABELS[preferences.preferredContainer]}`}
+                  systemImage="film"
+                  action={() => void choosePreferredContainer()}
+                  disabled={downloading || analyzing}
+                />
+              ) : null}
+              <Text font="caption" foregroundStyle="secondaryLabel">新建或空闲队列使用此默认；队列内「统一格式」只改本批，批量进行中改设置不影响当前批次。</Text>
             </Section>
             <Section title="本地存储">
               <Text font="caption" foregroundStyle="secondaryLabel">自动清理优先删除最早的 Yoinks 原文件和对应记录。</Text>
