@@ -1,8 +1,9 @@
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 try:
     from yt_dlp import YoutubeDL
@@ -17,6 +18,37 @@ def safe_url(value: str) -> bool:
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
     except Exception:
         return False
+
+
+def is_x_status_host(netloc: str) -> bool:
+    host = (netloc or "").lower().split(":")[0]
+    return host == "x.com" or host == "twitter.com" or host.endswith(".x.com") or host.endswith(".twitter.com")
+
+
+def x_status_video_url(url: str, video_index: int = 1) -> str:
+    """Pin an X/Twitter status URL to a concrete /video/N media item.
+
+    Multi-video posts are extracted by yt-dlp as a playlist with empty top-level
+    formats. Downloading the bare status URL with a format id from video 1 fails
+    on later items. /video/N forces a single-video extract.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if not is_x_status_host(parsed.netloc):
+        return url
+    match = re.match(
+        r"^(/(?:[^/]+|i)/status/\d+)(?:/video/(\d+))?/?$",
+        parsed.path or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return url
+    existing = match.group(2)
+    index = int(existing) if existing else max(1, int(video_index or 1))
+    path = f"{match.group(1)}/video/{index}"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
 
 
 def compact_format(item: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]:
@@ -65,6 +97,90 @@ def compact_format(item: dict[str, Any], info: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def select_media_info(info: dict[str, Any], source_url: str) -> dict[str, Any]:
+    """Return the info dict that actually carries formats.
+
+    X/Twitter multi-video posts come back as `_type=playlist` with formats only
+    on entries. Prefer the first entry that has formats, and rewrite webpage_url
+    to /video/N so subsequent downloads stay single-item.
+    """
+    top_formats = info.get("formats") or []
+    if top_formats:
+        return info
+
+    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    selected = next((entry for entry in entries if entry.get("formats")), None)
+    if not selected:
+        # Some extractors put a single direct url on the entry without formats[].
+        selected = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("url") and (entry.get("ext") or entry.get("format_id") or entry.get("height"))
+            ),
+            None,
+        )
+    if not selected:
+        return info
+
+    merged = dict(selected)
+    # Keep human title from the parent post when entry title is only a fragment.
+    if not merged.get("title"):
+        merged["title"] = info.get("title")
+    if not merged.get("uploader"):
+        merged["uploader"] = info.get("uploader") or info.get("channel")
+    if not merged.get("thumbnail"):
+        merged["thumbnail"] = info.get("thumbnail")
+    if not merged.get("duration"):
+        merged["duration"] = info.get("duration")
+
+    playlist_index = selected.get("playlist_index") or 1
+    try:
+        playlist_index = int(playlist_index)
+    except Exception:
+        playlist_index = 1
+    base_webpage = (
+        selected.get("webpage_url")
+        or info.get("webpage_url")
+        or info.get("original_url")
+        or source_url
+    )
+    merged["webpage_url"] = x_status_video_url(str(base_webpage), playlist_index)
+    # Expose parent multi-count for UI/logging without changing MediaProbe schema yet.
+    merged["_yoinks_playlist_count"] = info.get("playlist_count") or len(entries)
+    merged["_yoinks_playlist_index"] = playlist_index
+    return merged
+
+
+def formats_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
+    formats = [
+        compact_format(item, info)
+        for item in (info.get("formats") or [])
+        if item.get("format_id")
+    ]
+    if formats:
+        return formats
+    # Fallback: single direct media url with no formats list.
+    if info.get("url") and (info.get("format_id") or info.get("ext") or info.get("height")):
+        synthetic = {
+            "format_id": info.get("format_id") or "0",
+            "ext": info.get("ext"),
+            "vcodec": info.get("vcodec"),
+            "acodec": info.get("acodec"),
+            "height": info.get("height"),
+            "width": info.get("width"),
+            "fps": info.get("fps"),
+            "abr": info.get("abr"),
+            "tbr": info.get("tbr"),
+            "filesize": info.get("filesize") or info.get("filesize_approx"),
+            "url": info.get("url"),
+            "http_headers": info.get("http_headers"),
+            "referer": info.get("referer"),
+        }
+        return [compact_format(synthetic, info)]
+    return []
+
+
 def main() -> None:
     args = sys.argv[1:]
     insecure = False
@@ -104,16 +220,34 @@ def main() -> None:
         print(json.dumps({"ok": False, "error": str(error)[:1000]}))
         raise SystemExit(1)
 
-    formats = [compact_format(item, info) for item in (info.get("formats") or []) if item.get("format_id")]
-    print(json.dumps({
+    if not isinstance(info, dict):
+        print(json.dumps({"ok": False, "error": "媒体探测返回了空结果"}))
+        raise SystemExit(1)
+
+    media = select_media_info(info, url)
+    formats = formats_from_info(media)
+    if not formats:
+        print(json.dumps({
+            "ok": False,
+            "error": "未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）",
+        }, ensure_ascii=False))
+        raise SystemExit(1)
+    payload = {
         "ok": True,
-        "title": info.get("title") or "未命名媒体",
-        "uploader": info.get("uploader") or info.get("channel"),
-        "duration": info.get("duration"),
-        "thumbnail": info.get("thumbnail"),
-        "webpageUrl": info.get("webpage_url") or url,
+        "title": media.get("title") or info.get("title") or "未命名媒体",
+        "uploader": media.get("uploader") or media.get("channel") or info.get("uploader") or info.get("channel"),
+        "duration": media.get("duration") if media.get("duration") is not None else info.get("duration"),
+        "thumbnail": media.get("thumbnail") or info.get("thumbnail"),
+        "webpageUrl": media.get("webpage_url") or info.get("webpage_url") or url,
         "formats": formats,
-    }, ensure_ascii=False))
+    }
+    playlist_count = media.get("_yoinks_playlist_count")
+    playlist_index = media.get("_yoinks_playlist_index")
+    if isinstance(playlist_count, int) and playlist_count > 1:
+        payload["playlistCount"] = playlist_count
+        if isinstance(playlist_index, int):
+            payload["playlistIndex"] = playlist_index
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 if __name__ == "__main__":
