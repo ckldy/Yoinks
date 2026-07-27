@@ -6,6 +6,18 @@
 - 次版本：向后兼容的新功能。
 - 修订版本：向后兼容的问题修复与小幅优化。
 
+## 1.4.9 - 2026-07-28
+
+### 修复
+
+- **X（Twitter）多视频帖分析不出格式**：裸 `x.com/.../status/<id>` 多视频推文被 yt-dlp 以 `_type=playlist` 返回，顶层 `formats` 为空，探测显示标题但 `choiceCount/formatCount=0`。探测时展开 `entries` 取第一段视频格式，并把 `webpageUrl` 固定为 `/video/1`；`probeMedia`/`downloadMedia` 同步 pin 到 `/video/N`；runner 增加 `playlist_items=1` 防止裸状态链接误下第二段时 format 不匹配。
+
+### 验证
+
+- 复现链接 `https://x.com/i/status/2081601740965593356`：修复前 `formats=[]`，修复后 `formatCount=9` 且 `webpageUrl` 带 `/video/1`。
+- TypeScript 诊断 0 错误；`verify_x_multivideo_probe.ts` 7/7；`verify_x_preview_audio.ts` 通过；`python3 -m py_compile ytdlp_probe.py ytdlp_runner.py` 通过；`scripting-ts project "Yoinks" --check` 通过。
+- 仍需真机：粘贴该多视频 X 链接应列出格式并可下载第一段。
+
 ## 1.4.8 - 2026-07-27
 
 ### 修复
