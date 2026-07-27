@@ -6,6 +6,21 @@
 - 次版本：向后兼容的新功能。
 - 修订版本：向后兼容的问题修复与小幅优化。
 
+## 1.4.8 - 2026-07-27
+
+### 修复
+
+- **发现功能平台识别**：`services/discovery-engines/playlist.ts` 不再硬编码返回 B站，改为按 URL host 自动识别 YouTube、TikTok、抖音、X、小红书、B站等平台。
+- **发现页「换一批」**：只有在明确还有更多内容（`totalAvailable > items.length` 或当前页已满）时才显示，避免单页/无结果时仍出现翻页按钮。
+- **相关推荐平台选择**：仅列出 B站/YouTube；切换发现类型时若当前平台不被支持则自动重置为 B站。
+- **B站 Web 搜索**：`bilibili_web_discover.py` 的时长解析支持整数秒与 `HH:MM:SS`，并对 `numResults`/`numPages` 兜底避免总页数为 0。
+- **`ytdlp_discover.py` 输出简化**：`sourceURL` 统一使用原始输入。
+
+### 验证
+
+- TypeScript 诊断 0 错误；`verify_discovery_service.ts`、`verify_bilibili_space.ts`、`verify_discover_bili_behavior.ts` 均通过；`python3 -m py_compile` 通过；`scripting-ts project "Yoinks" --check` 通过。
+- 真机验证：平台字段正确性、相关推荐平台选择受限、翻页按钮按需显示、B 站搜索时长显示均正常。
+
 ## 1.4.7 - 2026-07-26
 
 ### 修复
