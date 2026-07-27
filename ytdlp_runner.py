@@ -117,6 +117,9 @@ def main():
         "format": config["format"],
         "format_sort": config.get("format_sort") or [],
         "noplaylist": True,
+        # X/Twitter multi-video posts ignore noplaylist and still yield a playlist.
+        # Limit to the first item so a bare status URL cannot fail on later videos.
+        "playlist_items": "1",
         # Progress is written via progress_hooks; keep stdout small so Shell.run keeps final path lines.
         "quiet": True,
         "no_warnings": True,
