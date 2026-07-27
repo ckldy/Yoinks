@@ -122,11 +122,13 @@ import {
 import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-preview"
 import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
+import { DiscoverTab } from "./components/DiscoverTab"
 
 const HISTORY_TAB = 0
-const DOWNLOAD_TAB = 1
-const SETTINGS_TAB = 2
-type YoinksTab = typeof HISTORY_TAB | typeof DOWNLOAD_TAB | typeof SETTINGS_TAB
+const DISCOVER_TAB = 1
+const DOWNLOAD_TAB = 2
+const SETTINGS_TAB = 3
+type YoinksTab = typeof HISTORY_TAB | typeof DISCOVER_TAB | typeof DOWNLOAD_TAB | typeof SETTINGS_TAB
 
 const CONCURRENCY_LABELS: Record<ConcurrentDownloads, string> = {
   1: "单线程",
@@ -601,6 +603,10 @@ function View() {
       }
       if (gen !== analysisGenerationRef.current) return
       setProbe(probeResult)
+      // X multi-video bare status URLs are pinned to /video/N during probe; keep download on that URL.
+      if (probeResult.webpageURL && probeResult.webpageURL !== sourceURL) {
+        setURL(probeResult.webpageURL)
+      }
       if (platform === "douyin" && probeResult.choices.length === 1) {
         setSelectedChoice(probeResult.choices[0])
       }
@@ -948,6 +954,23 @@ function View() {
     if (result.truncated || truncated) notes.push(`截断 ${result.truncated || truncated}`)
     if (result.rejectedFull) notes.push(`空位不足未入 ${result.rejectedFull}`)
     setStatus(`${notes.join(" · ")}。共 ${result.state.items.length} 条，可点「开始批量下载」。`)
+  }
+
+  const handleDiscoverEnqueue = (urls: string[]) => {
+    const result = enqueueURLs(batchQueueRef.current, urls, BATCH_ADD_MAX)
+    setBatchQueueSynced(result.state)
+    void logEvent({
+      level: "info",
+      event: "discover.enqueue",
+      details: {
+        added: result.added,
+        skippedDuplicate: result.skippedDuplicate,
+        truncated: result.truncated,
+        rejectedFull: result.rejectedFull,
+        queueSize: result.state.items.length,
+      },
+    })
+    return result
   }
 
   /** Queue-local: paste clipboard URLs into batch with no confirm dialogs. */
@@ -1869,6 +1892,16 @@ return (
         <HistoryView />
       </Tab>
 
+      <Tab title="发现" systemImage="binoculars" value={DISCOVER_TAB}>
+        <DiscoverTab
+          experimentalEnabled={preferences.experimentalDiscoveryEnabled}
+          queueItemCount={batchQueue.items.length}
+          onEnqueue={handleDiscoverEnqueue}
+          onSwitchToDownload={() => activeTab.setValue(DOWNLOAD_TAB)}
+          onClose={closeYoinks}
+        />
+      </Tab>
+
       <Tab title="下载" systemImage="arrow.down.circle.fill" value={DOWNLOAD_TAB}>
         <DownloadView />
       </Tab>
@@ -1921,6 +1954,15 @@ return (
               </HStack>
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
               {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>}
+            </Section>
+            <Section title="发现">
+              <Toggle
+                title="实验性发现功能"
+                systemImage="binoculars"
+                value={preferences.experimentalDiscoveryEnabled}
+                onChanged={(value) => updatePreferences({ ...preferences, experimentalDiscoveryEnabled: value })}
+              />
+              <Text font="caption" foregroundStyle="secondaryLabel">开启后，发现页显示「关键词搜索」和「相关推荐」。播放列表/作者主页发现始终可用。</Text>
             </Section>
             <Section title="运行日志">
               <Button title="查看运行日志" systemImage="list.bullet" action={() => void Navigation.present({ element: <LogListView /> })} />

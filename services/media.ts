@@ -105,7 +105,7 @@ export function quote(value: string): string {
 }
 
 /** Scripting host noise that can mask real yt-dlp exit output. */
-const HOST_NOISE_LINE =
+export const HOST_NOISE_LINE =
   /Script window host view deinit|Transpile JSContext(?: released)?|webview viewmodel cleanup|WebViewController disposed|load start|load stop|set channel|\[WebView\]\s*\[LOG\]|\[WebView\]|Write scripts settings successfully/i
 
 export function isHostDeinitNoise(value: string): boolean {
@@ -283,6 +283,25 @@ export function mediaPlatformLabel(value: string | null | undefined): string | n
     case "douyin": return "抖音"
     case "xiaohongshu": return "小红书"
     default: return null
+  }
+}
+
+/** Pin X/Twitter status URLs to /video/N so multi-video posts stay single-item. */
+export function pinXStatusVideoURL(value: string, videoIndex = 1): string {
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase()
+    if (!(host === "x.com" || host === "twitter.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com"))) {
+      return value
+    }
+    const match = url.pathname.match(/^(\/(?:[^/]+|i)\/status\/\d+)(?:\/video\/(\d+))?\/?$/i)
+    if (!match) return value
+    const existing = match[2] ? Number(match[2]) : NaN
+    const index = Number.isFinite(existing) && existing > 0 ? existing : Math.max(1, Math.floor(videoIndex || 1))
+    url.pathname = `${match[1]}/video/${index}`
+    return url.toString()
+  } catch {
+    return value
   }
 }
 
@@ -955,8 +974,11 @@ async function downloadDouyinDirect(options: {
 
 
 export async function probeMedia(url: string, options: ProbeOptions = {}): Promise<MediaProbe> {
-  const sourceURL = extractFirstURL(url)
-  if (!sourceURL) throw new Error("请输入有效的公开 http 或 https 链接。")
+  const extractedURL = extractFirstURL(url)
+  if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
+  // X multi-video bare status URLs extract as playlists with empty top-level formats.
+  // Prefer /video/1 so probe and later download share the same single-item URL.
+  const sourceURL = pinXStatusVideoURL(extractedURL, 1)
   // 抖音：匿名 WebView(+detail) → 合成候选，不走 yt-dlp / 不要求用户登录
   if (detectMediaPlatform(sourceURL) === "douyin") {
     return probeDouyinDirect(sourceURL)
@@ -1050,15 +1072,20 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
     }
   }).filter((item) => Boolean(item.formatId))
   const choices = buildChoices(formats)
+  if (!choices.length) {
+    throw new Error("未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）")
+  }
+  // Prefer the probe-pinned X /video/N URL so download reuses a single-item page.
+  const webpageURL = pinXStatusVideoURL(stringValue(payload.webpageUrl) || sourceURL, 1)
   const probe: MediaProbe = {
     title: stringValue(payload.title) || "未命名媒体",
     uploader: stringValue(payload.uploader),
     duration: numberValue(payload.duration),
     thumbnail: stringValue(payload.thumbnail),
-    webpageURL: stringValue(payload.webpageUrl) || sourceURL,
+    webpageURL,
     choices,
   }
-  await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: probe.title, choiceCount: choices.length, formatCount: formats.length } })
+  await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: probe.title, choiceCount: choices.length, formatCount: formats.length, webpageURL } })
   return probe
 }
 
@@ -1364,8 +1391,9 @@ export async function downloadMedia(options: {
   onProgress: (value: DownloadProgress) => void
   onCancelPath: (path: string) => void
 }): Promise<DownloadResult> {
-  const sourceURL = extractFirstURL(options.url)
-  if (!sourceURL) throw new Error("请输入有效的公开 http 或 https 链接。")
+  const extractedURL = extractFirstURL(options.url)
+  if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
+  const sourceURL = pinXStatusVideoURL(extractedURL, 1)
   await ensureDirectories()
 
   // 抖音：匿名 WebView → 候选 → 流式/图文下载（全程无用户登录）
