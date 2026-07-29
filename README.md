@@ -2,7 +2,9 @@
 
 面向 [Scripting](https://scripting.fun) 的 iOS 媒体下载脚本。粘贴或分享公开媒体链接，探测可选格式后下载，并可保存到相册或文件。
 
-当前版本：**1.4.9**
+当前版本：**1.5.1**
+
+作者：**vcncv**
 
 > 本项目受 [Pablo Stanley / Yoinks](https://github.com/pablostanley/yoinks) 启发，在 Scripting 运行时中重新实现核心下载体验。Scripting 的模拟 Node.js 环境无法完整运行原版 `node` / `npm` 工作流，因此这里保留名称与使用路径，并针对 iOS 与宿主能力做了适配。
 
@@ -15,8 +17,10 @@
 - **下载**：单文件 / 分离音视频后用内置 `ffmpeg` 合并；H.264 优先 MP4；**HEVC / AV1 / VP9 流拷贝合成 MKV**（外部播放器）；支持仅音频（MP3）、一键最佳质量
 - **站点分流**
   - 抖音：匿名 WebView 抓取详情候选后流式/图文下载（不登录、不接第三方解析 API）
-  - 小红书、YouTube、B 站等：以 `yt-dlp` 为主；必要时 Cookie / 登录重试、TLS 兼容重试
-- **在线预览**：探测后可预览；DASH 双流、H.264 优先；支持静音/有声自动播放策略
+  - 小红书、YouTube、B 站等：以 `yt-dlp` 为主；必要时 Cookie / 登录重试、TLS 兼容重试；B 站 DASH 音频 CDN 断连时会保留已完成视频并仅重试音频一次
+- **在线预览**：探测后可预览；支持 progressive、HLS 与 DASH 双流，H.264 优先；提供静音/有声自动播放、倍速控制，HLS 多档流可选画质；首播确认、关闭取消与触摸控件均做可靠性保护
+- **发现**：发现页可浏览播放列表、作者主页、相关推荐与搜索结果；支持 B 站作者主页与常用平台发现入口
+- **登录与兼容**：YouTube 等受限内容可按需网页登录或导入 `cookies.txt` 后重试；探测优先使用兼容当前运行时的 YouTube client
 - **保存**：相册、Files / 自定义输出目录；可选保留 Yoinks 本地原文件
 - **记录**：下载历史、最近链接复用、可用性检查与限额清理
 - **日志**：运行日志（主链 + warn/error）；调试时可开临时详细日志
@@ -37,7 +41,7 @@ https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckld
 或从仓库安装：
 
 - GitHub：https://github.com/ckldy/Yoinks
-- 标签：https://github.com/ckldy/Yoinks/releases/tag/v1.4.9
+- Releases：https://github.com/ckldy/Yoinks/releases
 
 ### 手动安装
 
@@ -68,8 +72,9 @@ https://scripting.fun/import_scripts?urls=%5B%22https:%5C/%5C/github.com%5C/ckld
 | 标签 | 说明 |
 |------|------|
 | 记录 | 历史下载、预览/分享/删除、滚动加载更多 |
-| 下载 | 当前链接、格式列表、批量队列（非空时）、任务进度与结果操作 |
-| 设置 | 偏好、工具状态、日志、关于与更新说明 |
+| 下载 | 当前链接、格式列表、在线预览、批量队列（非空时）、任务进度与结果操作 |
+| 发现 | 播放列表、作者主页、相关推荐和搜索结果浏览 |
+| 设置 | 偏好、工具状态、平台登录 / Cookie、日志、关于与更新说明 |
 
 ---
 
@@ -87,6 +92,8 @@ Yoinks/
 │   ├── media.ts             # 探测/下载/合并/验证主链
 │   ├── douyin.ts            # 抖音匿名 WebView 路径
 │   ├── online-preview.ts    # 在线预览
+│   ├── discovery.ts          # 发现页服务
+│   ├── discovery-engines/    # 平台发现引擎
 │   ├── history.ts           # 下载记录与清理
 │   ├── link-history.ts      # 最近成功链接
 │   ├── preferences.ts       # 用户偏好
@@ -148,6 +155,8 @@ Git 工作流可使用 Scripting 的 [isomorphic-git](https://github.com/isomorp
 
 | 版本 | 要点 |
 |------|------|
+| 1.5.1 | 下载稳定性修复：YouTube 匿名/登录会话一致性、剪贴板自动下载、TLS 证书兼容重试、B 站 DASH 音频断连重试 |
+| 1.5.0 | HLS / DASH 倍速控制、HLS 画质选择、在线预览可靠性增强；YouTube 按需登录与 `cookies.txt` 导入；发现页与平台发现能力 |
 | 1.4.9 | X 多视频帖：裸 status 探测展开 entries 并 pin `/video/1` |
 | 1.4.8 | 发现页平台识别、换一批、B 站搜索时长 |
 | 1.4.7 | X 视频预览：默认使用带音频的 progressive MP4 |
@@ -173,6 +182,7 @@ Git 工作流可使用 Scripting 的 [isomorphic-git](https://github.com/isomorp
 
 ## 致谢
 
+- **vcncv** — Scripting 适配、维护与发布  
 - [Pablo Stanley / Yoinks](https://github.com/pablostanley/yoinks) — 上游产品与交互灵感  
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — 媒体提取  
 - [Scripting](https://scripting.fun) — iOS 脚本运行时  
