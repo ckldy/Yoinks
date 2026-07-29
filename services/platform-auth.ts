@@ -2,7 +2,7 @@ import { Path, Script, type Cookie } from "scripting"
 import { createTaskId } from "./logs"
 import type { MediaPlatform } from "./media"
 
-export type AuthPlatform = "xiaohongshu"
+export type AuthPlatform = "xiaohongshu" | "youtube"
 export type LoginRetention = "temporary" | "persistent"
 
 export type PlatformAuthSession = {
@@ -21,6 +21,11 @@ const PLATFORM_CONFIG: Record<AuthPlatform, { label: string; loginURL: string; d
     label: "小红书",
     loginURL: "https://www.xiaohongshu.com/",
     domains: ["xiaohongshu.com", "rednote.com"],
+  },
+  youtube: {
+    label: "YouTube",
+    loginURL: "https://www.youtube.com/",
+    domains: ["youtube.com", "googlevideo.com", "youtu.be"],
   },
 }
 
@@ -84,7 +89,7 @@ export function supportedAuthPlatforms(): AuthPlatform[] {
 }
 
 export function isAuthPlatform(platform: MediaPlatform): platform is AuthPlatform {
-  return platform === "xiaohongshu"
+  return platform === "xiaohongshu" || platform === "youtube"
 }
 
 export function authPlatformLabel(platform: AuthPlatform): string {
@@ -92,7 +97,7 @@ export function authPlatformLabel(platform: AuthPlatform): string {
 }
 
 export function isFreshCookieError(message: string): boolean {
-  return /fresh cookies|cookies? (?:are|is) needed|login required|sign in|required to login|not logged in/i.test(message)
+  return /fresh cookies|cookies? (?:are|is) needed|login required|sign in|required to login|not logged in|members-only|join this channel/i.test(message)
 }
 
 export async function beginPlatformLogin(platform: AuthPlatform, retention: LoginRetention): Promise<PlatformAuthSession> {
@@ -158,4 +163,33 @@ export async function clearPlatformLogin(platform: AuthPlatform): Promise<number
   } finally {
     webView.dispose()
   }
+}
+
+// 导入外部 cookies.txt 文件（Netscape 格式），供探测/下载直接使用。
+// 适用于 WebView 登录被设备验证阻断、或用户已有浏览器导出 cookie 的场景。
+let importedCookiePath: string | null = null
+
+export function getImportedCookiePath(): string | null {
+  return importedCookiePath
+}
+
+export function clearImportedCookie(): void {
+  if (importedCookiePath) {
+    removeTaskCookieFile(importedCookiePath)
+    importedCookiePath = null
+  }
+}
+
+export async function importCookieFile(): Promise<string | null> {
+  const paths = await DocumentPicker.pickFiles()
+  if (!paths || !paths.length) return null
+  const sourcePath = paths[0]
+  if (!(await FileManager.exists(sourcePath))) throw new Error("选择的 Cookie 文件不存在。")
+  if (!(await FileManager.exists(TEMP_DIR))) await FileManager.createDirectory(TEMP_DIR, true)
+  // 清理旧的导入文件
+  clearImportedCookie()
+  const destPath = Path.join(TEMP_DIR, `${createTaskId()}.imported.cookies.txt`)
+  await FileManager.copyFile(sourcePath, destPath)
+  importedCookiePath = destPath
+  return destPath
 }

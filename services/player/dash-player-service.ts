@@ -28,12 +28,27 @@ html,body{height:100%;width:100%;background:#000;overflow:hidden}
 video{width:100%;height:100%;object-fit:contain;display:block}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font:14px -apple-system;text-align:center;z-index:10}
 .error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff4444;font:14px -apple-system;text-align:center;padding:20px;z-index:10;max-width:90%;display:none}
+.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}
+.ctrl-host{position:relative;pointer-events:auto}
+.pill{background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:14px;padding:5px 12px;font:600 12px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.pill:active{background:rgba(0,0,0,0.75)}
+.menu{position:absolute;top:34px;right:0;background:rgba(0,0,0,0.7);border-radius:8px;padding:4px 0;min-width:68px;display:none;z-index:21}
+.menu.open{display:block}
+.menu-item{color:#fff;font:13px -apple-system;padding:8px 14px;cursor:pointer;-webkit-tap-highlight-color:transparent;white-space:nowrap;text-align:center}
+.menu-item:active{background:rgba(255,255,255,0.15)}
+.menu-item.active{color:#4ad6ff}
 </style>
 </head>
 <body>
 <div class="loading" id="loading">加载中...</div>
 <video id="video" controls {{PLAYS_INLINE}} {{MUTED}} {{AUTOPLAY}} preload="auto"></video>
 <div class="error" id="error"></div>
+<div class="ctrl-wrap">
+  <div class="ctrl-host" id="speedHost">
+    <button class="pill" id="speedBtn">1.0x</button>
+    <div class="menu" id="speedMenu"></div>
+  </div>
+</div>
 
 <script src="{{DASH_JS_URL}}"></script>
 <script>
@@ -43,6 +58,9 @@ var errorDiv = document.getElementById('error');
 var player = null;
 var requestMode = 'dash.js';
 var headersApplied = false;
+var destroyed = false;
+var activeXhrs = [];
+var retryTimers = [];
 
 var config = {{DASH_CONFIG}};
 
@@ -126,26 +144,79 @@ function findInitAndIndexRanges(buffer) {
   };
 }
 
-function fetchArrayBuffer(url, headers) {
+function fetchArrayBufferOnce(url, headers) {
   return new Promise(function(resolve, reject) {
+    if (destroyed) { reject(new Error('Preview dismissed')); return; }
     var xhr = new XMLHttpRequest();
+    activeXhrs.push(xhr);
+    var done = false;
+    function finish(callback, value) {
+      if (done) return;
+      done = true;
+      var index = activeXhrs.indexOf(xhr);
+      if (index >= 0) activeXhrs.splice(index, 1);
+      callback(value);
+    }
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
+    xhr.timeout = 10000;
     // 2 MB is enough for large YouTube moov/sidx boxes while still being a small probe.
     xhr.setRequestHeader('Range', 'bytes=0-2097151');
     Object.entries(headers || {}).forEach(function(entry) {
       try { xhr.setRequestHeader(entry[0], entry[1]); } catch (e) {}
     });
     xhr.onload = function() {
+      if (destroyed) { finish(reject, new Error('Preview dismissed')); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(xhr.response);
+        var contentLength = Number(xhr.getResponseHeader('Content-Length') || 0);
+        if (contentLength > 3 * 1024 * 1024) { finish(reject, new Error('初始化响应过大')); return; }
+        finish(resolve, xhr.response);
       } else {
-        reject(new Error('HTTP ' + xhr.status));
+        finish(reject, new Error('HTTP ' + xhr.status));
       }
     };
-    xhr.onerror = function() { reject(new Error('Network error')); };
+    xhr.onerror = function() { finish(reject, new Error('Network error')); };
+    xhr.ontimeout = function() { finish(reject, new Error('初始化请求超时')); };
+    xhr.onabort = function() { finish(reject, new Error('Preview dismissed')); };
     xhr.send();
   });
+}
+
+function sleep(milliseconds) {
+  return new Promise(function(resolve) {
+    var timer = setTimeout(function() {
+      var index = retryTimers.indexOf(timer);
+      if (index >= 0) retryTimers.splice(index, 1);
+      resolve();
+    }, milliseconds);
+    retryTimers.push(timer);
+  });
+}
+
+async function fetchArrayBuffer(url, headers, streamKind) {
+  // Googlevideo initial Range requests can intermittently fail in WKWebView.
+  // Retry only transport failures; HTTP responses remain actionable immediately.
+  var delays = [0, 300, 900];
+  var lastError = null;
+  for (var attempt = 0; attempt < delays.length; attempt++) {
+    if (destroyed) throw new Error('Preview dismissed');
+    if (delays[attempt]) await sleep(delays[attempt]);
+    if (destroyed) throw new Error('Preview dismissed');
+    try {
+      var buffer = await fetchArrayBufferOnce(url, headers);
+      if (attempt > 0) reportDiagnostic('dash.init.retry.success', { stream: streamKind, attempt: attempt + 1 });
+      return buffer;
+    } catch (err) {
+      lastError = err;
+      var message = String(err && err.message ? err.message : err);
+      if (!/Network error/i.test(message) || attempt === delays.length - 1) {
+        reportDiagnostic('dash.init.request.failed', { stream: streamKind, attempt: attempt + 1, message: message });
+        throw err;
+      }
+      reportDiagnostic('dash.init.retry', { stream: streamKind, attempt: attempt + 1, delayMilliseconds: delays[attempt + 1], message: message });
+    }
+  }
+  throw lastError || new Error('Network error');
 }
 function isForbiddenStatus(err) {
   var msg = String(err && err.message ? err.message : err);
@@ -193,16 +264,16 @@ function buildMpd(videoUrl, videoRanges, audioUrl, audioRanges, duration, videoC
   return 'data:application/dash+xml;charset=utf-8;base64,' + btoa(unescape(encodeURIComponent(mpd)));
 }
 
-async function probeRangesForUrl(url, fallbackUrl, headers) {
+async function probeRangesForUrl(url, fallbackUrl, headers, streamKind) {
   try {
-    var buf = await fetchArrayBuffer(url, headers);
+    var buf = await fetchArrayBuffer(url, headers, streamKind);
     var ranges = findInitAndIndexRanges(buf);
     if (!ranges) throw new Error('无法解析 .m4s 初始化段');
     return { ranges: ranges, usedFallback: false };
   } catch (err) {
     if (fallbackUrl && fallbackUrl !== url && isForbiddenStatus(err)) {
       reportDiagnostic('dash.init.fallback', { reason: String(err.message || err), original: url, fallback: fallbackUrl });
-      var buf2 = await fetchArrayBuffer(fallbackUrl, headers);
+      var buf2 = await fetchArrayBuffer(fallbackUrl, headers, streamKind + '-fallback');
       var ranges2 = findInitAndIndexRanges(buf2);
       if (!ranges2) throw new Error('无法解析 .m4s 初始化段');
       return { ranges: ranges2, usedFallback: true };
@@ -261,17 +332,17 @@ function startDashPlayback() {
   reportMode('dash.js', headersApplied);
 
   reportDiagnostic('dash.init.urls', {
-    videoUrl: config.videoUrl,
-    videoFallback: config.videoFallbackUrl,
-    audioUrl: config.audioUrl,
-    audioFallback: config.audioFallbackUrl,
-    headerKeys: Object.keys(allowedHeaders || {}),
-    baseUrl: document.baseURI || null
+    videoHost: safeHost(config.videoUrl),
+    hasVideoFallback: !!config.videoFallbackUrl,
+    audioHost: safeHost(config.audioUrl),
+    hasAudioFallback: !!config.audioFallbackUrl,
+    headerKeys: Object.keys(allowedHeaders || {})
   });
   Promise.all([
-    probeRangesForUrl(config.videoUrl, config.videoFallbackUrl, allowedHeaders),
-    probeRangesForUrl(config.audioUrl, config.audioFallbackUrl, allowedHeaders)
+    probeRangesForUrl(config.videoUrl, config.videoFallbackUrl, allowedHeaders, 'video'),
+    probeRangesForUrl(config.audioUrl, config.audioFallbackUrl, allowedHeaders, 'audio')
   ]).then(function(results) {
+    if (destroyed || !player) return;
     var videoResult = results[0];
     var audioResult = results[1];
     var videoPlayUrl = videoResult.usedFallback && config.videoFallbackUrl ? config.videoFallbackUrl : config.videoUrl;
@@ -283,12 +354,21 @@ function startDashPlayback() {
       video.muted = true;
     }
   }).catch(function(err) {
+    if (destroyed) return;
     showError('DASH 初始化失败: ' + (err.message || err), true);
   });
+}
+function safeHost(url) {
+  try { return new URL(url).host; } catch (e) { return ''; }
 }
 
 window.startDashPlayback = startDashPlayback;
 window.destroyDashPlayer = function() {
+  destroyed = true;
+  activeXhrs.slice().forEach(function(xhr) { try { xhr.abort(); } catch (e) {} });
+  activeXhrs = [];
+  retryTimers.forEach(function(timer) { clearTimeout(timer); });
+  retryTimers = [];
   try {
     if (player) { player.reset(); player = null; }
     video.pause();
@@ -297,7 +377,47 @@ window.destroyDashPlayer = function() {
   } catch (e) {}
 };
 
-startDashPlayback();
+// --- 倍速控件 ---
+var SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+var speedMenu = document.getElementById('speedMenu');
+var speedBtn = document.getElementById('speedBtn');
+var currentRate = 1.0;
+
+function speedLabel(r) { return (r % 1 === 0 ? r.toFixed(1) : String(r)) + 'x'; }
+
+function buildSpeedMenu() {
+  speedMenu.innerHTML = '';
+  SPEEDS.forEach(function(r) {
+    var item = document.createElement('div');
+    item.className = 'menu-item' + (r === currentRate ? ' active' : '');
+    item.textContent = speedLabel(r);
+    item.addEventListener('click', function(e) {
+      e.stopPropagation();
+      currentRate = r;
+      try { video.playbackRate = r; } catch(e) {}
+      speedBtn.textContent = speedLabel(r);
+      buildSpeedMenu();
+      speedMenu.classList.remove('open');
+    });
+    speedMenu.appendChild(item);
+  });
+}
+
+speedBtn.addEventListener('click', function(e) {
+  e.stopPropagation();
+  speedMenu.classList.toggle('open');
+});
+// Keep touch events within custom controls away from native video tap-to-play.
+var controls = document.querySelector('.ctrl-wrap');
+['pointerdown', 'touchstart', 'click'].forEach(function(type) {
+  controls.addEventListener(type, function(e) { e.stopPropagation(); });
+});
+document.addEventListener('click', function(e) {
+  if (e.target && e.target.closest && e.target.closest('.ctrl-wrap')) return;
+  speedMenu.classList.remove('open');
+});
+
+buildSpeedMenu();
 </script>
 </body>
 </html>
@@ -418,11 +538,12 @@ export class DashPlayerService {
 
   async play(url: string, audioUrl?: string): Promise<void> {
     if (this.isDestroyed) throw new Error("Player destroyed")
-    this.currentUrl = url
-    this.currentAudioUrl = audioUrl || this.config.audioUrl || ""
+    if (!this.currentUrl) this.currentUrl = url
+    if (!this.currentAudioUrl) this.currentAudioUrl = audioUrl || this.config.audioUrl || ""
     if (!this.controller) await this.initialize()
-    // The HTML is already playing on load; no further JS call needed because we bake URLs into HTML.
-    this.emit({ type: "play", timestamp: Date.now(), data: { url } })
+    // Start only after native message handlers are registered, so first-play confirmation cannot race them.
+    await this.controller.evaluateJavaScript("startDashPlayback()")
+    this.emit({ type: "play", timestamp: Date.now(), data: { url: this.currentUrl } })
   }
 
   async destroy(): Promise<void> {
@@ -463,6 +584,10 @@ export class DashPlayerService {
 
   getCurrentUrl(): string {
     return this.currentUrl
+  }
+
+  getHtmlForTesting(): string {
+    return this.buildHtml()
   }
 
   getRequestMode(): "direct" | "hls.js" | "dash.js" | "native-fallback" | "unknown" {

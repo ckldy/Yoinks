@@ -98,6 +98,10 @@ const MAIN_CHAIN_EVENTS = new Set([
   "batch.item.removed",
   "batch.item.tls-retry",
   "batch.item.save.failed",
+  "discover.started",
+  "discover.completed",
+  "discover.failed",
+  "discover.enqueue",
   "verbose-log.enabled",
   "verbose-log.disabled",
 ])

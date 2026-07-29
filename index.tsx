@@ -118,6 +118,9 @@ import {
   isAuthPlatform,
   isFreshCookieError,
   supportedAuthPlatforms,
+  importCookieFile,
+  getImportedCookiePath,
+  clearImportedCookie,
 } from "./services/platform-auth"
 import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-preview"
 import type { DashPlayerService } from "./services/player/dash-player-service"
@@ -330,6 +333,7 @@ function View() {
   const [loadingTools, setLoadingTools] = useState(true)
   const [installing, setInstalling] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
   const [cancelPath, setCancelPath] = useState<string | null>(null)
   const [progress, setProgress] = useState<DownloadProgress>({ fraction: 0, stage: "准备就绪" })
   const [status, setStatus] = useState("粘贴一个公开媒体链接，然后选择输出格式。")
@@ -349,6 +353,7 @@ function View() {
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
+  const [importedCookieActive, setImportedCookieActive] = useState<boolean>(Boolean(getImportedCookiePath()))
   const launchClipboardCheckedRef = useRef(false)
   const closingRef = useRef(false)
   const analysisGenerationRef = useRef(0)
@@ -541,10 +546,13 @@ function View() {
   const probeWithPlatformSession = async (sourceURL: string, session: PlatformAuthSession | null): Promise<MediaProbe> => {
     let cookieFile: string | null = null
     try {
-      if (session) cookieFile = await createTaskCookieFile(session)
+      // 优先使用导入的 Cookie 文件，其次使用会话 Cookie
+      const imported = getImportedCookiePath()
+      if (imported) cookieFile = imported
+      else if (session) cookieFile = await createTaskCookieFile(session)
       return await probeMedia(sourceURL, { cookieFile: cookieFile || undefined, authorizedPlatform: session?.platform })
     } finally {
-      if (cookieFile) await FileManager.remove(cookieFile).catch(() => {})
+      if (cookieFile && session && !getImportedCookiePath()) await FileManager.remove(cookieFile).catch(() => {})
     }
   }
 
@@ -570,15 +578,16 @@ function View() {
     setStatus(platform === "douyin" ? "正在通过匿名 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
 
     try {
-      // 抖音：全程匿名 WebView，不挂登录会话 / 不弹登录
-      let session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      // YouTube and Douyin always start anonymously. YouTube only attaches a Cookie after an access-restricted response.
+      const anonymousFirst = platform === "youtube" || platform === "douyin"
+      let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       let probeResult: MediaProbe
       try {
         probeResult = await probeWithPlatformSession(sourceURL, session)
       } catch (firstError) {
         if (gen !== analysisGenerationRef.current) return
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-        // 仅小红书等仍走 Cookie 登录重探；抖音永不进入登录分支
+        // Douyin never enters the login branch; YouTube reaches it only after anonymous access is denied.
         if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
           await logEvent({
             level: "warn",
@@ -586,7 +595,9 @@ function View() {
             details: { sourceURL, platform, message: firstMessage },
           })
           setStatus(`${authPlatformLabel(platform)}需要登录后才能继续探测。`)
-          const loggedIn = await loginForPlatform(platform)
+          const loggedIn = platform === "youtube"
+            ? (await sessionForPlatform("youtube")) || await loginForPlatform(platform)
+            : await loginForPlatform(platform)
           if (gen !== analysisGenerationRef.current) return
           if (!loggedIn) {
             setProbe(null)
@@ -857,8 +868,23 @@ function View() {
     const confirmed = await Dialog.confirm({ title: "清除所有平台登录状态", message: "将清除所有平台的 Cookie 和持久化会话。", confirmLabel: "清除", cancelLabel: "取消" })
     if (!confirmed) return
     await Promise.all(supportedAuthPlatforms().map((platform) => clearPlatformLogin(platform)))
+    clearImportedCookie()
+    setImportedCookieActive(false)
     updatePlatformSessions(() => ({}))
     setStatus("已清除登录状态。")
+  }
+
+  const handleImportCookie = async () => {
+    try {
+      const path = await importCookieFile()
+      if (!path) return
+      setImportedCookieActive(true)
+      setStatus("Cookie 文件已导入，探测和下载将优先使用。")
+      await logEvent({ level: "info", event: "platform-auth.cookie.imported", details: {} })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await Dialog.alert({ title: "导入失败", message })
+    }
   }
 
   const pasteURL = async () => {
@@ -1273,12 +1299,29 @@ function View() {
 
         let probeResult: MediaProbe
         try {
-          const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+          // YouTube batch items probe anonymously first; only access-restricted items use an existing session.
+          const anonymousFirst = platform === "youtube" || platform === "douyin"
+          const session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
           try {
             probeResult = await probeWithPlatformSession(item.sourceURL, session)
           } catch (firstError) {
             const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-            if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+            if (platform === "youtube" && isFreshCookieError(firstMessage)) {
+              const youtubeSession = await sessionForPlatform("youtube")
+              if (youtubeSession) {
+                probeResult = await probeWithPlatformSession(item.sourceURL, youtubeSession)
+              } else {
+                fail += 1
+                const msg = "该视频需要 YouTube 会员登录；请先通过单链流程登录后再重试"
+                patchBatchItem(item.id, { status: "failed", errorMessage: msg })
+                await logEvent({
+                  level: "warn",
+                  event: "batch.item.failed",
+                  details: { itemId: item.id, reason: "login-required", platform },
+                })
+                continue
+              }
+            } else if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
               fail += 1
               const msg = `需先登录${authPlatformLabel(platform)}（设置或单链流程）后再重试`
               patchBatchItem(item.id, { status: "failed", errorMessage: msg })
@@ -1288,8 +1331,9 @@ function View() {
                 details: { itemId: item.id, reason: "login-required", platform },
               })
               continue
+            } else {
+              throw firstError
             }
-            throw firstError
           }
         } catch (error) {
           if (batchQueueRef.current.stopRequested) {
@@ -1362,9 +1406,11 @@ function View() {
 
         const runOneDownload = async (insecureTLS: boolean): Promise<DownloadResult> => {
           const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+          const importedCookie = getImportedCookiePath()
           let cookieFile: string | undefined
           try {
-            if (session) cookieFile = await createTaskCookieFile(session)
+            if (importedCookie) cookieFile = importedCookie
+            else if (session) cookieFile = await createTaskCookieFile(session)
             return await downloadMedia({
               url: item.sourceURL,
               choice,
@@ -1384,7 +1430,7 @@ function View() {
               authorizedPlatform: session?.platform,
             })
           } finally {
-            if (cookieFile) await FileManager.remove(cookieFile).catch(() => {})
+            if (cookieFile && !getImportedCookiePath()) await FileManager.remove(cookieFile).catch(() => {})
             if (session?.retention === "temporary") disposeTemporarySession(platform as AuthPlatform)
           }
         }
@@ -1493,11 +1539,14 @@ function View() {
   }
 
   const previewSelectedChoice = async () => {
+    if (previewing) return
     if (!selectedChoice?.previewURL || !probe) {
       setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
       return
     }
 
+    setPreviewing(true)
+    try {
     const previewOptions: OnlinePreviewOptions = {
       url: selectedChoice.previewURL,
       title: probe.title,
@@ -1529,6 +1578,10 @@ function View() {
     // failed
     setStatus("在线预览无法打开")
     await Dialog.alert({ title: "在线预览失败", message: result.message })
+    } finally {
+      previewPlayerRef.current = null
+      setPreviewing(false)
+    }
   }
 
       const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
@@ -1572,10 +1625,11 @@ function View() {
       const platform = detectMediaPlatform(validURL)
       // 抖音不走 Cookie 登录会话
       const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      const importedCookie = getImportedCookiePath()
       const downloaded = await downloadMedia({
         url: validURL,
         choice: downloadChoice,
-        cookieFile: session ? await createTaskCookieFile(session) : undefined,
+        cookieFile: importedCookie || (session ? await createTaskCookieFile(session) : undefined),
         concurrentFragments,
         insecureTLS,
         onProgress: (p: DownloadProgress) => applyProgressUi(p),
@@ -1811,7 +1865,7 @@ function DownloadView() {
                 {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
               </VStack>
               <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing || batchQueue.running} />
-              <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing || batchQueue.running} />
+              <Button title={previewing ? "正在打开预览……" : "在线预览"} systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || previewing || downloading || analyzing || batchQueue.running} />
             </>
           )}
         </Section>
@@ -1953,7 +2007,27 @@ return (
                 {!tools?.ytDlpVersion ? <Button title={installing ? "安装中" : "安装"} action={() => void install()} disabled={installing || loadingTools} /> : null}
               </HStack>
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
-              {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>}
+              {supportedAuthPlatforms().map((platform) => {
+                const session = platformSessions[platform]
+                return (
+                  <Button
+                    key={platform}
+                    title={session ? `${authPlatformLabel(platform)} · 已登录` : `登录${authPlatformLabel(platform)}`}
+                    systemImage={session ? "checkmark.circle.fill" : "person.crop.circle.badge.plus"}
+                    action={() => void loginForPlatform(platform)}
+                    disabled={downloading || analyzing}
+                  />
+                )
+              })}
+              <Button
+                title={importedCookieActive ? "Cookie 文件已导入" : "导入 Cookie 文件"}
+                systemImage={importedCookieActive ? "checkmark.shield.fill" : "doc.badge.plus"}
+                action={() => void handleImportCookie()}
+                disabled={downloading || analyzing}
+              />
+              <Text font="caption" foregroundStyle="secondaryLabel">导入 Netscape 格式 cookies.txt（如浏览器扩展“Get cookies.txt”导出），适用于会员视频或 WebView 登录被阻断的场景。导入后探测和下载将优先使用。</Text>
+              {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : null}
+              <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书、YouTube 等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>
             </Section>
             <Section title="发现">
               <Toggle

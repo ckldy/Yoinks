@@ -127,6 +127,9 @@ def main():
         "retries": 3,
         "fragment_retries": 3,
         "overwrites": False,
+        # YouTube web player client requires a JS runtime (deno) to decrypt nsig.
+        # This device has no JS runtime; prefer android_vr so downloads also work.
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
     }
 
     cookiefile = config.get("cookiefile")

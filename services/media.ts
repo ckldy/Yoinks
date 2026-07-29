@@ -150,6 +150,7 @@ export function isCertificateVerifyFailure(value: string): boolean {
   return /CERTIFICATE_VERIFY_FAILED|certificate verify failed|unable to get local issuer certificate/i.test(text)
 }
 
+
 /** Download-stage TLS/handshake timeouts (mid-file SSL), distinct from probe webpage open. */
 export function isDownloadTlsTimeout(value: string): boolean {
   const text = String(value || "")
@@ -253,7 +254,7 @@ function isAllowedURL(value: string): boolean {
   }
 }
 
-export type MediaPlatform = "douyin" | "xiaohongshu" | "generic"
+export type MediaPlatform = "douyin" | "xiaohongshu" | "youtube" | "generic"
 
 const XIAOHONGSHU_URL_PATTERNS = [
   /https?:\/\/(?:www\.)?(?:xiaohongshu|rednote)\.com\/(?:explore|discovery\/item|search_result|user\/profile\/[a-z0-9]+)\/[a-z0-9]+(?:\?[^\s"'<>，。！？；：、]*)?/i,
@@ -263,6 +264,12 @@ const DOUYIN_URL_PATTERNS = [
   /https?:\/\/v\.douyin\.com\/[a-zA-Z0-9_-]+/i,
   /https?:\/\/(?:www\.)?douyin\.com\/video\/[0-9]+/i,
   /https?:\/\/(?:www\.)?iesdouyin\.com\/[^\s"'<>，。！？；：、]*/i,
+]
+const YOUTUBE_URL_PATTERNS = [
+  /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]+/i,
+  /https?:\/\/(?:www\.)?youtu\.be\/[a-zA-Z0-9_-]+/i,
+  /https?:\/\/(?:www\.)?youtube\.com\/shorts\/[a-zA-Z0-9_-]+/i,
+  /https?:\/\/(?:music|gaming)\.youtube\.com\//i,
 ]
 
 function sanitizeExtractedURL(value: string): string {
@@ -275,6 +282,7 @@ export function detectMediaPlatform(value: string | null | undefined): MediaPlat
   if (!value) return "generic"
   if (DOUYIN_URL_PATTERNS.some((pattern) => pattern.test(value))) return "douyin"
   if (XIAOHONGSHU_URL_PATTERNS.some((pattern) => pattern.test(value))) return "xiaohongshu"
+  if (YOUTUBE_URL_PATTERNS.some((pattern) => pattern.test(value))) return "youtube"
   return "generic"
 }
 
@@ -1037,6 +1045,7 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
       },
     })
   }
+
 
   if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
   let payload: Record<string, unknown>

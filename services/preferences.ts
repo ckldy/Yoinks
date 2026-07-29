@@ -12,12 +12,12 @@ export type YoinksPreferences = {
   concurrentFragments: ConcurrentDownloads
   previewAutoplayMode: PreviewAutoplayMode
   automaticDownloadEnabled: boolean
-  experimentalDiscoveryEnabled: boolean
   automaticDownloadFormatStrategy: AutomaticDownloadFormatStrategy
   preferredContainer: PreferredContainer
   retainOriginalFiles: boolean
   maxManagedBytes: number | null
   maxHistoryRecords: number | null
+  experimentalDiscoveryEnabled: boolean
 }
 
 export const DEFAULT_PREFERENCES: YoinksPreferences = {
@@ -25,12 +25,12 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   concurrentFragments: 2,
   previewAutoplayMode: "muted",
   automaticDownloadEnabled: false,
-  experimentalDiscoveryEnabled: false,
   automaticDownloadFormatStrategy: "recommended",
   preferredContainer: "mp4",
   retainOriginalFiles: true,
   maxManagedBytes: 2 * 1024 * 1024 * 1024,
   maxHistoryRecords: 100,
+  experimentalDiscoveryEnabled: false,
 }
 
 function isSaveMode(value: unknown): value is SaveMode {
@@ -57,6 +57,10 @@ function isLimit(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0)
 }
 
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === "boolean"
+}
+
 export function normalizePreferences(value: unknown): YoinksPreferences {
   const source = typeof value === "object" && value != null ? value as Partial<YoinksPreferences> : {}
   return {
@@ -64,12 +68,12 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     concurrentFragments: isConcurrency(source.concurrentFragments) ? source.concurrentFragments : DEFAULT_PREFERENCES.concurrentFragments,
     previewAutoplayMode: isPreviewAutoplayMode(source.previewAutoplayMode) ? source.previewAutoplayMode : DEFAULT_PREFERENCES.previewAutoplayMode,
     automaticDownloadEnabled: typeof source.automaticDownloadEnabled === "boolean" ? source.automaticDownloadEnabled : DEFAULT_PREFERENCES.automaticDownloadEnabled,
-    experimentalDiscoveryEnabled: typeof source.experimentalDiscoveryEnabled === "boolean" ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
     automaticDownloadFormatStrategy: isAutomaticDownloadFormatStrategy(source.automaticDownloadFormatStrategy) ? source.automaticDownloadFormatStrategy : DEFAULT_PREFERENCES.automaticDownloadFormatStrategy,
     preferredContainer: isPreferredContainer(source.preferredContainer) ? source.preferredContainer : DEFAULT_PREFERENCES.preferredContainer,
     retainOriginalFiles: typeof source.retainOriginalFiles === "boolean" ? source.retainOriginalFiles : DEFAULT_PREFERENCES.retainOriginalFiles,
     maxManagedBytes: isLimit(source.maxManagedBytes) ? source.maxManagedBytes : DEFAULT_PREFERENCES.maxManagedBytes,
     maxHistoryRecords: source.maxHistoryRecords === null ? null : isLimit(source.maxHistoryRecords) ? Math.floor(source.maxHistoryRecords) : DEFAULT_PREFERENCES.maxHistoryRecords,
+    experimentalDiscoveryEnabled: isBoolean(source.experimentalDiscoveryEnabled) ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
   }
 }
 

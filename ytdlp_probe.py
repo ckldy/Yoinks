@@ -210,6 +210,8 @@ def main() -> None:
         "retries": 3,
         "extractor_retries": 3,
         "nocheckcertificate": insecure,
+        # This device has no JS runtime; use android_vr so YouTube formats do not depend on web nsig decryption.
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
     }
     if cookiefile:
         options["cookiefile"] = cookiefile

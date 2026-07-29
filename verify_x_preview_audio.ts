@@ -24,6 +24,8 @@ if (!firstVideo) {
   console.log("FAIL: no video choice generated")
   ok = false
   Script.exit(1)
+  // TypeScript does not know Script.exit terminates the process.
+  throw new Error("no video choice")
 }
 
 if (!firstVideo.previewURL || firstVideo.previewURL.endsWith(".m3u8")) {

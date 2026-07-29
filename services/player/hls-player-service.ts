@@ -91,7 +91,13 @@ export function filterAllowedHeaders(headers: Record<string, string>): Record<st
 
 // Serialize headers for safe JSON injection into HTML
 export function serializeHeadersForJS(headers: Record<string, string>): string {
+  // This JSON is embedded in an inline <script>; escape HTML/script delimiters too.
   return JSON.stringify(filterAllowedHeaders(headers))
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
 }
 
 // HTML template with embedded hls.js and header injection support
@@ -108,6 +114,15 @@ video{width:100%;height:100%;object-fit:contain;display:block}
 audio{display:none}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font:14px -apple-system;text-align:center;z-index:10}
 .error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff4444;font:14px -apple-system;text-align:center;padding:20px;z-index:10;max-width:90%}
+.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}
+.ctrl-host{position:relative;pointer-events:auto}
+.pill{background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:14px;padding:5px 12px;font:600 12px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.pill:active{background:rgba(0,0,0,0.75)}
+.menu{position:absolute;top:34px;right:0;background:rgba(0,0,0,0.7);border-radius:8px;padding:4px 0;min-width:68px;display:none;z-index:21}
+.menu.open{display:block}
+.menu-item{color:#fff;font:13px -apple-system;padding:8px 14px;cursor:pointer;-webkit-tap-highlight-color:transparent;white-space:nowrap;text-align:center}
+.menu-item:active{background:rgba(255,255,255,0.15)}
+.menu-item.active{color:#4ad6ff}
 </style>
 </head>
 <body>
@@ -115,6 +130,16 @@ audio{display:none}
 <video id="video" controls {{PLAYS_INLINE}} {{MUTED}} {{AUTOPLAY}} preload="{{PRELOAD}}"></video>
 <audio id="audio" preload="auto"></audio>
 <div class="error" id="error" style="display:none"></div>
+<div class="ctrl-wrap">
+  <div class="ctrl-host" id="qualityHost" style="display:none">
+    <button class="pill" id="qualityBtn">画质</button>
+    <div class="menu" id="qualityMenu"></div>
+  </div>
+  <div class="ctrl-host" id="speedHost">
+    <button class="pill" id="speedBtn">1.0x</button>
+    <div class="menu" id="speedMenu"></div>
+  </div>
+</div>
 
 <script src="{{HLS_JS_URL}}"></script>
 <script>
@@ -383,6 +408,14 @@ function play(src, audioSrc) {
         return { id: i, label: l.height + 'p', bitrate: l.bitrate, width: l.width, height: l.height };
       });
       window.webkit?.messageHandlers?.levelsUpdated?.postMessage({ levels: levels });
+      qualityLevels = levels;
+      if (levels.length >= 2) {
+        qualityHost.style.display = '';
+        if (manualLevel === -1) qualityBtn.textContent = '自动';
+        buildQualityMenu();
+      } else {
+        qualityHost.style.display = 'none';
+      }
     });
 
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -425,6 +458,101 @@ function destroy() {
 window.play = play;
 window.setQuality = setQuality;
 window.destroy = destroy;
+
+// --- 倍速 + 画质控件 ---
+var SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+var speedMenu = document.getElementById('speedMenu');
+var speedBtn = document.getElementById('speedBtn');
+var qualityHost = document.getElementById('qualityHost');
+var qualityBtn = document.getElementById('qualityBtn');
+var qualityMenu = document.getElementById('qualityMenu');
+var currentRate = 1.0;
+var manualLevel = -1;
+var qualityLevels = [];
+
+function speedLabel(r) { return (r % 1 === 0 ? r.toFixed(1) : String(r)) + 'x'; }
+
+function buildSpeedMenu() {
+  speedMenu.innerHTML = '';
+  SPEEDS.forEach(function(r) {
+    var item = document.createElement('div');
+    item.className = 'menu-item' + (r === currentRate ? ' active' : '');
+    item.textContent = speedLabel(r);
+    item.addEventListener('click', function(e) {
+      e.stopPropagation();
+      applySpeed(r);
+      speedMenu.classList.remove('open');
+    });
+    speedMenu.appendChild(item);
+  });
+}
+
+function applySpeed(rate) {
+  currentRate = rate;
+  try { video.playbackRate = rate; } catch(e) {}
+  if (currentAudioSrc && audio) { try { audio.playbackRate = rate; } catch(e) {} }
+  speedBtn.textContent = speedLabel(rate);
+  buildSpeedMenu();
+}
+
+function labelForLevel(id) {
+  var l = qualityLevels[id];
+  return l ? l.label : ('档位' + id);
+}
+
+function buildQualityMenu() {
+  qualityMenu.innerHTML = '';
+  var auto = document.createElement('div');
+  auto.className = 'menu-item' + (manualLevel === -1 ? ' active' : '');
+  auto.textContent = '自动';
+  auto.addEventListener('click', function(e) {
+    e.stopPropagation();
+    selectQuality(-1);
+    qualityMenu.classList.remove('open');
+  });
+  qualityMenu.appendChild(auto);
+  qualityLevels.forEach(function(l) {
+    var item = document.createElement('div');
+    item.className = 'menu-item' + (manualLevel === l.id ? ' active' : '');
+    item.textContent = l.label;
+    item.addEventListener('click', function(e) {
+      e.stopPropagation();
+      selectQuality(l.id);
+      qualityMenu.classList.remove('open');
+    });
+    qualityMenu.appendChild(item);
+  });
+}
+
+function selectQuality(level) {
+  manualLevel = level;
+  setQuality(level);
+  qualityBtn.textContent = (level === -1) ? '自动' : labelForLevel(level);
+  buildQualityMenu();
+}
+
+speedBtn.addEventListener('click', function(e) {
+  e.stopPropagation();
+  speedMenu.classList.toggle('open');
+  qualityMenu.classList.remove('open');
+});
+qualityBtn.addEventListener('click', function(e) {
+  e.stopPropagation();
+  qualityMenu.classList.toggle('open');
+  speedMenu.classList.remove('open');
+});
+// Keep touch events within custom controls away from native video tap-to-play.
+var controls = document.querySelector('.ctrl-wrap');
+['pointerdown', 'touchstart', 'click'].forEach(function(type) {
+  controls.addEventListener(type, function(e) { e.stopPropagation(); });
+});
+document.addEventListener('click', function(e) {
+  if (e.target && e.target.closest && e.target.closest('.ctrl-wrap')) return;
+  speedMenu.classList.remove('open');
+  qualityMenu.classList.remove('open');
+});
+
+buildSpeedMenu();
 </script>
 </body>
 </html>
@@ -593,7 +721,8 @@ export class HLSPlayerService {
 
   async setPlaybackRate(rate: number): Promise<void> {
     if (!this.controller) return
-    await this.controller.evaluateJavaScript(`video.playbackRate = ${rate}`)
+    if (!Number.isFinite(rate) || rate < 0.25 || rate > 4) throw new Error("Invalid playback rate")
+    await this.controller.evaluateJavaScript(`applySpeed(${rate})`)
     this.emit({ type: "ratechange", timestamp: Date.now(), data: { rate } })
   }
 
@@ -605,7 +734,9 @@ export class HLSPlayerService {
 
   async setQuality(levelId: string | number): Promise<void> {
     if (!this.controller) return
-    await this.controller.evaluateJavaScript(`setQuality(${levelId})`)
+    const level = Number(levelId)
+    if (!Number.isInteger(level) || level < -1) throw new Error("Invalid quality level")
+    await this.controller.evaluateJavaScript(`setQuality(${level})`)
   }
 
   async getCurrentTime(): Promise<number> {
@@ -654,10 +785,16 @@ export class HLSPlayerService {
     if (this.isDestroyed) return
     this.isDestroyed = true
 
-    if (this.controller) {
-      await this.controller.evaluateJavaScript("destroy()")
-      this.controller.dispose()
-      this.controller = null
+    const controller = this.controller
+    this.controller = null
+    if (controller) {
+      try {
+        await controller.evaluateJavaScript("destroy()")
+      } catch {
+        // The sheet may already have dismissed the WebView.
+      } finally {
+        controller.dispose()
+      }
     }
 
     this.currentUrl = ""
