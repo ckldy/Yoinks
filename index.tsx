@@ -353,6 +353,7 @@ function View() {
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
+  const probeAuthorizedPlatformRef = useRef<AuthPlatform | null>(null)
   const [importedCookieActive, setImportedCookieActive] = useState<boolean>(Boolean(getImportedCookiePath()))
   const launchClipboardCheckedRef = useRef(false)
   const closingRef = useRef(false)
@@ -398,7 +399,6 @@ function View() {
 
   const selectMediaChoice = (nextChoice: MediaChoice | null) => {
     setSelectedChoice(nextChoice)
-    if (nextChoice?.kind === "audio" && saveMode === "photos") updateSaveMode("files")
   }
 
   const refreshHistory = async () => {
@@ -546,8 +546,8 @@ function View() {
   const probeWithPlatformSession = async (sourceURL: string, session: PlatformAuthSession | null): Promise<MediaProbe> => {
     let cookieFile: string | null = null
     try {
-      // 优先使用导入的 Cookie 文件，其次使用会话 Cookie
-      const imported = getImportedCookiePath()
+      // 仅在调用方明确选择登录会话时使用 Cookie；匿名探测不能被全局导入 Cookie 隐式改变。
+      const imported = session ? getImportedCookiePath() : null
       if (imported) cookieFile = imported
       else if (session) cookieFile = await createTaskCookieFile(session)
       return await probeMedia(sourceURL, { cookieFile: cookieFile || undefined, authorizedPlatform: session?.platform })
@@ -556,7 +556,7 @@ function View() {
     }
   }
 
-  const analyzeMedia = async (nextURL?: string) => {
+  const analyzeMedia = async (nextURL?: string, autoDownloadRequested = false) => {
     const gen = ++analysisGenerationRef.current
     const sourceURL = extractFirstURL(nextURL || url)
     if (!sourceURL) {
@@ -569,6 +569,7 @@ function View() {
       return
     }
     setAnalyzing(true)
+    probeAuthorizedPlatformRef.current = null
     setProbe(null)
     setSelectedChoice(null)
     setResult(null)
@@ -578,7 +579,7 @@ function View() {
     setStatus(platform === "douyin" ? "正在通过匿名 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
 
     try {
-      // YouTube and Douyin always start anonymously. YouTube only attaches a Cookie after an access-restricted response.
+      // YouTube 与抖音默认匿名，避免 WebView Cookie 与 android_vr 客户端组合导致格式不可用；仅在匿名访问受限时才登录重探。
       const anonymousFirst = platform === "youtube" || platform === "douyin"
       let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       let probeResult: MediaProbe
@@ -613,6 +614,7 @@ function View() {
         }
       }
       if (gen !== analysisGenerationRef.current) return
+      probeAuthorizedPlatformRef.current = session?.platform || null
       setProbe(probeResult)
       // X multi-video bare status URLs are pinned to /video/N during probe; keep download on that URL.
       if (probeResult.webpageURL && probeResult.webpageURL !== sourceURL) {
@@ -627,6 +629,17 @@ function View() {
           : `探测完成：${probeResult.choices.length} 种可用格式，${probeResult.choices.length} 个格式条目。`
       )
       await logEvent({ level: "info", event: "probe.completed", taskId: sourceURL, details: { title: probeResult.title, choiceCount: probeResult.choices.length, formatCount: probeResult.choices.reduce((sum, c) => sum + (c.formatExpression ? 1 : 0), 0) } })
+      if (autoDownloadRequested && preferences.automaticDownloadEnabled) {
+        const resolved = resolveAutomaticChoice(probeResult.choices, preferences.automaticDownloadFormatStrategy, preferences.preferredContainer)
+        if (!resolved.choice) {
+          await logEvent({ level: "warn", event: "auto-download.skipped", taskId: sourceURL, details: { reason: "no-choice", strategy: preferences.automaticDownloadFormatStrategy } })
+          setStatus("自动下载未开始：没有匹配统一格式的可用媒体。")
+          return
+        }
+        setSelectedChoice(resolved.choice)
+        await logEvent({ level: "info", event: "auto-download.selected", taskId: sourceURL, details: { choiceId: resolved.choice.id, choiceLabel: resolved.choice.label, strategy: preferences.automaticDownloadFormatStrategy, usedFallback: resolved.usedFallback } })
+        void startDownload(false, { sourceURL, choice: resolved.choice, probeTitle: probeResult.title, toolStatus: tools })
+      }
     } catch (error) {
       if (gen !== analysisGenerationRef.current) return
       const message = error instanceof Error ? error.message : String(error)
@@ -647,10 +660,11 @@ function View() {
   }
 
   const chooseSaveMode = async () => {
-    const actions = (["ask", "photos", "files"] as SaveMode[]).map((mode) => ({ label: SAVE_LABELS[mode] }))
+    const modes: SaveMode[] = ["ask", "photos", "files"]
+    const actions = modes.map((mode) => ({ label: SAVE_LABELS[mode] }))
     const choice = await Dialog.actionSheet({ title: "默认保存方式", actions, cancelButton: true })
     if (choice == null) return
-    updateSaveMode((Object.keys(SAVE_LABELS) as SaveMode[])[choice])
+    updateSaveMode(modes[choice])
   }
 
   const chooseConcurrency = async () => {
@@ -904,7 +918,7 @@ function View() {
     setResult(null)
     setCompletedSaveMode(null)
     setStatus("正在分析链接。")
-    await analyzeMedia(valid)
+    await analyzeMedia(valid, true)
   }
 
   const enterURL = async () => {
@@ -1298,10 +1312,12 @@ function View() {
         }
 
         let probeResult: MediaProbe
+        let probeSession: PlatformAuthSession | null = null
         try {
           // YouTube batch items probe anonymously first; only access-restricted items use an existing session.
           const anonymousFirst = platform === "youtube" || platform === "douyin"
           const session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+          probeSession = session
           try {
             probeResult = await probeWithPlatformSession(item.sourceURL, session)
           } catch (firstError) {
@@ -1309,6 +1325,7 @@ function View() {
             if (platform === "youtube" && isFreshCookieError(firstMessage)) {
               const youtubeSession = await sessionForPlatform("youtube")
               if (youtubeSession) {
+                probeSession = youtubeSession
                 probeResult = await probeWithPlatformSession(item.sourceURL, youtubeSession)
               } else {
                 fail += 1
@@ -1405,8 +1422,8 @@ function View() {
         })
 
         const runOneDownload = async (insecureTLS: boolean): Promise<DownloadResult> => {
-          const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
-          const importedCookie = getImportedCookiePath()
+          const session = probeSession
+          const importedCookie = session ? getImportedCookiePath() : null
           let cookieFile: string | undefined
           try {
             if (importedCookie) cookieFile = importedCookie
@@ -1454,8 +1471,8 @@ function View() {
             }
           }
 
-          // Save policy: photos auto; ask/files keep originals only (no DocumentPicker / ask loops).
-          const batchSaveMode: SaveMode = saveMode === "photos" ? "photos" : "ask"
+          // 批量任务只自动保存图片/视频到相册；文件和每次询问均保留原文件，避免连续弹出系统面板。
+          const batchSaveMode = saveMode
           if (batchSaveMode === "photos" && (choice.kind === "video" || choice.kind === "image")) {
             try {
               await saveResult(downloaded.filePath, downloaded.fileName, "photos", downloaded.taskId)
@@ -1471,7 +1488,7 @@ function View() {
             }
           }
 
-          await recordCompletedDownload(downloaded, batchSaveMode === "photos" ? "photos" : "ask", probeResult.title || choice.label)
+          await recordCompletedDownload(downloaded, batchSaveMode, probeResult.title || choice.label)
           await rememberRecentLink(item.sourceURL)
           setRecentLinks(listRecentLinks())
 
@@ -1528,7 +1545,8 @@ function View() {
       setCancelPath(null)
       batchCancelPathRef.current = null
       const summary = `批量完成：成功 ${ok} · 失败 ${fail} · 取消 ${cancelledCount}`
-      setStatus(summary)
+      const exportHint = saveMode === "files" && ok > 0 ? "；文件已保留在 Yoinks 下载目录，请到「记录」中逐个导出。" : ""
+      setStatus(summary + exportHint)
       applyProgressUi({ fraction: fail === 0 && cancelledCount === 0 && ok > 0 ? 1 : 0, stage: summary }, true)
       await logEvent({
         level: "info",
@@ -1623,9 +1641,10 @@ function View() {
 
     try {
       const platform = detectMediaPlatform(validURL)
-      // 抖音不走 Cookie 登录会话
-      const session = platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
-      const importedCookie = getImportedCookiePath()
+      // YouTube 必须沿用本次探测的授权状态：匿名格式只能匿名下载。
+      const useSession = platform !== "youtube" || probeAuthorizedPlatformRef.current === "youtube"
+      const session = useSession && platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      const importedCookie = session ? getImportedCookiePath() : null
       const downloaded = await downloadMedia({
         url: validURL,
         choice: downloadChoice,
@@ -1639,11 +1658,25 @@ function View() {
       setDownloading(false)
       setCancelPath(null)
 
+      let saveMessage = ""
+      try {
+        saveMessage = await saveResult(downloaded.filePath, downloaded.fileName, saveMode, downloaded.taskId)
+      } catch (saveError) {
+        const message = saveError instanceof Error ? saveError.message : String(saveError)
+        await logEvent({
+          level: "warn",
+          event: "download.save.failed",
+          taskId: downloaded.taskId,
+          details: { mode: saveMode, message },
+        })
+        saveMessage = `下载完成，但${message}；文件已保留在 Yoinks 下载目录。`
+      }
+
       const available = await recordCompletedDownload(downloaded, saveMode, downloadChoice.label || probe?.title || "未知标题")
       if (available) {
         setResult(downloaded)
         setCompletedSaveMode(saveMode)
-        setStatus("下载完成。")
+        setStatus(saveMessage || "下载完成。")
         await rememberRecentLink(validURL)
         setRecentLinks(listRecentLinks())
       } else {
@@ -1659,17 +1692,9 @@ function View() {
         return
       }
       if (!insecureTLS && isCertificateError(message)) {
-        const retry = await Dialog.confirm({
-          title: "证书校验失败",
-          message: "当前网络返回了未受信任的 TLS 证书。兼容模式会仅对本次下载跳过证书校验。请只在你信任当前网络时继续。",
-          confirmLabel: "继续下载",
-          cancelLabel: "取消",
-        })
-        if (retry) {
-          setStatus("正在以证书兼容模式重试。")
-          await startDownload(true, automatic, retriedTransientAccess)
-          return
-        }
+        setStatus("证书校验失败，正在以兼容模式重试。")
+        await startDownload(true, automatic, retriedTransientAccess)
+        return
       }
       if (message !== "下载已取消") await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
     } finally {

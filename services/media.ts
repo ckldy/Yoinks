@@ -163,6 +163,10 @@ export function isDownloadTlsTimeout(value: string): boolean {
   return false
 }
 
+function isRemoteDownloadDisconnect(value: string): boolean {
+  return /Remote end closed connection|Connection reset|ECONNRESET|IncompleteRead|Connection aborted/i.test(String(value || ""))
+}
+
 function stripHostNoise(value: string): string {
   return value
     .split(/\r?\n/)
@@ -196,6 +200,9 @@ export function compactMessage(value: string): string {
   const source = cleaned || value
   if (isDownloadTlsTimeout(source)) {
     return "下载过程中网络 TLS/握手超时，请检查网络后重试；可改选 H.264 清晰度或稍后再试。"
+  }
+  if (isRemoteDownloadDisconnect(source)) {
+    return "下载音频时远端 CDN 连接中断，已重试仍未完成；请稍后重试。"
   }
   const errors = extractErrorSnippets(source)
   if (errors.length) {
@@ -423,6 +430,25 @@ async function runYtdlpWithHostNoiseRetry(options: {
       details: { stage: options.stage, delayMilliseconds: 800 },
     })
     await new Promise<void>((resolve) => setTimeout(resolve, 800))
+    if (options.isCancelFlagSet()) {
+      return { ...result, exitCode: 130 }
+    }
+    result = await runCommand(options.command, options.timeout)
+  }
+  if (
+    result.exitCode !== 0
+    && result.exitCode !== 130
+    && options.stage === "audio"
+    && !options.isCancelFlagSet()
+    && isRemoteDownloadDisconnect(result.output || "")
+  ) {
+    await logEvent({
+      level: "warn",
+      event: "download.audio-remote-disconnect.retry",
+      taskId: options.taskId,
+      details: { delayMilliseconds: 1200 },
+    })
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200))
     if (options.isCancelFlagSet()) {
       return { ...result, exitCode: 130 }
     }
