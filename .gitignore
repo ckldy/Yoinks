@@ -1,0 +1,10 @@
+# Runtime logs / history (generated at runtime, not source)
+logs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+.DS_Store
+*.swp

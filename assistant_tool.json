@@ -1,0 +1,11 @@
+{
+  "displayName": "读取 Yoinks 运行日志",
+  "id": "read_minimal_runtime_log",
+  "description": "读取 Yoinks 已脱敏的主链运行日志（runtime.jsonl）。默认仅关键里程碑与 warn/error；最多返回最近 100 条。",
+  "icon": "doc.text.magnifyingglass",
+  "color": "systemOrange",
+  "parameters": [],
+  "requireApproval": false,
+  "autoApprove": true,
+  "scriptEditorOnly": false
+}
