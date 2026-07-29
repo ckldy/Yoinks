@@ -12,6 +12,7 @@ export type YoinksPreferences = {
   concurrentFragments: ConcurrentDownloads
   previewAutoplayMode: PreviewAutoplayMode
   automaticDownloadEnabled: boolean
+  experimentalDiscoveryEnabled: boolean
   automaticDownloadFormatStrategy: AutomaticDownloadFormatStrategy
   preferredContainer: PreferredContainer
   retainOriginalFiles: boolean
@@ -24,6 +25,7 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   concurrentFragments: 2,
   previewAutoplayMode: "muted",
   automaticDownloadEnabled: false,
+  experimentalDiscoveryEnabled: false,
   automaticDownloadFormatStrategy: "recommended",
   preferredContainer: "mp4",
   retainOriginalFiles: true,
@@ -62,6 +64,7 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     concurrentFragments: isConcurrency(source.concurrentFragments) ? source.concurrentFragments : DEFAULT_PREFERENCES.concurrentFragments,
     previewAutoplayMode: isPreviewAutoplayMode(source.previewAutoplayMode) ? source.previewAutoplayMode : DEFAULT_PREFERENCES.previewAutoplayMode,
     automaticDownloadEnabled: typeof source.automaticDownloadEnabled === "boolean" ? source.automaticDownloadEnabled : DEFAULT_PREFERENCES.automaticDownloadEnabled,
+    experimentalDiscoveryEnabled: typeof source.experimentalDiscoveryEnabled === "boolean" ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
     automaticDownloadFormatStrategy: isAutomaticDownloadFormatStrategy(source.automaticDownloadFormatStrategy) ? source.automaticDownloadFormatStrategy : DEFAULT_PREFERENCES.automaticDownloadFormatStrategy,
     preferredContainer: isPreferredContainer(source.preferredContainer) ? source.preferredContainer : DEFAULT_PREFERENCES.preferredContainer,
     retainOriginalFiles: typeof source.retainOriginalFiles === "boolean" ? source.retainOriginalFiles : DEFAULT_PREFERENCES.retainOriginalFiles,
