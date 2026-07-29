@@ -28,6 +28,7 @@ check("HLS 画质受 levels>=2 门控", hlsHtml.includes("levels.length >= 2"))
 check("HLS 画质含自动档 selectQuality(-1)", hlsHtml.includes("selectQuality(-1)") && hlsHtml.includes("自动"))
 check("HLS 画质按钮初始隐藏 display:none", hlsHtml.includes('id="qualityHost" style="display:none"'))
 check("HLS 控件阻断触摸冒泡", hlsHtml.includes("['pointerdown', 'touchstart', 'click']") && hlsHtml.includes("controls.addEventListener(type, function(e) { e.stopPropagation(); })"))
+check("HLS 控件容器空白区域可触达原生控件", hlsHtml.includes(".ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}") && hlsHtml.includes(".ctrl-host{position:relative;pointer-events:auto}"))
 check("HLS 菜单忽略控件内点击", hlsHtml.includes("e.target.closest('.ctrl-wrap')"))
 check("HLS 无占位符泄漏", !/\{\{[A-Z_]+\}\}/.test(hlsHtml))
 
@@ -35,11 +36,12 @@ check("HLS 无占位符泄漏", !/\{\{[A-Z_]+\}\}/.test(hlsHtml))
 check("DASH 倍速 6 档齐全", SPEEDS.every(s => dashHtml.includes(s)))
 check("DASH 无画质控件", !dashHtml.includes("qualityHost"))
 check("DASH 控件阻断触摸冒泡", dashHtml.includes("['pointerdown', 'touchstart', 'click']") && dashHtml.includes("controls.addEventListener(type, function(e) { e.stopPropagation(); })"))
+check("DASH 控件容器空白区域可触达原生控件", dashHtml.includes(".ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}") && dashHtml.includes(".ctrl-host{position:relative;pointer-events:auto}"))
 check("DASH 菜单忽略控件内点击", dashHtml.includes("e.target.closest('.ctrl-wrap')"))
 check("DASH 无占位符泄漏", !/\{\{[A-Z_]+\}\}/.test(dashHtml))
 
 if (failures === 0) {
-  console.log("\n全部通过 (13/13)")
+  console.log("\n全部通过 (15/15)")
   Script.exit(0)
 } else {
   console.log("\n失败 " + failures + " 项")

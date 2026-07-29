@@ -91,7 +91,13 @@ export function filterAllowedHeaders(headers: Record<string, string>): Record<st
 
 // Serialize headers for safe JSON injection into HTML
 export function serializeHeadersForJS(headers: Record<string, string>): string {
+  // This JSON is embedded in an inline <script>; escape HTML/script delimiters too.
   return JSON.stringify(filterAllowedHeaders(headers))
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
 }
 
 // HTML template with embedded hls.js and header injection support
@@ -108,8 +114,8 @@ video{width:100%;height:100%;object-fit:contain;display:block}
 audio{display:none}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font:14px -apple-system;text-align:center;z-index:10}
 .error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff4444;font:14px -apple-system;text-align:center;padding:20px;z-index:10;max-width:90%}
-.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20}
-.ctrl-host{position:relative}
+.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}
+.ctrl-host{position:relative;pointer-events:auto}
 .pill{background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:14px;padding:5px 12px;font:600 12px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent}
 .pill:active{background:rgba(0,0,0,0.75)}
 .menu{position:absolute;top:34px;right:0;background:rgba(0,0,0,0.7);border-radius:8px;padding:4px 0;min-width:68px;display:none;z-index:21}
@@ -715,7 +721,8 @@ export class HLSPlayerService {
 
   async setPlaybackRate(rate: number): Promise<void> {
     if (!this.controller) return
-    await this.controller.evaluateJavaScript(`video.playbackRate = ${rate}`)
+    if (!Number.isFinite(rate) || rate < 0.25 || rate > 4) throw new Error("Invalid playback rate")
+    await this.controller.evaluateJavaScript(`applySpeed(${rate})`)
     this.emit({ type: "ratechange", timestamp: Date.now(), data: { rate } })
   }
 
@@ -727,7 +734,9 @@ export class HLSPlayerService {
 
   async setQuality(levelId: string | number): Promise<void> {
     if (!this.controller) return
-    await this.controller.evaluateJavaScript(`setQuality(${levelId})`)
+    const level = Number(levelId)
+    if (!Number.isInteger(level) || level < -1) throw new Error("Invalid quality level")
+    await this.controller.evaluateJavaScript(`setQuality(${level})`)
   }
 
   async getCurrentTime(): Promise<number> {
@@ -776,10 +785,16 @@ export class HLSPlayerService {
     if (this.isDestroyed) return
     this.isDestroyed = true
 
-    if (this.controller) {
-      await this.controller.evaluateJavaScript("destroy()")
-      this.controller.dispose()
-      this.controller = null
+    const controller = this.controller
+    this.controller = null
+    if (controller) {
+      try {
+        await controller.evaluateJavaScript("destroy()")
+      } catch {
+        // The sheet may already have dismissed the WebView.
+      } finally {
+        controller.dispose()
+      }
     }
 
     this.currentUrl = ""

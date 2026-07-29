@@ -3,7 +3,8 @@
 
 import { Script } from "scripting"
 import { isGoogleVideoDashUrl, PREVIEW_PLAYBACK_TIMEOUT_MS, type OnlinePreviewOptions } from "./services/online-preview"
-import { createPlayer } from "./services/player/hls-player-service"
+import { createPlayer, serializeHeadersForJS } from "./services/player/hls-player-service"
+import { createDashPlayer } from "./services/player/dash-player-service"
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new Error(`ASSERT FAILED: ${message}`)
@@ -98,6 +99,17 @@ async function runTests() {
     "YouTube 页面 URL 不应识别为 DASH"
   )
   assert(!isGoogleVideoDashUrl("not-a-url"), "无效 URL 应安全返回 false")
+  console.log()
+
+  // Test 7: Player startup/cleanup and inline-script safety contracts.
+  console.log("测试 7: DASH 启动与安全清理契约")
+  const dashHtml = createDashPlayer({ baseUrl: "https://example.com" }).getHtmlForTesting()
+  assert(!dashHtml.includes("\nstartDashPlayback();\n</script>"), "DASH HTML 不会在桥接注册前自动启动")
+  assert(dashHtml.includes('xhr.timeout = 10000'), "DASH 初始化请求有超时")
+  assert(dashHtml.includes('activeXhrs.slice().forEach'), "DASH 销毁会取消在途请求")
+  assert(!dashHtml.includes('videoUrl: config.videoUrl'), "DASH 诊断不记录原始媒体 URL")
+  const serializedHeaders = serializeHeadersForJS({ "x-test": "</script><img src=x>" })
+  assert(!serializedHeaders.includes("</script>"), "HLS 内联 Header JSON 转义脚本闭合字符")
   console.log()
 
   console.log("=== 所有静态验证通过 ===")

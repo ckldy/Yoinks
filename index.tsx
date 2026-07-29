@@ -333,6 +333,7 @@ function View() {
   const [loadingTools, setLoadingTools] = useState(true)
   const [installing, setInstalling] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
   const [cancelPath, setCancelPath] = useState<string | null>(null)
   const [progress, setProgress] = useState<DownloadProgress>({ fraction: 0, stage: "准备就绪" })
   const [status, setStatus] = useState("粘贴一个公开媒体链接，然后选择输出格式。")
@@ -1538,11 +1539,14 @@ function View() {
   }
 
   const previewSelectedChoice = async () => {
+    if (previewing) return
     if (!selectedChoice?.previewURL || !probe) {
       setStatus("当前格式没有可用的预览链接。请重新分析后再试。")
       return
     }
 
+    setPreviewing(true)
+    try {
     const previewOptions: OnlinePreviewOptions = {
       url: selectedChoice.previewURL,
       title: probe.title,
@@ -1574,6 +1578,10 @@ function View() {
     // failed
     setStatus("在线预览无法打开")
     await Dialog.alert({ title: "在线预览失败", message: result.message })
+    } finally {
+      previewPlayerRef.current = null
+      setPreviewing(false)
+    }
   }
 
       const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
@@ -1857,7 +1865,7 @@ function DownloadView() {
                 {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
               </VStack>
               <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing || batchQueue.running} />
-              <Button title="在线预览" systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || downloading || analyzing || batchQueue.running} />
+              <Button title={previewing ? "正在打开预览……" : "在线预览"} systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || previewing || downloading || analyzing || batchQueue.running} />
             </>
           )}
         </Section>

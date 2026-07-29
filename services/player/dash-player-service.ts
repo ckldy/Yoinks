@@ -28,8 +28,8 @@ html,body{height:100%;width:100%;background:#000;overflow:hidden}
 video{width:100%;height:100%;object-fit:contain;display:block}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font:14px -apple-system;text-align:center;z-index:10}
 .error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff4444;font:14px -apple-system;text-align:center;padding:20px;z-index:10;max-width:90%;display:none}
-.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20}
-.ctrl-host{position:relative}
+.ctrl-wrap{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:20;pointer-events:none}
+.ctrl-host{position:relative;pointer-events:auto}
 .pill{background:rgba(0,0,0,0.55);color:#fff;border:none;border-radius:14px;padding:5px 12px;font:600 12px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent}
 .pill:active{background:rgba(0,0,0,0.75)}
 .menu{position:absolute;top:34px;right:0;background:rgba(0,0,0,0.7);border-radius:8px;padding:4px 0;min-width:68px;display:none;z-index:21}
@@ -58,6 +58,9 @@ var errorDiv = document.getElementById('error');
 var player = null;
 var requestMode = 'dash.js';
 var headersApplied = false;
+var destroyed = false;
+var activeXhrs = [];
+var retryTimers = [];
 
 var config = {{DASH_CONFIG}};
 
@@ -143,28 +146,51 @@ function findInitAndIndexRanges(buffer) {
 
 function fetchArrayBufferOnce(url, headers) {
   return new Promise(function(resolve, reject) {
+    if (destroyed) { reject(new Error('Preview dismissed')); return; }
     var xhr = new XMLHttpRequest();
+    activeXhrs.push(xhr);
+    var done = false;
+    function finish(callback, value) {
+      if (done) return;
+      done = true;
+      var index = activeXhrs.indexOf(xhr);
+      if (index >= 0) activeXhrs.splice(index, 1);
+      callback(value);
+    }
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
+    xhr.timeout = 10000;
     // 2 MB is enough for large YouTube moov/sidx boxes while still being a small probe.
     xhr.setRequestHeader('Range', 'bytes=0-2097151');
     Object.entries(headers || {}).forEach(function(entry) {
       try { xhr.setRequestHeader(entry[0], entry[1]); } catch (e) {}
     });
     xhr.onload = function() {
+      if (destroyed) { finish(reject, new Error('Preview dismissed')); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(xhr.response);
+        var contentLength = Number(xhr.getResponseHeader('Content-Length') || 0);
+        if (contentLength > 3 * 1024 * 1024) { finish(reject, new Error('初始化响应过大')); return; }
+        finish(resolve, xhr.response);
       } else {
-        reject(new Error('HTTP ' + xhr.status));
+        finish(reject, new Error('HTTP ' + xhr.status));
       }
     };
-    xhr.onerror = function() { reject(new Error('Network error')); };
+    xhr.onerror = function() { finish(reject, new Error('Network error')); };
+    xhr.ontimeout = function() { finish(reject, new Error('初始化请求超时')); };
+    xhr.onabort = function() { finish(reject, new Error('Preview dismissed')); };
     xhr.send();
   });
 }
 
 function sleep(milliseconds) {
-  return new Promise(function(resolve) { setTimeout(resolve, milliseconds); });
+  return new Promise(function(resolve) {
+    var timer = setTimeout(function() {
+      var index = retryTimers.indexOf(timer);
+      if (index >= 0) retryTimers.splice(index, 1);
+      resolve();
+    }, milliseconds);
+    retryTimers.push(timer);
+  });
 }
 
 async function fetchArrayBuffer(url, headers, streamKind) {
@@ -173,7 +199,9 @@ async function fetchArrayBuffer(url, headers, streamKind) {
   var delays = [0, 300, 900];
   var lastError = null;
   for (var attempt = 0; attempt < delays.length; attempt++) {
+    if (destroyed) throw new Error('Preview dismissed');
     if (delays[attempt]) await sleep(delays[attempt]);
+    if (destroyed) throw new Error('Preview dismissed');
     try {
       var buffer = await fetchArrayBufferOnce(url, headers);
       if (attempt > 0) reportDiagnostic('dash.init.retry.success', { stream: streamKind, attempt: attempt + 1 });
@@ -304,17 +332,17 @@ function startDashPlayback() {
   reportMode('dash.js', headersApplied);
 
   reportDiagnostic('dash.init.urls', {
-    videoUrl: config.videoUrl,
-    videoFallback: config.videoFallbackUrl,
-    audioUrl: config.audioUrl,
-    audioFallback: config.audioFallbackUrl,
-    headerKeys: Object.keys(allowedHeaders || {}),
-    baseUrl: document.baseURI || null
+    videoHost: safeHost(config.videoUrl),
+    hasVideoFallback: !!config.videoFallbackUrl,
+    audioHost: safeHost(config.audioUrl),
+    hasAudioFallback: !!config.audioFallbackUrl,
+    headerKeys: Object.keys(allowedHeaders || {})
   });
   Promise.all([
     probeRangesForUrl(config.videoUrl, config.videoFallbackUrl, allowedHeaders, 'video'),
     probeRangesForUrl(config.audioUrl, config.audioFallbackUrl, allowedHeaders, 'audio')
   ]).then(function(results) {
+    if (destroyed || !player) return;
     var videoResult = results[0];
     var audioResult = results[1];
     var videoPlayUrl = videoResult.usedFallback && config.videoFallbackUrl ? config.videoFallbackUrl : config.videoUrl;
@@ -326,12 +354,21 @@ function startDashPlayback() {
       video.muted = true;
     }
   }).catch(function(err) {
+    if (destroyed) return;
     showError('DASH 初始化失败: ' + (err.message || err), true);
   });
+}
+function safeHost(url) {
+  try { return new URL(url).host; } catch (e) { return ''; }
 }
 
 window.startDashPlayback = startDashPlayback;
 window.destroyDashPlayer = function() {
+  destroyed = true;
+  activeXhrs.slice().forEach(function(xhr) { try { xhr.abort(); } catch (e) {} });
+  activeXhrs = [];
+  retryTimers.forEach(function(timer) { clearTimeout(timer); });
+  retryTimers = [];
   try {
     if (player) { player.reset(); player = null; }
     video.pause();
@@ -381,8 +418,6 @@ document.addEventListener('click', function(e) {
 });
 
 buildSpeedMenu();
-
-startDashPlayback();
 </script>
 </body>
 </html>
@@ -503,11 +538,12 @@ export class DashPlayerService {
 
   async play(url: string, audioUrl?: string): Promise<void> {
     if (this.isDestroyed) throw new Error("Player destroyed")
-    this.currentUrl = url
-    this.currentAudioUrl = audioUrl || this.config.audioUrl || ""
+    if (!this.currentUrl) this.currentUrl = url
+    if (!this.currentAudioUrl) this.currentAudioUrl = audioUrl || this.config.audioUrl || ""
     if (!this.controller) await this.initialize()
-    // The HTML is already playing on load; no further JS call needed because we bake URLs into HTML.
-    this.emit({ type: "play", timestamp: Date.now(), data: { url } })
+    // Start only after native message handlers are registered, so first-play confirmation cannot race them.
+    await this.controller.evaluateJavaScript("startDashPlayback()")
+    this.emit({ type: "play", timestamp: Date.now(), data: { url: this.currentUrl } })
   }
 
   async destroy(): Promise<void> {
