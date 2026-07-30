@@ -1,20 +1,36 @@
 {
-  "name": "Yoinks",
-  "icon": "arrow.down.to.line.compact",
-  "color": "rgba(52, 199, 89, 1)",
-  "version": "1.5.1",
-  "author": {
-    "name": "vcncv"
+  "version" : "1.5.1",
+  "icon" : "arrow.down.to.line.compact",
+  "localizedDescriptions" : {
+    "en" : "Paste or share a public media link, choose an output format, then save it to Photos or Files.",
+    "zh" : "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。"
   },
-  "runInApp": true,
-  "intentInputTypes": ["URLs", "Text"],
-  "description": "Download public media with a focused Yoinks-style workflow, including sequential batch queues.",
-  "localizedNames": {
-    "en": "Yoinks",
-    "zh": "Yoinks"
+  "localizedNames" : {
+    "en" : "Yoinks",
+    "zh" : "Yoinks"
   },
-  "localizedDescriptions": {
-    "en": "Paste or share a public media link, choose an output format, then save it to Photos or Files.",
-    "zh": "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。"
-  }
+  "color" : "rgba(52, 199, 89, 1)",
+  "intentInputTypes" : [
+    "URLs",
+    "Text"
+  ],
+  "name" : "Yoinks",
+  "contributors" : [
+
+  ],
+  "description" : "Download public media with a focused Yoinks-style workflow, including sequential batch queues.",
+  "entry" : "index.tsx",
+  "author" : {
+    "email" : null,
+    "name" : "vcncv",
+    "homepage" : null
+  },
+  "permissions" : null,
+  "remoteResource" : {
+    "url" : "https:\/\/github.com\/ckldy\/Yoinks",
+    "hash" : "fbb45aa377fecd2c7ecd5e38d71ae035",
+    "autoUpdateInterval" : 300
+  },
+  "runInApp" : true,
+  "iconImage" : null
 }
