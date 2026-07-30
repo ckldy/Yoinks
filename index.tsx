@@ -189,12 +189,13 @@ function formatHistoryDate(iso: string): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`
 }
 
-function formatDownloadBytes(downloaded: number, total: number): string {
-  return `${formatBytes(downloaded)} / ${formatBytes(total)}`
+function formatDownloadBytes(downloaded?: number, total?: number): string {
+  if (total && total > 0) return `${formatBytes(downloaded || 0)} / ${formatBytes(total)}`
+  return downloaded && downloaded > 0 ? `已下载 ${formatBytes(downloaded)}` : "正在统计已下载大小…"
 }
 
-function formatDownloadSpeed(speed: number, eta: number): string {
-  if (!speed || speed < 1) return "计算中..."
+function formatDownloadSpeed(speed?: number, eta?: number): string {
+  if (!speed || speed < 1) return "速度统计中…"
   const etaStr = eta && eta > 0 ? ` · 预计 ${Math.round(eta)}s` : ""
   return `${formatBytes(speed)}/s${etaStr}`
 }
@@ -1892,7 +1893,7 @@ function DownloadView() {
                 <Text font="caption" foregroundStyle="secondaryLabel">{Math.round(progress.fraction * 100)}%</Text>
               </HStack>
               <ProgressView value={progress.fraction} />
-              <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${formatDownloadBytes(progress.downloadedBytes || 0, progress.totalBytes || 0)} · ${formatDownloadSpeed(progress.speed || 0, progress.eta || 0)}`}</Text>
+              <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${formatDownloadBytes(progress.downloadedBytes, progress.totalBytes)} · ${formatDownloadSpeed(progress.speed, progress.eta)}`}</Text>
             </VStack>
           </Section>
         ) : null}

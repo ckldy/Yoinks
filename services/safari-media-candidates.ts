@@ -1,0 +1,167 @@
+import { redactURL } from "./logs"
+
+export type SafariMediaCandidateKind = "hls" | "dash" | "video" | "audio"
+
+export type SafariMediaCandidate = {
+  id: string
+  url: string
+  kind: SafariMediaCandidateKind
+  pageURL: string
+  pageTitle?: string
+  discoveredAt: number
+}
+
+export type SafariMediaCandidateEnvelope = {
+  version: 1
+  pageURL: string
+  pageTitle?: string
+  capturedAt: number
+  candidates: SafariMediaCandidate[]
+}
+
+export const SAFARI_MEDIA_CANDIDATE_STORAGE_KEY = "yoinks-media-candidates-v1"
+export const SAFARI_MEDIA_CANDIDATE_FILE = "Yoinks.json"
+export const MAX_SAFARI_MEDIA_CANDIDATES = 50
+
+const MEDIA_KINDS = new Set<SafariMediaCandidateKind>(["hls", "dash", "video", "audio"])
+
+function safeTitle(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const title = value.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240)
+  return title || undefined
+}
+
+export function isHTTPURL(value: unknown): value is string {
+  if (typeof value !== "string" || !value.trim()) return false
+  try {
+    const url = new URL(value)
+    return url.protocol === "https:" || url.protocol === "http:"
+  } catch {
+    return false
+  }
+}
+
+/** Removes fragments while retaining query parameters required by short-lived signed media URLs. */
+export function normalizeSafariCandidateURL(value: string): string | null {
+  if (!isHTTPURL(value)) return null
+  try {
+    const url = new URL(value)
+    url.hash = ""
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * A Safari candidate's public page URL may be used only as this task's Referer.
+ * It is never a cookie/header import and is deliberately normalized to remove fragments.
+ */
+export function safariPageReferer(value: unknown): string | undefined {
+  if (typeof value !== "string" || /[\r\n]/.test(value)) return undefined
+  return normalizeSafariCandidateURL(value) || undefined
+}
+
+export function classifySafariMediaURL(value: string): SafariMediaCandidateKind | null {
+  const normalized = normalizeSafariCandidateURL(value)
+  if (!normalized) return null
+  const pathname = new URL(normalized).pathname.toLowerCase()
+  if (/\.m3u8$/.test(pathname)) return "hls"
+  if (/\.mpd$/.test(pathname)) return "dash"
+  if (/\.(?:m4a|aac|mp3|opus|ogg|wav)$/.test(pathname)) return "audio"
+  if (/\.(?:mp4|m4v|mov|webm|mkv|avi|flv|ts)$/.test(pathname)) return "video"
+  return null
+}
+
+export function safariMediaCandidatePriority(candidate: Pick<SafariMediaCandidate, "url" | "kind">): number {
+  const pathname = new URL(candidate.url).pathname.toLowerCase()
+  if (candidate.kind === "hls") {
+    return /(?:^|[-_.\/])(?:master|playlist)(?:[-_.\/]|$)/i.test(pathname) ? 0
+      : isLikelyHLSAudioRendition(candidate.url) ? 4
+        : 1
+  }
+  if (candidate.kind === "dash") return 2
+  if (candidate.kind === "video") return /(?:^|[-_.\/])seg-?\d+(?:[-_.\/]|$)/i.test(pathname) ? 5 : 3
+  return 4
+}
+
+export function sortSafariMediaCandidates(candidates: SafariMediaCandidate[]): SafariMediaCandidate[] {
+  return candidates
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((a, b) => safariMediaCandidatePriority(a.candidate) - safariMediaCandidatePriority(b.candidate) || a.index - b.index)
+    .map(({ candidate }) => candidate)
+}
+
+export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandidateEnvelope | null {
+  if (!value || typeof value !== "object") return null
+  const raw = value as Record<string, unknown>
+  if (raw.version !== 1 || !isHTTPURL(raw.pageURL) || !Array.isArray(raw.candidates)) return null
+  const pageURL = safariPageReferer(raw.pageURL)
+  if (!pageURL) return null
+  const capturedAt = typeof raw.capturedAt === "number" && Number.isFinite(raw.capturedAt) ? raw.capturedAt : Date.now()
+  const seen = new Set<string>()
+  const candidates: SafariMediaCandidate[] = []
+  for (const item of raw.candidates) {
+    if (!item || typeof item !== "object" || candidates.length >= MAX_SAFARI_MEDIA_CANDIDATES) continue
+    const candidate = item as Record<string, unknown>
+    const url = normalizeSafariCandidateURL(candidate.url as string)
+    const kind = typeof candidate.kind === "string" && MEDIA_KINDS.has(candidate.kind as SafariMediaCandidateKind)
+      ? candidate.kind as SafariMediaCandidateKind
+      : url ? classifySafariMediaURL(url) : null
+    if (!url || !kind || seen.has(url)) continue
+    seen.add(url)
+    candidates.push({
+      id: typeof candidate.id === "string" && candidate.id.trim() ? candidate.id.slice(0, 96) : `candidate-${candidates.length + 1}`,
+      url,
+      kind,
+      pageURL,
+      pageTitle: safeTitle(candidate.pageTitle ?? raw.pageTitle),
+      discoveredAt: typeof candidate.discoveredAt === "number" && Number.isFinite(candidate.discoveredAt) ? candidate.discoveredAt : capturedAt,
+    })
+  }
+  if (!candidates.length) return null
+  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates) }
+}
+
+/**
+ * GM.setValue writes each browser script's values to one JSON file in
+ * safariBrowserStorageDirectory. The Yoinks browser script is named "Yoinks".
+ */
+export function safariMediaCandidatePath(): string {
+  return `${FileManager.safariBrowserStorageDirectory}/${SAFARI_MEDIA_CANDIDATE_FILE}`
+}
+
+async function readSafariStorage(): Promise<Record<string, unknown> | null> {
+  try {
+    const path = safariMediaCandidatePath()
+    if (!(await FileManager.exists(path))) return null
+    const value = JSON.parse(await FileManager.readAsString(path))
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+export async function readSafariMediaCandidates(): Promise<SafariMediaCandidateEnvelope | null> {
+  const storage = await readSafariStorage()
+  return storage ? sanitizeSafariMediaCandidates(storage[SAFARI_MEDIA_CANDIDATE_STORAGE_KEY]) : null
+}
+
+/**
+ * GM storage is writable only from its owning Safari userscript. A successful import
+ * intentionally leaves the last candidate available for retry; the next Safari menu
+ * capture atomically replaces it. This avoids unauthorized writes from the app runtime.
+ */
+export async function clearSafariMediaCandidates(): Promise<void> {
+  // No-op by design; see the function documentation above.
+}
+
+export function safariCandidateSummary(candidate: SafariMediaCandidate): string {
+  return `${candidate.kind.toUpperCase()} · ${redactURL(candidate.url)}`
+}
+
+export function isLikelyHLSAudioRendition(value: string): boolean {
+  const normalized = normalizeSafariCandidateURL(value)
+  if (!normalized || classifySafariMediaURL(normalized) !== "hls") return false
+  return /(?:^|[-_.])(?:a\d+|audio)(?:[-_.]|$)/i.test(new URL(normalized).pathname)
+}

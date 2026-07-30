@@ -1586,18 +1586,32 @@ export async function downloadMedia(options: {
     const workPath = Path.join(workDirectory, `hls_${Date.now()}.mp4`)
     await logEvent({ level: "info", event: "download.m3u8.manifest.checked", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
     try {
-      // Prefer ffmpeg direct (handles multi-segment); progress is time-smoothed because ffmpeg lacks percent file
+      // FFmpeg's Shell output is only available after exit. Sample its growing work file instead:
+      // byte count and speed below are real observations; only the bar remains an indeterminate-style estimate.
       let smoothStopped = false
       let smoothTimer: ReturnType<typeof setTimeout> | null = null
       const startedAt = Date.now()
-      const smoothTick = () => {
+      let lastSampleBytes = 0
+      let lastSampleAt = startedAt
+      const smoothTick = async () => {
         if (smoothStopped || isCancelFlagSet()) return
-        const elapsed = Date.now() - startedAt
+        const now = Date.now()
+        const downloadedBytes = await fileSizeBytes(workPath).catch(() => 0)
+        const elapsed = now - startedAt
         const inner = Math.min(0.95, 1 - Math.exp(-elapsed / 90000))
-        tracker.emit(0.08 + 0.82 * inner, `正在通过 FFmpeg 下载 m3u8 · ${Math.round((0.08 + 0.82 * inner) * 100)}%`)
-        smoothTimer = setTimeout(smoothTick, 500)
+        const elapsedSinceLastSample = Math.max(1, now - lastSampleAt)
+        const speed = downloadedBytes >= lastSampleBytes
+          ? (downloadedBytes - lastSampleBytes) * 1000 / elapsedSinceLastSample
+          : 0
+        lastSampleBytes = downloadedBytes
+        lastSampleAt = now
+        tracker.emit(0.08 + 0.82 * inner, "正在通过 FFmpeg 下载 m3u8", {
+          downloadedBytes: downloadedBytes || undefined,
+          speed: speed || undefined,
+        })
+        if (!smoothStopped && !isCancelFlagSet()) smoothTimer = setTimeout(smoothTick, 500)
       }
-      smoothTimer = setTimeout(smoothTick, 300)
+      smoothTimer = setTimeout(() => { void smoothTick() }, 300)
       const ffmpegResult = await runCommand(
         `ffmpeg -nostdin -y -rw_timeout 30000000${referer ? ` -referer ${quote(referer)}` : ""}${safariUserAgent ? ` -user_agent ${quote(safariUserAgent)}` : ""} -protocol_whitelist file,http,https,tcp,tls,crypto -allowed_extensions ALL -i ${quote(sourceURL)} -c copy -bsf:a aac_adtstoasc -movflags +faststart ${quote(workPath)}`,
         900,
