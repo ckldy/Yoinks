@@ -184,15 +184,43 @@ def formats_from_info(info: dict[str, Any]) -> list[dict[str, Any]]:
 def main() -> None:
     args = sys.argv[1:]
     insecure = False
-    if args and args[0] == "--insecure":
-        insecure = True
-        args = args[1:]
-    if len(args) not in {1, 2}:
+    referer: str | None = None
+    user_agent: str | None = None
+    positional: list[str] = []
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value == "--insecure":
+            insecure = True
+        elif value in {"--referer", "--user-agent"}:
+            if index + 1 >= len(args):
+                print(json.dumps({"ok": False, "error": f"missing value for {value}"}))
+                raise SystemExit(2)
+            header_value = args[index + 1]
+            if "\r" in header_value or "\n" in header_value:
+                print(json.dumps({"ok": False, "error": f"unsafe value for {value}"}))
+                raise SystemExit(2)
+            if value == "--referer":
+                referer = header_value if safe_url(header_value) else None
+                if referer is None:
+                    print(json.dumps({"ok": False, "error": "invalid public Referer"}))
+                    raise SystemExit(2)
+            else:
+                user_agent = header_value
+            index += 1
+        elif value.startswith("--"):
+            print(json.dumps({"ok": False, "error": f"unknown option: {value}"}))
+            raise SystemExit(2)
+        else:
+            positional.append(value)
+        index += 1
+
+    if len(positional) not in {1, 2}:
         print(json.dumps({"ok": False, "error": "missing URL"}))
         raise SystemExit(2)
 
-    url = args[0]
-    cookiefile = args[1] if len(args) == 2 else None
+    url = positional[0]
+    cookiefile = positional[1] if len(positional) == 2 else None
     if not safe_url(url):
         print(json.dumps({"ok": False, "error": "invalid public http or https URL"}))
         raise SystemExit(2)
@@ -215,6 +243,10 @@ def main() -> None:
     }
     if cookiefile:
         options["cookiefile"] = cookiefile
+    if referer:
+        options["http_headers"] = {"Referer": referer}
+        if user_agent:
+            options["http_headers"]["User-Agent"] = user_agent
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
