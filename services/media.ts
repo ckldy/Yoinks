@@ -97,6 +97,8 @@ const DOWNLOAD_DIR = Path.join(ROOT_DIR, "Downloads")
 const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
+/** One end-to-end probe, including automatic retries, may use at most this many seconds. */
+export const PROBE_TOTAL_TIMEOUT_SECONDS = 45
 /** Final containers + common yt-dlp intermediates (Bilibili DASH often uses .m4s). */
 const MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".m4a", ".aac", ".opus", ".mp3", ".m4s", ".ts", ".flv"])
 
@@ -832,6 +834,8 @@ export async function installYtDlp(): Promise<string> {
 export type ProbeOptions = {
   cookieFile?: string
   authorizedPlatform?: AuthPlatform
+  /** Public Safari page URL, used only for this probe as Referer. */
+  referer?: string
 }
 
 
@@ -1018,10 +1022,30 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
     return probeDouyinDirect(sourceURL)
   }
   const taskId = createTaskId()
-  await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile) } })
+  const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
+  const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
+  await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
+  const refererArgument = referer ? ` --referer ${quote(referer)}` : ""
+  const userAgentArgument = safariUserAgent ? ` --user-agent ${quote(safariUserAgent)}` : ""
   const cookieArgument = options.cookieFile ? ` ${quote(options.cookieFile)}` : ""
-  const runProbe = (insecure = false) =>
-    runCommand(`python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""} ${quote(sourceURL)}${cookieArgument}`, 120)
+  const startedAt = Date.now()
+  const deadline = startedAt + PROBE_TOTAL_TIMEOUT_SECONDS * 1000
+  let attemptCount = 0
+  const timeoutError = () => new Error(`媒体分析超时（${PROBE_TOTAL_TIMEOUT_SECONDS} 秒）。请检查网络后重试。`)
+  const runProbe = async (insecure = false) => {
+    const remainingMilliseconds = deadline - Date.now()
+    if (remainingMilliseconds <= 0) throw timeoutError()
+    attemptCount += 1
+    const result = await runCommand(
+      `python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""}${refererArgument}${userAgentArgument} ${quote(sourceURL)}${cookieArgument}`,
+      Math.max(1, Math.ceil(remainingMilliseconds / 1000)),
+    )
+    if (Date.now() >= deadline) {
+      await logEvent({ level: "warn", event: "probe.timeout", taskId, details: { elapsedMilliseconds: Date.now() - startedAt, attemptCount } })
+      throw timeoutError()
+    }
+    return result
+  }
 
   let result = await runProbe()
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
@@ -1208,9 +1232,44 @@ function createProgressTracker(onProgress: (value: DownloadProgress) => void) {
   }
 }
 
-function isM3U8URL(url: string): boolean {
+export function isM3U8URL(url: string): boolean {
   const lower = url.toLowerCase()
   return lower.includes(".m3u8") || lower.includes("application/x-mpegurl") || lower.includes("application/vnd.apple.mpegurl")
+}
+
+/** A real HLS playlist must never fall back to publishing a standalone first segment. */
+export function hlsFailureMessage(sourceURL: string, output: string): string | undefined {
+  if (!isM3U8URL(sourceURL)) return undefined
+  if (/HTTP error 410 Gone/i.test(output || "")) {
+    return "HLS 分片已失效（HTTP 410 Gone），无法合成为完整视频。请回到 Safari 重新捕获后立即下载。"
+  }
+  return `HLS 清单下载失败，未发布不完整分片：${compactMessage(output || "m3u8 下载失败")}`
+}
+
+export type HlsManifestSummary = { segmentCount: number; durationSeconds: number; endList: boolean }
+
+/** Parse only the conservative media facts needed to detect a one-segment false success. */
+export function parseHlsManifestSummary(text: string): HlsManifestSummary | undefined {
+  if (!/^\s*#EXTM3U/m.test(text || "")) return undefined
+  const durations = [...text.matchAll(/^\s*#EXTINF:([0-9]+(?:\.[0-9]+)?)/gm)].map((match) => Number(match[1])).filter(Number.isFinite)
+  if (!durations.length) return undefined
+  return { segmentCount: durations.length, durationSeconds: durations.reduce((sum, value) => sum + value, 0), endList: /^\s*#EXT-X-ENDLIST\s*$/m.test(text) }
+}
+
+/** A short VOD output is likely a first segment masquerading as a completed MP4. */
+export function hlsCompletenessFailure(manifest: HlsManifestSummary | undefined, outputDurationSeconds: number | undefined): string | undefined {
+  if (!manifest || manifest.segmentCount < 2 || !manifest.endList || !Number.isFinite(outputDurationSeconds)) return undefined
+  const required = Math.max(manifest.durationSeconds * 0.9, manifest.durationSeconds - 5)
+  if ((outputDurationSeconds as number) + 0.1 < required) {
+    return `HLS 下载不完整：清单含 ${manifest.segmentCount} 个分片、约 ${Math.round(manifest.durationSeconds)} 秒，输出仅约 ${Math.round(outputDurationSeconds as number)} 秒；未保存文件。`
+  }
+  return undefined
+}
+
+/** Safari-imported HLS must fail closed: an unverified manifest can hide a single segment. */
+export function hlsPublishFailure(manifest: HlsManifestSummary | undefined, outputDurationSeconds: number | undefined): string | undefined {
+  if (!manifest) return "HLS 清单无法验证完整性；为避免保存单分片，未保存文件。"
+  return hlsCompletenessFailure(manifest, outputDurationSeconds)
 }
 
 /** Absolute media paths printed by ytdlp_runner or embedded in yt-dlp log lines. */
@@ -1355,6 +1414,34 @@ export function isDeviceHardVideoChoice(choice: Pick<MediaChoice, "videoCodec" |
   return /\bAV1\b|\bVP9\b|\bHEVC\b/i.test(choice.label || "")
 }
 
+async function mediaDurationSeconds(filePath: string): Promise<number | undefined> {
+  const result = await runCommand(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${quote(filePath)}`, 60)
+  if (result.exitCode !== 0) return undefined
+  const value = Number(String(result.output || "").trim().split(/\s+/).pop())
+  return Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+async function readHlsManifestSummary(sourceURL: string, referer?: string, userAgent?: string): Promise<HlsManifestSummary | undefined> {
+  const request = async (url: string) => {
+    const args = ["curl -fsSL --max-time 30", userAgent ? `-A ${quote(userAgent)}` : "", referer ? `-e ${quote(referer)}` : "", quote(url)].filter(Boolean).join(" ")
+    const result = await runCommand(args, 45)
+    return result.exitCode === 0 ? String(result.output || "") : undefined
+  }
+  const master = await request(sourceURL)
+  if (!master) return undefined
+  const direct = parseHlsManifestSummary(master)
+  if (direct) return direct
+  // Master playlists name a variant URI immediately after #EXT-X-STREAM-INF.
+  const variant = master.match(/^\s*#EXT-X-STREAM-INF:[^\r\n]*\r?\n\s*([^#\r\n][^\r\n]*)/m)?.[1]?.trim()
+  if (!variant) return undefined
+  try {
+    const media = await request(new URL(variant, sourceURL).toString())
+    return media ? parseHlsManifestSummary(media) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function verifyMediaFile(filePath: string, choice: MediaChoice, taskId: string) {
   // Prefer stream type lines; -v error still surfaces codec open failures on this n5.0.1 build.
   const result = await runCommand(`ffprobe -v error -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 ${quote(filePath)}`, 60)
@@ -1404,6 +1491,34 @@ export async function cancelDownload(cancelPath: string) {
   cancelBackgroundDownloads()
 }
 
+async function verifyAndPublishMediaFile(options: {
+  workPath: string
+  choice: MediaChoice
+  taskId: string
+  hlsOrigin: boolean
+  hlsManifest: HlsManifestSummary | undefined
+}): Promise<string> {
+  await verifyMediaFile(options.workPath, options.choice, options.taskId)
+  if (options.hlsOrigin) {
+    const outputDurationSeconds = await mediaDurationSeconds(options.workPath)
+    const completenessFailure = hlsPublishFailure(options.hlsManifest, outputDurationSeconds)
+    await logEvent({
+      level: completenessFailure ? "error" : "info",
+      event: "download.hls.completeness.checked",
+      taskId: options.taskId,
+      details: {
+        outputDurationSeconds: outputDurationSeconds || null,
+        manifestDurationSeconds: options.hlsManifest?.durationSeconds || null,
+        manifestSegmentCount: options.hlsManifest?.segmentCount || null,
+        manifestEndList: options.hlsManifest?.endList || null,
+        complete: !completenessFailure,
+      },
+    })
+    if (completenessFailure) throw new Error(completenessFailure)
+  }
+  return publishMediaFile(options.workPath, options.taskId)
+}
+
 async function publishMediaFile(workPath: string, taskId: string): Promise<string> {
   const sourceName = Path.basename(workPath)
   const dot = sourceName.lastIndexOf(".")
@@ -1423,12 +1538,16 @@ export async function downloadMedia(options: {
   insecureTLS?: boolean
   cookieFile?: string
   authorizedPlatform?: AuthPlatform
+  /** Public Safari page URL, used only for this download as Referer. */
+  referer?: string
   onProgress: (value: DownloadProgress) => void
   onCancelPath: (path: string) => void
 }): Promise<DownloadResult> {
   const extractedURL = extractFirstURL(options.url)
   if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
   const sourceURL = pinXStatusVideoURL(extractedURL, 1)
+  const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
+  const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
   await ensureDirectories()
 
   // 抖音：匿名 WebView → 候选 → 流式/图文下载（全程无用户登录）
@@ -1453,13 +1572,19 @@ export async function downloadMedia(options: {
   const mergeAudioFormat = options.choice.mergeAudioFormat
   const tracker = createProgressTracker(options.onProgress)
   const isCancelFlagSet = () => FileManager.existsSync(cancelPath)
+  const hlsOrigin = isM3U8URL(sourceURL)
+  const hlsManifest = hlsOrigin ? await readHlsManifestSummary(sourceURL, referer, safariUserAgent) : undefined
+  if (hlsOrigin) {
+    await logEvent({ level: "info", event: "download.hls-origin.detected", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
+  }
 
   // C: direct m3u8 / HLS — BackgroundURLSession fetch of playlist URL via ffmpeg after optional progressive download of single media
   if (isM3U8URL(sourceURL) || options.choice.formatExpression === "m3u8" || options.choice.id === "m3u8") {
     options.onCancelPath(cancelPath)
-    await logEvent({ level: "info", event: "download.m3u8.started", taskId, details: { sourceURL } })
+    await logEvent({ level: "info", event: "download.m3u8.started", taskId, details: { sourceURL, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
     tracker.emit(0.05, "正在准备 m3u8 下载")
     const workPath = Path.join(workDirectory, `hls_${Date.now()}.mp4`)
+    await logEvent({ level: "info", event: "download.m3u8.manifest.checked", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
     try {
       // Prefer ffmpeg direct (handles multi-segment); progress is time-smoothed because ffmpeg lacks percent file
       let smoothStopped = false
@@ -1474,24 +1599,30 @@ export async function downloadMedia(options: {
       }
       smoothTimer = setTimeout(smoothTick, 300)
       const ffmpegResult = await runCommand(
-        `ffmpeg -nostdin -y -protocol_whitelist file,http,https,tcp,tls,crypto -allowed_extensions ALL -i ${quote(sourceURL)} -c copy -bsf:a aac_adtstoasc -movflags +faststart ${quote(workPath)}`,
-        7200,
+        `ffmpeg -nostdin -y -rw_timeout 30000000${referer ? ` -referer ${quote(referer)}` : ""}${safariUserAgent ? ` -user_agent ${quote(safariUserAgent)}` : ""} -protocol_whitelist file,http,https,tcp,tls,crypto -allowed_extensions ALL -i ${quote(sourceURL)} -c copy -bsf:a aac_adtstoasc -movflags +faststart ${quote(workPath)}`,
+        900,
       )
       smoothStopped = true
       if (smoothTimer) clearTimeout(smoothTimer)
       await logEvent({ level: ffmpegResult.exitCode === 0 ? "info" : "error", event: "download.m3u8.ffmpeg.completed", taskId, details: { exitCode: ffmpegResult.exitCode, output: ffmpegResult.output } })
       if (isCancelFlagSet() || ffmpegResult.exitCode === 130) throw new Error("下载已取消")
       if (ffmpegResult.exitCode !== 0 || !FileManager.existsSync(workPath)) {
-        // Fallback: try downloading the m3u8 URL as a single progressive asset (some hosts serve ts-like containers)
+        // A .m3u8 URL is a playlist, never a standalone media asset. Downloading it through
+        // the generic fallback can yield only its first .ts segment, which still has A/V streams
+        // and would otherwise be mispublished as a complete video.
+        const playlistFailure = hlsFailureMessage(sourceURL, ffmpegResult.output || "")
+        if (playlistFailure) throw new Error(playlistFailure)
+        // Non-playlist pseudo-HLS URLs may still be a single transport stream, so retain the
+        // conservative fallback only for those legacy cases.
         tracker.emit(0.15, "FFmpeg 直连失败，尝试 Background 下载")
         const tmpMedia = Path.join(workDirectory, `hls_raw_${Date.now()}.ts`)
         await downloadURLToFileWithProgress({
           url: sourceURL,
           destination: tmpMedia,
-          headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" },
+          headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
           start: 0.15,
           end: 0.85,
-          stage: "正在下载 m3u8 资源",
+          stage: "正在下载媒体资源",
           onProgress: options.onProgress,
           isCancelFlagSet,
         })
@@ -1501,11 +1632,10 @@ export async function downloadMedia(options: {
           1800,
         )
         if (wrap.exitCode !== 0 || !FileManager.existsSync(workPath)) {
-          throw new Error(compactMessage(ffmpegResult.output || wrap.output || "m3u8 下载失败"))
+          throw new Error(compactMessage(ffmpegResult.output || wrap.output || "媒体资源下载失败"))
         }
       }
-      await verifyMediaFile(workPath, options.choice, taskId)
-      const filePath = await publishMediaFile(workPath, taskId)
+      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
       tracker.emit(1, "m3u8 下载并验证完成")
       await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "m3u8" } })
       return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
@@ -1531,10 +1661,12 @@ export async function downloadMedia(options: {
     concurrent_fragments: options.concurrentFragments,
     no_check_certificates: Boolean(options.insecureTLS),
     cookiefile: taskCookiePath,
+    referer,
+    user_agent: safariUserAgent,
     extract_audio: false,
   }
   await FileManager.writeAsString(configPath, JSON.stringify(config))
-  await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: options.choice.formatExpression, concurrentFragments: options.concurrentFragments, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), outputDirectory: DOWNLOAD_DIR } })
+  await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: options.choice.formatExpression, concurrentFragments: options.concurrentFragments, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
   options.onCancelPath(cancelPath)
 
   try {
@@ -1650,14 +1782,12 @@ export async function downloadMedia(options: {
         if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
           throw new Error(compactMessage(mergeResult.output || transcode.output || "FFmpeg 合并失败"))
         }
-        await verifyMediaFile(mp4Path, options.choice, taskId)
-        const filePath = await publishMediaFile(mp4Path, taskId)
+        const filePath = await verifyAndPublishMediaFile({ workPath: mp4Path, choice: options.choice, taskId, hlsOrigin, hlsManifest })
         tracker.emit(1, "下载、转码并验证完成")
         await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, mergedWithFFmpeg: true, transcoded: true, sourceVideoCodec: options.choice.videoCodec || null } })
         return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
       }
-      await verifyMediaFile(workPath, options.choice, taskId)
-      const filePath = await publishMediaFile(workPath, taskId)
+      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
       tracker.emit(1, hardCodec ? "下载并合成 MKV 完成（请用外部播放器打开）" : "下载、合并并验证完成")
       await logEvent({
         level: "info",
@@ -1698,8 +1828,7 @@ export async function downloadMedia(options: {
     }
     // Single-file HEVC/AV1/VP9: keep original container; open with external players (no H.264 transcode).
     tracker.emit(0.96, "正在验证文件")
-    await verifyMediaFile(filePath, options.choice, taskId)
-    const publishedPath = await publishMediaFile(filePath, taskId)
+    const publishedPath = await verifyAndPublishMediaFile({ workPath: filePath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
     const hardSingle = options.choice.kind === "video" && isDeviceHardVideoChoice(options.choice)
     tracker.emit(1, hardSingle ? "下载完成（请用外部播放器打开）" : "下载并验证完成")
     await logEvent({
