@@ -1,36 +1,36 @@
 {
-  "localizedDescriptions" : {
-    "zh" : "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。",
-    "en" : "Paste or share a public media link, choose an output format, then save it to Photos or Files."
-  },
+  "contributors" : [
+
+  ],
+  "iconImage" : "",
+  "intentInputTypes" : [
+    "URLs",
+    "Text"
+  ],
+  "description" : "Download public media with a focused Yoinks-style workflow, including sequential batch queues.",
+  "color" : "rgba(52, 199, 89, 1)",
   "entry" : "index.tsx",
   "localizedNames" : {
     "zh" : "Yoinks",
     "en" : "Yoinks"
   },
-  "runInApp" : true,
-  "contributors" : [
-
-  ],
+  "author" : {
+    "email" : null,
+    "homepage" : null,
+    "name" : "vcncv"
+  },
   "name" : "Yoinks",
+  "runInApp" : true,
+  "version" : "1.6.1",
+  "icon" : "arrow.down.to.line.compact",
   "permissions" : null,
-  "version" : "1.6.0",
-  "description" : "Download public media with a focused Yoinks-style workflow, including sequential batch queues.",
-  "intentInputTypes" : [
-    "URLs",
-    "Text"
-  ],
   "remoteResource" : {
     "url" : "https:\/\/github.com\/ckldy\/Yoinks",
-    "hash" : "f9c2cb7e69683843107eb9d100bbf180",
-    "autoUpdateInterval" : 300
+    "hash" : "c89cbbd17c0e8de62dec4a598703546d",
+    "autoUpdateInterval" : null
   },
-  "author" : {
-    "name" : "vcncv",
-    "homepage" : null,
-    "email" : null
-  },
-  "color" : "rgba(52, 199, 89, 1)",
-  "icon" : "arrow.down.to.line.compact",
-  "iconImage" : ""
+  "localizedDescriptions" : {
+    "zh" : "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。",
+    "en" : "Paste or share a public media link, choose an output format, then save it to Photos or Files."
+  }
 }

@@ -49,6 +49,7 @@ import {
   mediaPlatformLabel,
   probeMedia,
   resolveAutomaticChoice,
+  resolveInitialMediaChoice,
   saveResult,
   type ConcurrentDownloads,
   type DownloadProgress,
@@ -702,9 +703,8 @@ function View() {
       if (isXStatusURL(sourceURL) && probeResult.webpageURL && probeResult.webpageURL !== sourceURL) {
         setURL(probeResult.webpageURL)
       }
-      if (platform === "douyin" && probeResult.choices.length === 1) {
-        setSelectedChoice(probeResult.choices[0])
-      }
+      const initialChoice = resolveInitialMediaChoice(probeResult.choices)
+      if (initialChoice) setSelectedChoice(initialChoice)
       const hlsAudioOnly = isLikelyHLSAudioRendition(sourceURL)
         && probeResult.choices.length > 0
         && probeResult.choices.every((choice) => choice.kind === "audio")
@@ -1028,6 +1028,10 @@ function View() {
       })
     }
     setMediaCandidates(listMediaCandidates())
+    if (envelope.candidates.length === 1) {
+      await analyzeSafariCandidate(envelope.candidates[0])
+      return
+    }
     const actions = envelope.candidates.map((candidate) => ({ label: safariCandidateSummary(candidate) }))
     const selected = await Dialog.actionSheet({
       title: "Safari 媒体候选",
@@ -1038,13 +1042,6 @@ function View() {
     if (selected == null) return
     const candidate = envelope.candidates[selected]
     if (!candidate) return
-    const confirmed = await Dialog.confirm({
-      title: "导入并分析媒体链接",
-      message: safariCandidateSummary(candidate),
-      confirmLabel: "导入",
-      cancelLabel: "取消",
-    })
-    if (!confirmed) return
     await analyzeSafariCandidate(candidate)
   }
 

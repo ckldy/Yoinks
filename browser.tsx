@@ -36,6 +36,7 @@ const DIAGNOSTIC_STORAGE_KEY = "yoinks-media-candidates-diagnostic-v1"
 const ALWAYS_SHOW_FLOATING_ENTRY_KEY = "yoinks-floating-entry-always-visible-v1"
 const FLOATING_ENTRY_ID = "yoinks-media-candidate-entry"
 const FLOATING_ENTRY_LONG_PRESS_MS = 700
+const CAPTURE_DELAY_MS = 1500
 const MAX_CANDIDATES = 50
 const VIDEO_PATTERN = /\.(?:mp4|m4v|mov|webm|mkv|avi|flv)$/i
 const AUDIO_PATTERN = /\.(?:m4a|aac|mp3|opus|ogg|wav)$/i
@@ -177,6 +178,11 @@ async function captureCurrentPage(): Promise<number> {
   return candidates.length
 }
 
+async function captureAfterDelay(): Promise<number> {
+  await new Promise<void>(resolve => setTimeout(resolve, CAPTURE_DELAY_MS))
+  return captureCurrentPage()
+}
+
 function showFloatingFeedback(entry: any, text: string): void {
   const feedback = document.createElement("span")
   feedback.className = "yoinks-media-candidate-feedback"
@@ -221,7 +227,8 @@ function installFloatingEntry(alwaysVisible: boolean): void {
     if (longPressTriggered) return
     entry.disabled = true
     try {
-      const count = await captureCurrentPage()
+      showFloatingFeedback(entry, "正在等待媒体地址…")
+      const count = await captureAfterDelay()
       showFloatingFeedback(entry, `已捕获 ${count} 个候选`)
     } catch {
       showFloatingFeedback(entry, "采集失败")
@@ -233,7 +240,7 @@ function installFloatingEntry(alwaysVisible: boolean): void {
 }
 
 GM.registerMenuCommand("导入本页媒体候选到 Yoinks", async () => {
-  await captureCurrentPage()
+  await captureAfterDelay()
 })
 
 void (async () => {

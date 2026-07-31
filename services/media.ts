@@ -210,14 +210,32 @@ export function isProbeTimeoutFailure(value: string): boolean {
   return /^媒体分析超时（\d+ 秒）。请检查网络后重试。$/.test(String(value || "").trim())
 }
 
+/** yt-dlp's generic extractor was blocked, while the user-approved Safari capture already observed this public HLS URL. */
+export function isCloudflareAntiBotFailure(value: string): boolean {
+  const text = String(value || "")
+  return /HTTP Error 403 caused by Cloudflare anti-bot challenge|Cloudflare anti-bot challenge/i.test(text)
+}
+
+/** A CDN can accept Safari's HLS request but close the Python/yt-dlp connection under HTTPS capture. */
+export function isRemoteHlsManifestDisconnect(value: string): boolean {
+  return /Unable to download webpage:\s*Remote end closed connection without response|Failed to download m3u8 information:\s*Remote end closed connection without response/i.test(String(value || ""))
+}
+
+export function isSafariHlsDirectFallbackFailure(value: string): boolean {
+  return isCloudflareAntiBotFailure(value) || isRemoteHlsManifestDisconnect(value)
+}
+
 export function compactMessage(value: string): string {
   const cleaned = stripHostNoise(value)
   const source = cleaned || value
   if (isDownloadTlsTimeout(source)) {
     return "下载过程中网络 TLS/握手超时，请检查网络后重试；可改选 H.264 清晰度或稍后再试。"
   }
+  if (isRemoteHlsManifestDisconnect(source)) {
+    return "读取 HLS 清单时远端 CDN 连接中断，请稍后重试。"
+  }
   if (isRemoteDownloadDisconnect(source)) {
-    return "下载音频时远端 CDN 连接中断，已重试仍未完成；请稍后重试。"
+    return "下载媒体时远端 CDN 连接中断，已重试仍未完成；请稍后重试。"
   }
   const errors = extractErrorSnippets(source)
   if (errors.length) {
@@ -257,6 +275,19 @@ function extensionOf(path: string): string {
 }
 
 const DIRECT_MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv", ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"])
+
+export function hlsMediaChoice(sourceURL: string): MediaChoice | null {
+  if (!/\.m3u8(?:$|[?#])/i.test(sourceURL)) return null
+  return {
+    id: "m3u8",
+    label: "HLS 原始清单 · 自适应视频",
+    kind: "video",
+    formatExpression: "m3u8",
+    container: "mp4",
+    previewURL: sourceURL,
+    sourceURL,
+  }
+}
 
 export function directMediaChoice(sourceURL: string, knownKind?: "video" | "audio"): MediaChoice | null {
   const detectedExtension = extensionOf(sourceURL)
@@ -815,6 +846,15 @@ export function buildChoices(formats: RawFormat[]): MediaChoice[] {
   return [...videos, ...audios]
 }
 
+/**
+ * Select an initial manual-download format only when the probe has exactly one
+ * video choice. Audio alternatives remain available from the format menu.
+ */
+export function resolveInitialMediaChoice(choices: MediaChoice[]): MediaChoice | null {
+  const videos = choices.filter((choice) => choice.kind === "video")
+  return videos.length === 1 ? videos[0] : null
+}
+
 export function resolveAutomaticChoice(
   choices: MediaChoice[],
   strategy: AutomaticDownloadFormatStrategy,
@@ -1269,6 +1309,25 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   return probe
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    // A Safari-captured HLS manifest is already an explicit user-selected media URL.
+    // If yt-dlp's generic probe is rejected by Cloudflare or the CDN closes only its
+    // Python connection, preserve that public manifest as a direct HLS choice. The
+    // download path still uses only Referer + UA; no Safari cookies, challenge tokens,
+    // or authorization data are read or transferred.
+    const safariHlsChoice = referer && isSafariHlsDirectFallbackFailure(message)
+      ? hlsMediaChoice(sourceURL)
+      : null
+    if (safariHlsChoice && referer) {
+      safariHlsChoice.previewReferer = referer
+      safariHlsChoice.previewHeaders = { Referer: referer, "User-Agent": safariUserAgent || "Mozilla/5.0" }
+      await logEvent({
+        level: "warn",
+        event: "probe.safari-hls.direct-fallback",
+        taskId,
+        details: { sourceURL, reason: isCloudflareAntiBotFailure(message) ? "cloudflare-anti-bot" : "remote-manifest-disconnect", safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false },
+      })
+      return { title: "Safari HLS 视频", webpageURL: sourceURL, choices: [safariHlsChoice] }
+    }
     const extracted = await tryPublicPlayerFallback(message)
     if (extracted) return extracted
     throw error

@@ -12,6 +12,7 @@ import {
   BILIBILI_DESKTOP_UA,
   rewriteBilibiliCdnUrl,
 } from "./bilibili-cdn"
+import { logEvent } from "../logs"
 
 export type { PlayerConfig }
 
@@ -156,6 +157,12 @@ var preferMuted = {{PREFER_MUTED}};
 var requestMode = 'unknown';
 var startedReported = false;
 var blackScreenTimer = null;
+var latestLoadedFragment = null;
+var seekPollTimer = null;
+var seekPollLastTime = null;
+var seekPollStartedAt = 0;
+var seekPollSamples = 0;
+var seekPollTargetTime = null;
 
 function reportError(message, fatal) {
   try {
@@ -187,6 +194,74 @@ function reportPlaybackEvent(type) {
   } catch (e) {
     console.log('[Player] Failed to report playback event:', e);
   }
+}
+
+function finiteSeconds(value) {
+  var number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 10) / 10 : null;
+}
+
+function bufferedRangeCount() {
+  try { return video && video.buffered ? video.buffered.length : 0; } catch (e) { return 0; }
+}
+
+function bufferedRangesSnapshot() {
+  var ranges = [];
+  try {
+    for (var i = 0; video && video.buffered && i < video.buffered.length && i < 2; i++) {
+      ranges.push({ start: finiteSeconds(video.buffered.start(i)), end: finiteSeconds(video.buffered.end(i)) });
+    }
+  } catch (e) {}
+  return ranges;
+}
+
+function reportSeekDiagnostic(label, extra) {
+  try {
+    window.webkit?.messageHandlers?.seekDiagnostic?.postMessage(Object.assign({
+      label: String(label),
+      currentTime: finiteSeconds(video.currentTime),
+      duration: finiteSeconds(video.duration),
+      readyState: Number(video.readyState) || 0,
+      networkState: Number(video.networkState) || 0,
+      paused: !!video.paused,
+      bufferedRanges: bufferedRangeCount()
+    }, extra || {}));
+  } catch (e) {
+    console.log('[Player] Failed to report seek diagnostic:', e);
+  }
+}
+
+function stopSeekPolling(reason) {
+  if (!seekPollTimer) return;
+  clearInterval(seekPollTimer);
+  seekPollTimer = null;
+  reportSeekDiagnostic('seek.poll.finished', { reason: String(reason), samples: seekPollSamples, targetTime: seekPollTargetTime });
+}
+
+function startSeekPolling(targetTime) {
+  stopSeekPolling('replaced');
+  seekPollStartedAt = Date.now();
+  seekPollSamples = 0;
+  seekPollTargetTime = finiteSeconds(targetTime);
+  reportSeekDiagnostic('seek.poll.started', { targetTime: seekPollTargetTime });
+  seekPollTimer = setInterval(function() {
+    seekPollSamples += 1;
+    reportSeekDiagnostic('seek.poll.sample', {
+      elapsedMs: Date.now() - seekPollStartedAt,
+      samples: seekPollSamples,
+      targetTime: seekPollTargetTime,
+      buffered: bufferedRangesSnapshot(),
+      fragment: latestLoadedFragment
+    });
+    if (seekPollSamples >= 20) stopSeekPolling('completed');
+  }, 500);
+}
+
+function observeSeekByTimeJump() {
+  var current = finiteSeconds(video.currentTime);
+  if (current == null) return;
+  if (seekPollLastTime != null && Math.abs(current - seekPollLastTime) >= 5) startSeekPolling(current);
+  seekPollLastTime = current;
 }
 
 function stopOrphanAudio() {
@@ -241,7 +316,7 @@ function markPlaying() {
   reportPlaybackEvent('playing');
 }
 
-function bindMediaEvents() {
+function bindMediaEvents(enableSeekDiagnostics) {
   video.oncanplay = function() {
     loading.style.display = 'none';
     reportPlaybackEvent('canplay');
@@ -257,12 +332,22 @@ function bindMediaEvents() {
   video.onpause = function() {
     if (currentAudioSrc && audio && !audio.paused) audio.pause();
   };
-  video.onseeking = function() { syncAudioFromVideo(); };
+  video.onseeking = function() {
+    if (enableSeekDiagnostics) {
+      reportSeekDiagnostic('seek.start');
+      startSeekPolling(video.currentTime);
+    }
+    syncAudioFromVideo();
+  };
   video.onseeked = function() {
+    if (enableSeekDiagnostics) reportSeekDiagnostic('seek.completed');
     syncAudioFromVideo();
     if (!video.paused && currentAudioSrc) playAudioWithVideo();
   };
+  video.onwaiting = function() { if (enableSeekDiagnostics) reportSeekDiagnostic('seek.waiting'); };
+  video.onstalled = function() { if (enableSeekDiagnostics) reportSeekDiagnostic('seek.stalled'); };
   video.ontimeupdate = function() {
+    if (enableSeekDiagnostics) observeSeekByTimeJump();
     if (currentAudioSrc && !hasVisibleVideoFrame()) {
       // Advancing time without frames: stop any premature audio.
       try { if (audio && !audio.paused) audio.pause(); } catch (e) {}
@@ -286,7 +371,7 @@ function bindMediaEvents() {
 }
 
 function bindDirectMediaEvents() {
-  bindMediaEvents();
+  bindMediaEvents(false);
   video.onloadedmetadata = function() {
     loading.style.display = 'none';
     startNativePlayback();
@@ -313,10 +398,13 @@ function play(src, audioSrc) {
   currentSrc = src;
   currentAudioSrc = audioSrc || '';
   startedReported = false;
+  latestLoadedFragment = null;
+  seekPollLastTime = null;
+  stopSeekPolling('new-play');
   if (blackScreenTimer) { clearTimeout(blackScreenTimer); blackScreenTimer = null; }
   loading.style.display = 'block';
   hideError();
-  bindMediaEvents();
+  bindMediaEvents(false);
 
   if (hls) {
     hls.destroy();
@@ -346,9 +434,16 @@ function play(src, audioSrc) {
     bindDirectMediaEvents();
     video.src = src;
     video.load();
+  } else if (Object.keys(customHeaders).length === 0 && video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native WebKit/AVFoundation HLS gives iOS reliable random seeking for public streams.
+    reportMode('native-fallback', false);
+    bindDirectMediaEvents();
+    video.src = src;
+    video.load();
   } else if (window.Hls && Hls.isSupported()) {
     reportMode('hls.js', Object.keys(customHeaders).length > 0);
 
+    bindMediaEvents(true);
     hls = new Hls(hlsConfig);
     // Inject custom headers for all hls.js controlled requests
     if (Object.keys(customHeaders).length > 0) {
@@ -376,6 +471,7 @@ function play(src, audioSrc) {
     });
 
     hls.on(Hls.Events.ERROR, function(event, data) {
+      reportSeekDiagnostic('hls.error', { hlsType: String(data.type || ''), hlsDetails: String(data.details || ''), fatal: !!data.fatal });
       console.log('[Player] HLS Error:', data.type, data.details, data.fatal);
       if (data.fatal) {
         switch (data.type) {
@@ -396,6 +492,12 @@ function play(src, audioSrc) {
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         // Non-fatal media errors - hls.js handles internally
       }
+    });
+
+    hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
+      var fragment = data && data.frag ? data.frag : {};
+      latestLoadedFragment = { start: finiteSeconds(fragment.start), end: finiteSeconds(fragment.start + fragment.duration), sn: Number.isFinite(Number(fragment.sn)) ? Number(fragment.sn) : null };
+      reportSeekDiagnostic('hls.fragment.loaded', latestLoadedFragment);
     });
 
     hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
@@ -436,6 +538,9 @@ function setQuality(level) {
 }
 
 function destroy() {
+  stopSeekPolling('destroyed');
+  seekPollLastTime = null;
+  latestLoadedFragment = null;
   if (blackScreenTimer) { clearTimeout(blackScreenTimer); blackScreenTimer = null; }
   if (hls) {
     hls.destroy();
@@ -664,6 +769,35 @@ export class HLSPlayerService {
       if (message?.type === "playing") {
         this.emit({ type: "play", timestamp: Date.now(), data: { url: this.currentUrl, confirmed: true } })
       }
+    })
+
+    await this.controller.addScriptMessageHandler("seekDiagnostic", (message: any) => {
+      const label = typeof message?.label === "string" ? message.label.slice(0, 80) : "unknown"
+      const number = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) ? value : null
+      logEvent({
+        level: label === "hls.error" ? "warn" : "info",
+        event: `preview.hls.${label}`,
+        details: {
+          currentTime: number(message?.currentTime),
+          duration: number(message?.duration),
+          readyState: number(message?.readyState),
+          networkState: number(message?.networkState),
+          paused: message?.paused === true,
+          bufferedRanges: number(message?.bufferedRanges),
+          elapsedMs: number(message?.elapsedMs),
+          samples: number(message?.samples),
+          targetTime: number(message?.targetTime),
+          reason: typeof message?.reason === "string" ? message.reason.slice(0, 40) : undefined,
+          buffered: Array.isArray(message?.buffered) ? message.buffered.slice(0, 2).map((range: any) => ({ start: number(range?.start), end: number(range?.end) })) : undefined,
+          fragment: message?.fragment && typeof message.fragment === "object" ? { start: number(message.fragment.start), end: number(message.fragment.end), sn: number(message.fragment.sn) } : undefined,
+          start: number(message?.start),
+          end: number(message?.end),
+          sn: number(message?.sn),
+          hlsType: typeof message?.hlsType === "string" ? message.hlsType.slice(0, 80) : undefined,
+          hlsDetails: typeof message?.hlsDetails === "string" ? message.hlsDetails.slice(0, 120) : undefined,
+          fatal: message?.fatal === true,
+        },
+      }).catch(() => {})
     })
 
     await this.controller.addScriptMessageHandler("requestMode", (message: any) => {
