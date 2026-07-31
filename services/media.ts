@@ -1,5 +1,6 @@
-import { Path, Script } from "scripting"
+import { AbortController, Path, Script, fetch } from "scripting"
 import { createTaskId, logEvent } from "./logs"
+import { extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
 import type { AuthPlatform } from "./platform-auth"
 import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
 import { cancelBackgroundDownloads, downloadURLToFileWithProgress } from "./background-download"
@@ -50,6 +51,10 @@ export type MediaChoice = {
   previewURL?: string
   previewReferer?: string
   previewHeaders?: Record<string, string>
+  /** A public extracted stream URL; when present it replaces the webpage URL for this choice only. */
+  sourceURL?: string
+  /** Public page or allowed same-site iframe URL used only as Referer for sourceURL. */
+  sourceReferer?: string
   /** Separate audio stream for DASH video-only online preview. */
   previewAudioURL?: string
   /** Actual video codec string (e.g. avc1.640033) for DASH MPD. */
@@ -197,6 +202,14 @@ function extractErrorSnippets(source: string): string[] {
   return snippets
 }
 
+export function isNoDownloadableFormatFailure(value: string): boolean {
+  return /no(?:\s+video)?\s+formats?|requested format is not available|未找到可下载的视频格式|no playable formats?/i.test(String(value || ""))
+}
+
+export function isProbeTimeoutFailure(value: string): boolean {
+  return /^媒体分析超时（\d+ 秒）。请检查网络后重试。$/.test(String(value || "").trim())
+}
+
 export function compactMessage(value: string): string {
   const cleaned = stripHostNoise(value)
   const source = cleaned || value
@@ -238,8 +251,31 @@ function uniquePaths(paths: string[]): string[] {
 
 function extensionOf(path: string): string {
   const clean = path.startsWith("/") ? path : path.split(/[?#]/)[0]
-  const index = clean.lastIndexOf(".")
-  return index >= 0 ? clean.slice(index).toLowerCase() : ""
+  const fileName = clean.slice(clean.lastIndexOf("/") + 1)
+  const index = fileName.lastIndexOf(".")
+  return index > 0 ? fileName.slice(index).toLowerCase() : ""
+}
+
+const DIRECT_MEDIA_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv", ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"])
+
+export function directMediaChoice(sourceURL: string, knownKind?: "video" | "audio"): MediaChoice | null {
+  const detectedExtension = extensionOf(sourceURL)
+  const extension = DIRECT_MEDIA_EXTENSIONS.has(detectedExtension)
+    ? detectedExtension
+    : knownKind === "video" ? ".mp4"
+      : knownKind === "audio" ? ".m4a"
+        : ""
+  if (!extension) return null
+  const kind: MediaKind = [".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"].includes(extension) ? "audio" : "video"
+  const container = extension.slice(1)
+  return {
+    id: `direct-${container}`,
+    label: kind === "audio" ? `原始音频 · ${container.toUpperCase()}` : `原始视频 · 容器·${container.toUpperCase()}`,
+    kind,
+    formatExpression: "direct",
+    container,
+    previewURL: sourceURL,
+  }
 }
 
 function formatBytes(value?: number): string {
@@ -836,8 +872,76 @@ export type ProbeOptions = {
   authorizedPlatform?: AuthPlatform
   /** Public Safari page URL, used only for this probe as Referer. */
   referer?: string
+  /** The Safari DOM explicitly identified this public URL as a media element, even when its path has no extension. */
+  safariMediaKind?: "video" | "audio"
+  /** Prevent the public HTML fallback from recursively invoking itself. */
+  skipPublicPlayerFallback?: boolean
 }
 
+
+const PUBLIC_PLAYER_PAGE_TIMEOUT_MS = 12_000
+const PUBLIC_PLAYER_MAX_HTML_BYTES = 1_500_000
+
+async function fetchPublicHTML(url: string): Promise<{ finalURL: string; contentType?: string; html: string; title?: string } | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), PUBLIC_PLAYER_PAGE_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, { headers: { Accept: "text/html,application/xhtml+xml" }, signal: controller.signal })
+    if (!response.ok) return null
+    const contentType = response.headers.get("content-type") || undefined
+    const contentLength = Number(response.headers.get("content-length") || 0)
+    if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) return null
+    if (Number.isFinite(contentLength) && contentLength > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
+    const html = await response.text()
+    if (html.length > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
+    return { finalURL: response.url || url, contentType, html }
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function publicChoice(source: PublicPlayerSource): MediaChoice | null {
+  const headers = { Referer: source.referer, "User-Agent": MOBILE_SAFARI_UA }
+  if (source.kind === "hls") return {
+    id: "public-hls", label: "公开 HLS / m3u8", kind: "video", formatExpression: "m3u8", container: "mp4",
+    previewURL: source.url, previewReferer: source.referer, previewHeaders: headers, sourceURL: source.url, sourceReferer: source.referer,
+  }
+  if (source.kind === "dash") return {
+    id: "public-dash", label: "公开 DASH / MPD", kind: "video", formatExpression: "best", container: "mp4",
+    previewURL: source.url, previewReferer: source.referer, previewHeaders: headers, sourceURL: source.url, sourceReferer: source.referer,
+  }
+  const direct = directMediaChoice(source.url, source.kind === "audio" ? "audio" : "video")
+  if (!direct) return null
+  const height = source.kind === "video" ? source.height : undefined
+  return {
+    ...direct,
+    ...(height ? { id: `public-mp4-${height}`, label: `${height}p · 公开 MP4`, height } : { id: "public-mp4", label: "公开 MP4" }),
+    previewReferer: source.referer, previewHeaders: headers, sourceURL: source.url, sourceReferer: source.referer,
+  }
+}
+
+async function probePublicPlayerSource(sourceURL: string, taskId: string): Promise<MediaProbe | null> {
+  await logEvent({ level: "info", event: "probe.public-player.started", taskId, details: { sourceURL } })
+  const extracted = await extractPublicPlayerSources({ pageURL: sourceURL, fetchHTML: fetchPublicHTML })
+  if (!extracted) {
+    await logEvent({ level: "info", event: "probe.public-player.completed", taskId, details: { hit: false, checkedIframes: 0 } })
+    return null
+  }
+  const choices = extracted.sources.map(publicChoice).filter((choice): choice is MediaChoice => Boolean(choice))
+  if (!choices.length) {
+    await logEvent({ level: "info", event: "probe.public-player.completed", taskId, details: { hit: false, checkedIframes: extracted.checkedIframes, candidateCount: extracted.sources.length } })
+    return null
+  }
+  const kindCounts = choices.reduce<Record<string, number>>((counts, choice) => {
+    const key = choice.id.replace("public-", "")
+    counts[key] = (counts[key] || 0) + 1
+    return counts
+  }, {})
+  await logEvent({ level: "info", event: "probe.public-player.completed", taskId, details: { hit: true, checkedIframes: extracted.checkedIframes, kindCounts } })
+  return { title: extracted.title, webpageURL: sourceURL, choices }
+}
 
 export const DOUYIN_DIRECT_FORMAT = "douyin-webview"
 
@@ -925,6 +1029,7 @@ async function probeDouyinDirect(sourceURL: string): Promise<MediaProbe> {
 async function downloadDouyinDirect(options: {
   sourceURL: string
   choice: MediaChoice
+  outputTitle?: string
   onProgress: (value: DownloadProgress) => void
   onCancelPath: (path: string) => void
 }): Promise<DownloadResult> {
@@ -953,7 +1058,7 @@ async function downloadDouyinDirect(options: {
     let filePath = result.filePath
     if (!filePath.includes(`(${taskId.slice(-6)})`)) {
       try {
-        filePath = await publishMediaFile(filePath, taskId)
+        filePath = await publishMediaFile(filePath, taskId, options.outputTitle)
       } catch {
         filePath = result.filePath
       }
@@ -1032,6 +1137,11 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   const deadline = startedAt + PROBE_TOTAL_TIMEOUT_SECONDS * 1000
   let attemptCount = 0
   const timeoutError = () => new Error(`媒体分析超时（${PROBE_TOTAL_TIMEOUT_SECONDS} 秒）。请检查网络后重试。`)
+  const tryPublicPlayerFallback = async (message: string): Promise<MediaProbe | null> => {
+    if (options.skipPublicPlayerFallback) return null
+    if (!isNoDownloadableFormatFailure(message) && !isProbeTimeoutFailure(message)) return null
+    return probePublicPlayerSource(sourceURL, taskId)
+  }
   const runProbe = async (insecure = false) => {
     const remainingMilliseconds = deadline - Date.now()
     if (remainingMilliseconds <= 0) throw timeoutError()
@@ -1047,7 +1157,9 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
     return result
   }
 
-  let result = await runProbe()
+  try {
+  let insecure = false
+  let result = await runProbe(insecure)
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
 
   // Host noise / short WebView logs / one network timeout often succeed on a single re-probe.
@@ -1083,7 +1195,8 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
       taskId,
       details: { reason: "certificate_verify_failed", insecure: true },
     })
-    result = await runProbe(true)
+    insecure = true
+    result = await runProbe(insecure)
     await logEvent({
       level: result.exitCode === 0 ? "info" : "error",
       event: "probe.command.completed",
@@ -1105,8 +1218,8 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
     const message = error instanceof Error ? error.message : String(error)
     if (message !== "下载工具未返回可识别的媒体信息") throw error
     await logEvent({ level: "warn", event: "probe.output.retry", taskId, details: { delayMilliseconds: 0 } })
-    result = await runProbe()
-    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })
+    result = await runProbe(insecure)
+    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output, afterOutputRetry: true, tlsInsecure: insecure } })
     if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
     payload = parseLastJSON(result.output)
   }
@@ -1132,7 +1245,15 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   }).filter((item) => Boolean(item.formatId))
   const choices = buildChoices(formats)
   if (!choices.length) {
-    throw new Error("未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）")
+    const directChoice = directMediaChoice(sourceURL, options.safariMediaKind)
+    if (directChoice) {
+      directChoice.previewReferer = referer
+      directChoice.previewHeaders = referer ? { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA } : undefined
+      choices.push(directChoice)
+      await logEvent({ level: "info", event: "probe.direct-media.fallback", taskId, details: { sourceURL, extension: extensionOf(sourceURL) || (options.safariMediaKind === "audio" ? ".m4a" : options.safariMediaKind === "video" ? ".mp4" : ""), knownSafariMediaKind: options.safariMediaKind || null, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
+    } else {
+      throw new Error("未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）")
+    }
   }
   // Prefer the probe-pinned X /video/N URL so download reuses a single-item page.
   const webpageURL = pinXStatusVideoURL(stringValue(payload.webpageUrl) || sourceURL, 1)
@@ -1146,6 +1267,12 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   }
   await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: probe.title, choiceCount: choices.length, formatCount: formats.length, webpageURL } })
   return probe
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const extracted = await tryPublicPlayerFallback(message)
+    if (extracted) return extracted
+    throw error
+  }
 }
 
 function clearProgressFile(path: string) {
@@ -1497,6 +1624,7 @@ async function verifyAndPublishMediaFile(options: {
   taskId: string
   hlsOrigin: boolean
   hlsManifest: HlsManifestSummary | undefined
+  outputTitle?: string
 }): Promise<string> {
   await verifyMediaFile(options.workPath, options.choice, options.taskId)
   if (options.hlsOrigin) {
@@ -1516,17 +1644,26 @@ async function verifyAndPublishMediaFile(options: {
     })
     if (completenessFailure) throw new Error(completenessFailure)
   }
-  return publishMediaFile(options.workPath, options.taskId)
+  return publishMediaFile(options.workPath, options.taskId, options.outputTitle)
 }
 
-async function publishMediaFile(workPath: string, taskId: string): Promise<string> {
+export function safeOutputStem(value: string | undefined, fallback: string): string {
+  const cleaned = String(value || "").replace(/[\\/:*?\"<>|\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").replace(/^[.\s]+|[.\s]+$/g, "").trim().slice(0, 160)
+  return cleaned || fallback
+}
+
+async function publishMediaFile(workPath: string, taskId: string, outputTitle?: string): Promise<string> {
   const sourceName = Path.basename(workPath)
   const dot = sourceName.lastIndexOf(".")
-  const stem = dot > 0 ? sourceName.slice(0, dot) : sourceName
+  const fallbackStem = dot > 0 ? sourceName.slice(0, dot) : sourceName
   const extension = dot > 0 ? sourceName.slice(dot) : ""
-  const suffix = taskId.slice(-6)
-  const destination = Path.join(DOWNLOAD_DIR, `${stem} (${suffix})${extension}`)
-  if (await FileManager.exists(destination)) throw new Error("下载文件发布失败：目标文件名已存在")
+  const stem = safeOutputStem(outputTitle, fallbackStem)
+  let index = 0
+  let destination = Path.join(DOWNLOAD_DIR, `${stem}${extension}`)
+  while (await FileManager.exists(destination)) {
+    index += 1
+    destination = Path.join(DOWNLOAD_DIR, `${stem} (${index})${extension}`)
+  }
   await FileManager.rename(workPath, destination)
   return destination
 }
@@ -1540,13 +1677,16 @@ export async function downloadMedia(options: {
   authorizedPlatform?: AuthPlatform
   /** Public Safari page URL, used only for this download as Referer. */
   referer?: string
+  /** Preferred final filename stem from probe or discovery metadata. */
+  outputTitle?: string
   onProgress: (value: DownloadProgress) => void
   onCancelPath: (path: string) => void
 }): Promise<DownloadResult> {
-  const extractedURL = extractFirstURL(options.url)
+  const extractedURL = extractFirstURL(options.choice.sourceURL || options.url)
   if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
   const sourceURL = pinXStatusVideoURL(extractedURL, 1)
-  const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
+  const requestedReferer = options.referer || options.choice.sourceReferer
+  const referer = requestedReferer && /^https?:\/\//i.test(requestedReferer) && !/[\r\n]/.test(requestedReferer) ? requestedReferer : undefined
   const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
   await ensureDirectories()
 
@@ -1555,6 +1695,7 @@ export async function downloadMedia(options: {
     return downloadDouyinDirect({
       sourceURL,
       choice: options.choice,
+      outputTitle: options.outputTitle,
       onProgress: options.onProgress,
       onCancelPath: options.onCancelPath,
     })
@@ -1574,6 +1715,37 @@ export async function downloadMedia(options: {
   const isCancelFlagSet = () => FileManager.existsSync(cancelPath)
   const hlsOrigin = isM3U8URL(sourceURL)
   const hlsManifest = hlsOrigin ? await readHlsManifestSummary(sourceURL, referer, safariUserAgent) : undefined
+  if (options.choice.formatExpression === "direct") {
+    const extension = extensionOf(sourceURL) || (options.choice.container ? `.${options.choice.container}` : ".mp4")
+    const workPath = Path.join(workDirectory, `direct_${Date.now()}${extension}`)
+    options.onCancelPath(cancelPath)
+    await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "direct", safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
+    try {
+      await downloadURLToFileWithProgress({
+        url: sourceURL,
+        destination: workPath,
+        headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+        start: 0.02,
+        end: 0.95,
+        stage: "正在下载直接媒体资源",
+        onProgress: options.onProgress,
+        isCancelFlagSet,
+      })
+      if (isCancelFlagSet()) throw new Error("下载已取消")
+      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
+      tracker.emit(1, "直接媒体下载并验证完成")
+      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct" } })
+      return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+    } catch (error) {
+      await logEvent({ level: "error", event: "download.failed", taskId, details: { message: error instanceof Error ? error.message : String(error), kind: "direct" } })
+      throw error
+    } finally {
+      cancelBackgroundDownloads()
+      try {
+        if (FileManager.existsSync(taskDirectory)) FileManager.removeSync(taskDirectory)
+      } catch {}
+    }
+  }
   if (hlsOrigin) {
     await logEvent({ level: "info", event: "download.hls-origin.detected", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
   }
@@ -1649,7 +1821,7 @@ export async function downloadMedia(options: {
           throw new Error(compactMessage(ffmpegResult.output || wrap.output || "媒体资源下载失败"))
         }
       }
-      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
+      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest, outputTitle: options.outputTitle })
       tracker.emit(1, "m3u8 下载并验证完成")
       await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "m3u8" } })
       return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
@@ -1796,12 +1968,12 @@ export async function downloadMedia(options: {
         if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
           throw new Error(compactMessage(mergeResult.output || transcode.output || "FFmpeg 合并失败"))
         }
-        const filePath = await verifyAndPublishMediaFile({ workPath: mp4Path, choice: options.choice, taskId, hlsOrigin, hlsManifest })
+        const filePath = await verifyAndPublishMediaFile({ workPath: mp4Path, choice: options.choice, taskId, hlsOrigin, hlsManifest, outputTitle: options.outputTitle })
         tracker.emit(1, "下载、转码并验证完成")
         await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, mergedWithFFmpeg: true, transcoded: true, sourceVideoCodec: options.choice.videoCodec || null } })
         return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
       }
-      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
+      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest, outputTitle: options.outputTitle })
       tracker.emit(1, hardCodec ? "下载并合成 MKV 完成（请用外部播放器打开）" : "下载、合并并验证完成")
       await logEvent({
         level: "info",
@@ -1842,7 +2014,7 @@ export async function downloadMedia(options: {
     }
     // Single-file HEVC/AV1/VP9: keep original container; open with external players (no H.264 transcode).
     tracker.emit(0.96, "正在验证文件")
-    const publishedPath = await verifyAndPublishMediaFile({ workPath: filePath, choice: options.choice, taskId, hlsOrigin, hlsManifest })
+    const publishedPath = await verifyAndPublishMediaFile({ workPath: filePath, choice: options.choice, taskId, hlsOrigin, hlsManifest, outputTitle: options.outputTitle })
     const hardSingle = options.choice.kind === "video" && isDeviceHardVideoChoice(options.choice)
     tracker.emit(1, hardSingle ? "下载完成（请用外部播放器打开）" : "下载并验证完成")
     await logEvent({

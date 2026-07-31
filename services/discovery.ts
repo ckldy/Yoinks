@@ -147,6 +147,33 @@ function isSingleVideoURL(value: string): boolean {
   }
 }
 
+export function bilibiliMobileFallbackURL(value: string): string | null {
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase()
+    if ((host !== "www.bilibili.com" && host !== "bilibili.com") || !isSingleVideoURL(value)) return null
+    url.hostname = "m.bilibili.com"
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+export function isBilibiliDiscovery412(message: string): boolean {
+  return /\b(?:http\s+error\s+)?412\b/i.test(message)
+}
+
+function canonicalBilibiliVideoURL(value: string): string {
+  try {
+    const url = new URL(value)
+    if (url.hostname.toLowerCase() !== "m.bilibili.com" || !isSingleVideoURL(value)) return value
+    url.hostname = "www.bilibili.com"
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
 function isBilibiliShortLink(value: string): boolean {
   try {
     const host = new URL(value).hostname.toLowerCase()
@@ -215,13 +242,43 @@ export async function discover(options: DiscoverOptions): Promise<DiscoveryResul
       const shouldInsecure = options.insecure === true || isBilibiliHost(sourceURL)
       // 单视频/短链使用非 flat 模式，获取真实标题、UP 主、封面；列表仍用 flat 模式保证速度。
       const shouldFlat = !isSingleVideoURL(sourceURL)
-      const result = await discoverPlaylist({
+      let result: DiscoveryResult
+      try {
+        result = await discoverPlaylist({
           sourceURL,
           maxItems: options.maxItems,
           insecure: shouldInsecure,
           flat: shouldFlat,
           page,
         })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const mobileURL = isBilibiliDiscovery412(message) ? bilibiliMobileFallbackURL(sourceURL) : null
+        if (!mobileURL) throw error
+        await logEvent({
+          level: "warn",
+          event: "discover.bilibili.mobile-fallback",
+          taskId,
+          details: { sourceURL, mobileURL, reason: "http-412" },
+        })
+        try {
+          const mobileResult = await discoverPlaylist({
+            sourceURL: mobileURL,
+            maxItems: options.maxItems,
+            insecure: shouldInsecure,
+            flat: false,
+            page,
+          })
+          result = {
+            ...mobileResult,
+            sourceURL,
+            items: mobileResult.items.map(item => ({ ...item, url: canonicalBilibiliVideoURL(item.url) })),
+          }
+        } catch (fallbackError) {
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+          throw new Error(`B站桌面页发现返回 HTTP 412；m站回退也失败：${fallbackMessage}`)
+        }
+      }
         await logEvent({
           level: "info",
           event: "discover.completed",

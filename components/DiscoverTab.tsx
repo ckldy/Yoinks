@@ -11,7 +11,7 @@ import {
   useEffect,
   useState,
 } from "scripting"
-import type { EnqueueResult } from "../services/batch-queue"
+import type { BatchEnqueueInput, EnqueueResult } from "../services/batch-queue"
 import { BATCH_QUEUE_MAX, extractFirstURL } from "../services/media"
 import { discover, discoveryKindLabel, discoveryPlatformLabel, type DiscoveryItem, type DiscoveryKind, type DiscoveryPlatform, ALL_DISCOVERY_PLATFORMS } from "../services/discovery"
 
@@ -58,7 +58,7 @@ function formatDuration(seconds?: number): string {
 export type DiscoverTabProps = {
   experimentalEnabled: boolean
   queueItemCount: number
-  onEnqueue: (urls: string[]) => EnqueueResult
+  onEnqueue: (items: BatchEnqueueInput[]) => Promise<EnqueueResult>
   onSwitchToDownload: () => void
   onClose: () => void
 }
@@ -152,7 +152,7 @@ export function DiscoverTab(props: DiscoverTabProps) {
   const selectedURLs = selectedItems.map((item) => item.url)
   const remainingCapacity = Math.max(0, BATCH_QUEUE_MAX - props.queueItemCount)
 
-  const addToQueue = () => {
+  const addToQueue = async () => {
     if (selectedURLs.length === 0) {
       setStatus("请先选择至少一条视频")
       return
@@ -161,16 +161,26 @@ export function DiscoverTab(props: DiscoverTabProps) {
       setStatus(`批量队列最多 ${BATCH_QUEUE_MAX} 条，当前还可加入 ${remainingCapacity} 条`)
       return
     }
-    const result = props.onEnqueue(selectedURLs)
-    if (result.added > 0) {
-      setStatus(`已加入 ${result.added} 条到批量队列`)
-      setItems([])
-      setSelectedIds(new Set())
-      props.onSwitchToDownload()
-    } else if (result.rejectedFull > 0) {
-      setStatus(`批量队列已满，无法加入`)
-    } else {
-      setStatus("这些链接已在队列中")
+    setLoading(true)
+    setStatus(`正在分析 ${selectedItems.length} 条已选视频…`)
+    try {
+      const result = await props.onEnqueue(selectedItems.map((item) => ({ url: item.url, title: item.title })))
+      if (result.added > 0) {
+        setStatus(`已加入 ${result.added} 条到批量队列`)
+        setItems([])
+        setSelectedIds(new Set())
+        props.onSwitchToDownload()
+      } else if (result.rejectedFull > 0) {
+        setStatus("批量队列已满，无法加入")
+      } else if (result.rejectedProbe) {
+        setStatus(`${result.rejectedProbe} 条无法解析，未加入队列。`)
+      } else {
+        setStatus("这些链接已在队列中")
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setLoading(false)
     }
   }
 

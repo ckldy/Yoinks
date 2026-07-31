@@ -3,6 +3,7 @@
  * Run: scripting-ts run verify_batch_queue.ts
  */
 import { Script } from "scripting"
+import type { MediaProbe } from "./services/media"
 import { BATCH_ADD_MAX, BATCH_QUEUE_MAX, extractAllURLs, extractFirstURL } from "./services/media"
 import {
   batchItemTitle,
@@ -64,6 +65,19 @@ check("queue length 20", state.items.length === 20)
 result = enqueueURLs(state, ["https://example.com/v/0", "https://example.com/v/99"])
 state = result.state
 check("duplicate pending skipped", result.skippedDuplicate === 1 && result.added === 1)
+check("enqueue returns actual added URL", result.addedSourceURLs.length === 1 && result.addedSourceURLs[0] === "https://example.com/v/99")
+
+const probeMarker = { title: "member", choices: [] } as unknown as MediaProbe
+const authorized = enqueueURLs(createBatchQueueState(), [{
+  url: "https://www.youtube.com/watch?v=member",
+  title: "会员视频",
+  probe: probeMarker,
+  probeAuthorizedPlatform: "youtube",
+}])
+check(
+  "enqueue preserves authorized probe platform without cookie data",
+  authorized.state.items[0]?.probe === probeMarker && authorized.state.items[0]?.probeAuthorizedPlatform === "youtube",
+)
 
 const pending = nextPendingItem(state)
 check("next pending is first", pending?.sourceURL === "https://example.com/v/0")

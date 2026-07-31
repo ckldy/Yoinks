@@ -1,5 +1,6 @@
 import type { AutomaticDownloadFormatStrategy, PreferredContainer } from "./preferences"
-import type { DownloadResult } from "./media"
+import type { DownloadResult, MediaProbe } from "./media"
+import type { AuthPlatform } from "./platform-auth"
 import { BATCH_QUEUE_MAX } from "./media"
 
 export type BatchItemStatus =
@@ -15,6 +16,10 @@ export type BatchItem = {
   sourceURL: string
   status: BatchItemStatus
   title?: string
+  /** 已在发现页入队前成功探测的格式，批量运行时可直接复用。 */
+  probe?: MediaProbe
+  /** 缓存探测依赖的平台会话；只存平台枚举，不存 Cookie 或会话对象。 */
+  probeAuthorizedPlatform?: AuthPlatform
   errorMessage?: string
   choiceLabel?: string
   result?: DownloadResult
@@ -41,12 +46,18 @@ export type BatchCounts = {
   active: number
 }
 
+export type BatchEnqueueInput = { url: string; title?: string; probe?: MediaProbe; probeAuthorizedPlatform?: AuthPlatform }
+
 export type EnqueueResult = {
   state: BatchQueueState
   added: number
+  /** 本次实际新增的 source URL，排除重复项和容量不足项。 */
+  addedSourceURLs: string[]
   skippedDuplicate: number
   truncated: number
   rejectedFull: number
+  /** 发现页入队前预解析失败数量；普通入队流程不设置。 */
+  rejectedProbe?: number
 }
 
 function createItemId(): string {
@@ -94,16 +105,21 @@ function isBlockingDuplicate(status: BatchItemStatus): boolean {
 }
 
 /** Enqueue URLs; dedupe against pending/failed/cancelled/active; allow re-add of completed. */
-export function enqueueURLs(state: BatchQueueState, urls: string[], perAddMax = 20): EnqueueResult {
+export function enqueueURLs(state: BatchQueueState, urls: Array<string | BatchEnqueueInput>, perAddMax = 20): EnqueueResult {
   let added = 0
   let skippedDuplicate = 0
   let truncated = 0
   let rejectedFull = 0
+  const addedSourceURLs: string[] = []
   const items = [...state.items]
   const limited = urls.length > perAddMax ? urls.slice(0, perAddMax) : urls
   truncated = Math.max(0, urls.length - limited.length)
 
-  for (const sourceURL of limited) {
+  for (const raw of limited) {
+    const sourceURL = typeof raw === "string" ? raw : raw.url
+    const title = typeof raw === "string" ? undefined : raw.title
+    const probe = typeof raw === "string" ? undefined : raw.probe
+    const probeAuthorizedPlatform = typeof raw === "string" ? undefined : raw.probeAuthorizedPlatform
     if (items.length >= BATCH_QUEUE_MAX) {
       rejectedFull += 1
       continue
@@ -117,14 +133,19 @@ export function enqueueURLs(state: BatchQueueState, urls: string[], perAddMax = 
       id: createItemId(),
       sourceURL,
       status: "pending",
+      title,
+      probe,
+      probeAuthorizedPlatform,
       addedAt: Date.now(),
     })
     added += 1
+    addedSourceURLs.push(sourceURL)
   }
 
   return {
     state: { ...state, items },
     added,
+    addedSourceURLs,
     skippedDuplicate,
     truncated,
     rejectedFull,

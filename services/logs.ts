@@ -45,6 +45,19 @@ const MAIN_CHAIN_EVENTS = new Set([
   "paste.accepted",
   "manual-url.accepted",
   "paste.invalid",
+  "clipboard-launch.checked",
+  "clipboard-launch.empty",
+  "clipboard-launch.invalid",
+  "clipboard-launch.accepted",
+  "clipboard-launch.skipped",
+  "clipboard-launch.read-failed",
+  "auto-download.selected",
+  "auto-download.skipped",
+  "safari-candidate.imported",
+  "safari-candidate.page-probe.fallback",
+  "probe.direct-media.fallback",
+  "probe.public-player.started",
+  "probe.public-player.completed",
   "probe.started",
   "probe.completed",
   "probe.failed",
@@ -324,7 +337,7 @@ export function createTaskId(): string {
   return `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`
 }
 
-function shouldPersist(payload: YoinksLogEvent): boolean {
+export function shouldPersist(payload: YoinksLogEvent): boolean {
   if (payload.level === "warn" || payload.level === "error") return true
   if (MAIN_CHAIN_EVENTS.has(payload.event)) return true
   if (isVerboseActiveUnlocked()) return payload.level !== "debug"
@@ -337,7 +350,7 @@ export async function logEvent(event: Omit<YoinksLogEvent, "timestamp">): Promis
     timestamp: now.toISOString(),
     level: event.level,
     event: safeText(event.event, 120),
-    taskId: event.taskId,
+    taskId: event.taskId ? safeText(event.taskId, 160) : undefined,
     details: sanitizeDetails(event.details),
   }
   await enqueueLogWrite(async () => {

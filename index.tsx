@@ -23,6 +23,7 @@ import {
 import {
   consumeSkippedClipboardURL,
   rememberSkippedClipboardURL,
+  shouldInspectLaunchClipboard,
 } from "./services/launch-clipboard"
 import {
   clearLogs,
@@ -94,6 +95,17 @@ import {
   type HistoryStorageSummary,
 } from "./services/history"
 import {
+  candidateDetailValue,
+  clearMediaCandidates,
+  filterMediaCandidates,
+  listMediaCandidates,
+  rememberMediaCandidate,
+  safariCandidateNeedsTitleAlignment,
+  safariManifestNeedsTitleAlignment,
+  type MediaCandidate,
+  type MediaCandidateFilter,
+} from "./services/media-candidates"
+import {
   listRecentLinks,
   rememberRecentLink,
   type RecentLinkRecord,
@@ -126,9 +138,13 @@ import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-
 import {
   clearSafariMediaCandidates,
   isLikelyHLSAudioRendition,
+  readSafariMediaCandidateDiagnostic,
   readSafariMediaCandidates,
+  safariCandidateContainerHint,
+  safariCandidateQualityHint,
   safariCandidateSummary,
   safariPageReferer,
+  type SafariMediaCandidate,
 } from "./services/safari-media-candidates"
 import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
@@ -374,6 +390,9 @@ function View() {
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const probeAuthorizedPlatformRef = useRef<AuthPlatform | null>(null)
   const [importedCookieActive, setImportedCookieActive] = useState<boolean>(Boolean(getImportedCookiePath()))
+   const [mediaCandidates, setMediaCandidates] = useState<MediaCandidate[]>(() => listMediaCandidates())
+  const [mediaCandidateFilter, setMediaCandidateFilter] = useState<MediaCandidateFilter>("all")
+   const [showAllMediaCandidates, setShowAllMediaCandidates] = useState(false)
   const launchClipboardCheckedRef = useRef(false)
   const closingRef = useRef(false)
   const analysisGenerationRef = useRef(0)
@@ -383,7 +402,10 @@ function View() {
    const safariCandidateURLRef = useRef<string | null>(null)
    /** Safari 公开页面 URL；仅本次探测/下载作 Referer，绝不持久化或导入 Cookie。 */
    const safariCandidateRefererRef = useRef<string | null>(null)
-  const previewPlayerRef = useRef<HLSPlayerService | DashPlayerService | null>(null)
+  const safariCandidateMediaKindRef = useRef<"video" | "audio" | null>(null)
+   /** Safari 候选页面标题；仅直链回退时替代无元数据 URL 的退化标题。 */
+   const safariCandidateTitleRef = useRef<string | null>(null)
+   const previewPlayerRef = useRef<HLSPlayerService | DashPlayerService | null>(null)
   /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
   const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
 
@@ -569,20 +591,40 @@ function View() {
     return session
   }
 
-  const probeWithPlatformSession = async (sourceURL: string, session: PlatformAuthSession | null, referer?: string): Promise<MediaProbe> => {
+  const probeWithPlatformSession = async (sourceURL: string, session: PlatformAuthSession | null, referer?: string, safariMediaKind?: "video" | "audio", skipPublicPlayerFallback = false): Promise<MediaProbe> => {
     let cookieFile: string | null = null
     try {
       // 仅在调用方明确选择登录会话时使用 Cookie；匿名探测不能被全局导入 Cookie 隐式改变。
       const imported = session ? getImportedCookiePath() : null
       if (imported) cookieFile = imported
       else if (session) cookieFile = await createTaskCookieFile(session)
-      return await probeMedia(sourceURL, { cookieFile: cookieFile || undefined, authorizedPlatform: session?.platform, referer })
+      return await probeMedia(sourceURL, { cookieFile: cookieFile || undefined, authorizedPlatform: session?.platform, referer, safariMediaKind, skipPublicPlayerFallback })
     } finally {
       if (cookieFile && session && !getImportedCookiePath()) await FileManager.remove(cookieFile).catch(() => {})
     }
   }
 
-  const analyzeMedia = async (nextURL?: string, autoDownloadRequested = false): Promise<boolean | undefined> => {
+  const preflightDiscoverItem = async (sourceURL: string): Promise<{ probe: MediaProbe; probeAuthorizedPlatform?: AuthPlatform }> => {
+    const platform = detectMediaPlatform(sourceURL)
+    const anonymousFirst = platform === "youtube" || platform === "douyin"
+    let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+    try {
+      return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session?.platform }
+    } catch (firstError) {
+      const message = firstError instanceof Error ? firstError.message : String(firstError)
+      if (platform === "youtube" && isFreshCookieError(message)) {
+        session = await sessionForPlatform("youtube")
+        if (session) return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session.platform }
+        throw new Error("该视频需要 YouTube 会员登录；请先通过单链流程登录后再重试")
+      }
+      if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(message)) {
+        throw new Error(`需先登录${authPlatformLabel(platform)}（设置或单链流程）后再重试`)
+      }
+      throw firstError
+    }
+  }
+
+  const analyzeMedia = async (nextURL?: string, autoDownloadRequested = false, skipPublicPlayerFallback = false): Promise<boolean | undefined> => {
     let analysisCompleted = false
     const gen = ++analysisGenerationRef.current
     const sourceURL = extractFirstURL(nextURL || url)
@@ -608,7 +650,9 @@ function View() {
     setCompletedSaveMode(null)
     setProgress({ fraction: 0.02, stage: "正在解析媒体" })
     const platform = detectMediaPlatform(sourceURL)
-    const safariReferer = sourceURL === safariCandidateURLRef.current ? safariCandidateRefererRef.current || undefined : undefined
+    const isSafariCandidate = sourceURL === safariCandidateURLRef.current
+    const safariReferer = isSafariCandidate ? safariCandidateRefererRef.current || undefined : undefined
+    const safariMediaKind = isSafariCandidate ? safariCandidateMediaKindRef.current || undefined : undefined
     setStatus(platform === "douyin" ? "正在通过匿名 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
 
     try {
@@ -617,7 +661,7 @@ function View() {
       let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       let probeResult: MediaProbe
       try {
-        probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer)
+        probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
       } catch (firstError) {
         if (gen !== analysisGenerationRef.current) return
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
@@ -641,13 +685,17 @@ function View() {
           }
           session = loggedIn
           setStatus("登录完成，正在重新探测……")
-          probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer)
+          probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
         } else {
           throw firstError
         }
       }
       if (gen !== analysisGenerationRef.current) return
       probeAuthorizedPlatformRef.current = session?.platform || null
+      // Safari 来源页失败后会退回实际直链；该直链通常只有随机 path，不能作为用户可见标题或文件名。
+      if (safariMediaKind && safariCandidateTitleRef.current) {
+        probeResult = { ...probeResult, title: safariCandidateTitleRef.current }
+      }
       setProbe(probeResult)
       // Only X bare status URLs are intentionally pinned to /video/N during probe.
       // Do not replace direct Safari HLS manifest URLs with yt-dlp's derived webpage URL.
@@ -695,6 +743,64 @@ function View() {
     }
     return analysisCompleted
   }
+
+  // The only automatic-download entry: inspect the launch clipboard once while the
+  // Download tab is idle. Manual paste, typed links and Safari candidates call
+  // analyzeMedia without the automatic flag.
+  useEffect(() => {
+    void (async () => {
+      const inspection = {
+        checked: launchClipboardCheckedRef.current,
+        suppressed: launchClipboardSuppressedRef.current,
+        hasURL: Boolean(extractFirstURL(url)),
+        analyzing: analysisBusyRef.current,
+        downloading,
+        batchRunning: batchQueueRef.current.running,
+      }
+      if (!shouldInspectLaunchClipboard(inspection)) {
+        if (inspection.checked || inspection.suppressed || inspection.hasURL) {
+          await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { reason: inspection.checked ? "already-checked" : inspection.suppressed ? "suppressed" : "existing-url" } })
+        }
+        return
+      }
+      launchClipboardCheckedRef.current = true
+      await logEvent({ level: "info", event: "clipboard-launch.checked", details: {} })
+      let clip = ""
+      try {
+        clip = (await Pasteboard.getString()) || ""
+      } catch (error) {
+        await logEvent({ level: "info", event: "clipboard-launch.read-failed", details: { message: error instanceof Error ? error.message : String(error) } })
+        return
+      }
+      if (!clip.trim()) {
+        await logEvent({ level: "info", event: "clipboard-launch.empty", details: {} })
+        return
+      }
+      const valid = extractFirstURL(clip)
+      if (!valid) {
+        await logEvent({ level: "info", event: "clipboard-launch.invalid", details: {} })
+        return
+      }
+      if (consumeSkippedClipboardURL(valid)) {
+        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { reason: "previously-dismissed" } })
+        return
+      }
+      if (analysisBusyRef.current || batchQueueRef.current.running) {
+        await logEvent({ level: "info", event: "clipboard-launch.skipped", details: { reason: "became-busy" } })
+        return
+      }
+      safariCandidateURLRef.current = null
+      safariCandidateRefererRef.current = null
+      setURL(valid)
+      setProbe(null)
+      setSelectedChoice(null)
+      setResult(null)
+      setCompletedSaveMode(null)
+      setStatus("正在分析启动时剪贴板中的链接。")
+      await logEvent({ level: "info", event: "clipboard-launch.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
+      await analyzeMedia(valid, true)
+    })()
+  }, [])
 
   const stopAnalysis = async () => {
     if (!analyzing || !analysisBusyRef.current) return
@@ -837,6 +943,10 @@ function View() {
     setStatus(preserveResult ? "下载完成，当前链接已清除。" : "当前链接已清除。")
   }
 
+  useEffect(() => {
+    setShowAllMediaCandidates(false)
+  }, [mediaCandidates])
+
   const closeYoinks = () => {
     closingRef.current = true
     const current = extractFirstURL(url)
@@ -863,17 +973,65 @@ function View() {
     await analyzeMedia(record.url)
   }
 
-  const importSafariMediaCandidate = async () => {
-    if (analyzing || downloading || batchQueueRef.current.running) return
-    const envelope = await readSafariMediaCandidates()
-    if (!envelope) {
-      setStatus("Safari 暂无可导入的媒体候选。请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。")
+  const analyzeSafariCandidate = async (candidate: SafariMediaCandidate) => {
+    launchClipboardSuppressedRef.current = false
+    analysisGenerationRef.current += 1
+    disposeTemporarySession()
+    const preferPageFormats = candidate.kind === "video" || candidate.kind === "audio"
+    const analysisURL = preferPageFormats ? candidate.pageURL : candidate.url
+    safariCandidateURLRef.current = analysisURL
+    safariCandidateRefererRef.current = preferPageFormats ? null : safariPageReferer(candidate.pageURL) || null
+    const alignManifestTitle = safariManifestNeedsTitleAlignment(candidate.kind, candidate.pageTitle)
+    safariCandidateMediaKindRef.current = preferPageFormats ? null : alignManifestTitle ? "video" : candidate.kind === "video" || candidate.kind === "audio" ? candidate.kind : null
+    safariCandidateTitleRef.current = candidate.pageTitle || null
+    setURL(analysisURL)
+    setProbe(null)
+    setSelectedChoice(null)
+    setResult(null)
+    setCompletedSaveMode(null)
+    activeTab.setValue(DOWNLOAD_TAB)
+    setMediaCandidates(rememberMediaCandidate({ source: "safari", url: candidate.url, pageURL: candidate.pageURL, title: candidate.pageTitle, kind: candidate.kind === "inferred" ? "page" : candidate.kind, captureSource: candidate.captureSource, qualityHint: safariCandidateQualityHint(candidate) || undefined, containerHint: safariCandidateContainerHint(candidate) }))
+    await logEvent({ level: "info", event: "safari-candidate.imported", details: { candidateURL: candidate.url, pageURL: candidate.pageURL, analysisURL, kind: candidate.kind, strategy: preferPageFormats ? "page-formats-first" : "candidate-direct", safariRefererApplied: Boolean(safariCandidateRefererRef.current) } })
+    setStatus(preferPageFormats ? "正在进入 Safari 来源视频页获取可选格式。" : "正在分析 Safari 导入的媒体链接。")
+    const analyzed = await analyzeMedia(analysisURL, false, preferPageFormats)
+    if (analyzed || !preferPageFormats) {
+      if (analyzed) await clearSafariMediaCandidates()
       return
     }
+    safariCandidateURLRef.current = candidate.url
+    safariCandidateRefererRef.current = safariPageReferer(candidate.pageURL) || null
+    safariCandidateMediaKindRef.current = candidate.kind === "video" || candidate.kind === "audio" ? candidate.kind : null
+    setURL(candidate.url)
+    setStatus("来源页未返回格式，正在回退至 Safari 采集的直接媒体资源。")
+    await logEvent({ level: "warn", event: "safari-candidate.page-probe.fallback", details: { candidateURL: candidate.url, pageURL: candidate.pageURL, kind: candidate.kind } })
+    if (await analyzeMedia(candidate.url)) await clearSafariMediaCandidates()
+  }
+
+  const importSafariMediaCandidate = async () => {
+    if (analyzing || downloading || batchQueueRef.current.running) return
+    const [envelope, diagnostic] = await Promise.all([readSafariMediaCandidates(), readSafariMediaCandidateDiagnostic()])
+    if (!envelope) {
+      const summary = diagnostic ? `最近采集：候选 ${diagnostic.candidateCount}，媒体类资源 ${diagnostic.mediaLikeResourceCount}，iframe ${diagnostic.iframeCount}。` : ""
+      setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
+      return
+    }
+    for (const candidate of envelope.candidates) {
+      rememberMediaCandidate({
+        source: "safari",
+        url: candidate.url,
+        pageURL: candidate.pageURL,
+        title: candidate.pageTitle,
+        kind: candidate.kind === "inferred" ? "page" : candidate.kind,
+        captureSource: candidate.captureSource,
+        qualityHint: safariCandidateQualityHint(candidate) || undefined,
+        containerHint: safariCandidateContainerHint(candidate),
+      })
+    }
+    setMediaCandidates(listMediaCandidates())
     const actions = envelope.candidates.map((candidate) => ({ label: safariCandidateSummary(candidate) }))
     const selected = await Dialog.actionSheet({
       title: "Safari 媒体候选",
-      message: `${envelope.pageTitle || "当前页面"} · ${new Date(envelope.capturedAt).toLocaleString()}\n仅导入公开 URL，不包含 Cookie、授权或请求头。`,
+      message: `${envelope.pageTitle || "当前页面"} · ${new Date(envelope.capturedAt).toLocaleString()}\n${diagnostic ? `诊断：候选 ${diagnostic.candidateCount} · 媒体类资源 ${diagnostic.mediaLikeResourceCount} · iframe ${diagnostic.iframeCount} · 资源域名 ${diagnostic.resourceHostCount}\n` : ""}优先选择“推荐 · 自适应”HLS/DASH；标注“备用直链”的 MP4 仅包含其固定画质。\n仅导入公开 URL，不包含 Cookie、授权或请求头。`, 
       actions,
       cancelButton: true,
     })
@@ -887,21 +1045,7 @@ function View() {
       cancelLabel: "取消",
     })
     if (!confirmed) return
-    launchClipboardSuppressedRef.current = false
-    analysisGenerationRef.current += 1
-    disposeTemporarySession()
-    safariCandidateURLRef.current = candidate.url
-    safariCandidateRefererRef.current = safariPageReferer(candidate.pageURL) || null
-    setURL(candidate.url)
-    setProbe(null)
-    setSelectedChoice(null)
-    setResult(null)
-    setCompletedSaveMode(null)
-    activeTab.setValue(DOWNLOAD_TAB)
-    await logEvent({ level: "info", event: "safari-candidate.imported", details: { candidateURL: candidate.url, pageURL: candidate.pageURL, kind: candidate.kind, safariRefererApplied: Boolean(safariCandidateRefererRef.current) } })
-    setStatus("正在分析 Safari 导入的媒体链接。")
-    // 探测失败时保留 Safari 槽位，让用户可重试或改选其它候选。
-    if (await analyzeMedia(candidate.url)) await clearSafariMediaCandidates()
+    await analyzeSafariCandidate(candidate)
   }
 
   const chooseRecentLink = async () => {
@@ -1014,6 +1158,10 @@ function View() {
     launchClipboardSuppressedRef.current = false
     analysisGenerationRef.current += 1
     safariCandidateURLRef.current = null
+    safariCandidateRefererRef.current = null
+    safariCandidateMediaKindRef.current = null
+       safariCandidateTitleRef.current = null
+    setMediaCandidates(rememberMediaCandidate({ source: "manual", url: valid, kind: "page" }))
     await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
     setURL(valid)
     setProbe(null)
@@ -1021,7 +1169,7 @@ function View() {
     setResult(null)
     setCompletedSaveMode(null)
     setStatus("正在分析链接。")
-    await analyzeMedia(valid, true)
+    await analyzeMedia(valid)
   }
 
   const enterURL = async () => {
@@ -1037,6 +1185,10 @@ function View() {
     launchClipboardSuppressedRef.current = false
     analysisGenerationRef.current += 1
     safariCandidateURLRef.current = null
+    safariCandidateRefererRef.current = null
+    safariCandidateMediaKindRef.current = null
+       safariCandidateTitleRef.current = null
+    setMediaCandidates(rememberMediaCandidate({ source: "manual", url: valid, kind: "page" }))
     await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
     setURL(valid)
     setProbe(null)
@@ -1100,9 +1252,33 @@ function View() {
     setStatus(`${notes.join(" · ")}。共 ${result.state.items.length} 条，可点「开始批量下载」。`)
   }
 
-  const handleDiscoverEnqueue = (urls: string[]) => {
-    const result = enqueueURLs(batchQueueRef.current, urls, BATCH_ADD_MAX)
+  const handleDiscoverEnqueue = async (items: Array<{ url: string; title?: string }>) => {
+    const resolved: Array<{ url: string; title?: string; probe: MediaProbe; probeAuthorizedPlatform?: AuthPlatform }> = []
+    let failed = 0
+    for (const item of items) {
+      try {
+        const preflight = await preflightDiscoverItem(item.url)
+        resolved.push({
+          url: item.url,
+          title: preflight.probe.title || item.title,
+          probe: preflight.probe,
+          probeAuthorizedPlatform: preflight.probeAuthorizedPlatform,
+        })
+      } catch (error) {
+        failed += 1
+        await logEvent({ level: "warn", event: "discover.enqueue.probe.failed", details: { sourceURL: item.url, message: error instanceof Error ? error.message : String(error) } })
+      }
+    }
+    const result = enqueueURLs(batchQueueRef.current, resolved, BATCH_ADD_MAX)
     setBatchQueueSynced(result.state)
+    if (result.added > 0) {
+      let candidates = mediaCandidates
+      const addedURLs = new Set(result.addedSourceURLs)
+      for (const item of resolved) {
+        if (addedURLs.has(item.url)) candidates = rememberMediaCandidate({ source: "discover", url: item.url, title: item.title, kind: "page" })
+      }
+      setMediaCandidates(candidates)
+    }
     void logEvent({
       level: "info",
       event: "discover.enqueue",
@@ -1114,7 +1290,8 @@ function View() {
         queueSize: result.state.items.length,
       },
     })
-    return result
+    if (failed) setStatus(`已加入 ${result.added} 条；${failed} 条无法解析，未加入队列。`)
+    return failed ? { ...result, rejectedProbe: failed } : result
   }
 
   /** Queue-local: paste clipboard URLs into batch with no confirm dialogs. */
@@ -1417,7 +1594,27 @@ function View() {
 
         let probeResult: MediaProbe
         let probeSession: PlatformAuthSession | null = null
-        try {
+        if (item.probe) {
+          probeResult = item.probe
+          if (item.probeAuthorizedPlatform) {
+            try {
+              probeSession = await sessionForPlatform(item.probeAuthorizedPlatform)
+            } catch (error) {
+              fail += 1
+              const message = error instanceof Error ? error.message : String(error)
+              patchBatchItem(item.id, { status: "failed", errorMessage: `登录状态已失效，请重新登录后重试：${message}`.slice(0, 200) })
+              await logEvent({ level: "warn", event: "batch.item.failed", details: { itemId: item.id, reason: "authorized-session-unavailable", platform: item.probeAuthorizedPlatform } })
+              continue
+            }
+            if (!probeSession) {
+              fail += 1
+              patchBatchItem(item.id, { status: "failed", errorMessage: `登录状态已失效，请重新登录${authPlatformLabel(item.probeAuthorizedPlatform)}后重试` })
+              await logEvent({ level: "warn", event: "batch.item.failed", details: { itemId: item.id, reason: "authorized-session-missing", platform: item.probeAuthorizedPlatform } })
+              continue
+            }
+          }
+          await logEvent({ level: "info", event: "batch.item.probe.reused", details: { itemId: item.id, title: probeResult.title, choiceCount: probeResult.choices.length, authorizedPlatform: item.probeAuthorizedPlatform } })
+        } else try {
           // YouTube batch items probe anonymously first; only access-restricted items use an existing session.
           const anonymousFirst = platform === "youtube" || platform === "douyin"
           const session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
@@ -1549,6 +1746,7 @@ function View() {
                 setCancelPath(path)
               },
               authorizedPlatform: session?.platform,
+              outputTitle: probeResult.title || item.title,
             })
           } finally {
             if (cookieFile && !getImportedCookiePath()) await FileManager.remove(cookieFile).catch(() => {})
@@ -1759,6 +1957,7 @@ function View() {
         onCancelPath: (path: string) => setCancelPath(path),
         authorizedPlatform: session?.platform,
         referer: validURL === safariCandidateURLRef.current ? safariCandidateRefererRef.current || undefined : undefined,
+        outputTitle: automatic?.probeTitle || probe?.title,
       })
       setDownloading(false)
       setCancelPath(null)
@@ -1990,6 +2189,15 @@ function DownloadView() {
           {url ? <Button title={analysisDraining ? "正在停止分析……" : analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || analysisDraining || downloading || batchQueue.running} /> : null}
           {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || analysisDraining || downloading || batchQueue.running} /> : null}
         </Section>
+
+        {mediaCandidates.length ? <Section title="最近候选库">
+          <Button title={`筛选：${mediaCandidateFilter === "all" ? "全部" : mediaCandidateFilter === "recommended" ? "推荐" : mediaCandidateFilter.toUpperCase()}`} systemImage="line.3.horizontal.decrease.circle" action={() => void (async () => { const filters: MediaCandidateFilter[] = ["all", "recommended", "hls", "dash", "video", "audio", "page"]; const selected = await Dialog.actionSheet({ title: "筛选候选", actions: filters.map(filter => ({ label: filter === "all" ? "全部" : filter === "recommended" ? "推荐" : filter.toUpperCase() })), cancelButton: true }); if (selected != null) setMediaCandidateFilter(filters[selected]) })()} disabled={analyzing || downloading} />
+          <Button title="读取 Safari 最新采集" systemImage="arrow.clockwise" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
+          <Button title="清空候选" systemImage="trash" role="destructive" action={() => void (async () => { if (await Dialog.confirm({ title: "清空最近候选", message: "这不会删除下载记录或文件。", confirmLabel: "清空", cancelLabel: "取消" })) { clearMediaCandidates(); setMediaCandidates([]) } })()} disabled={analyzing || downloading} />
+          {(showAllMediaCandidates ? filterMediaCandidates(mediaCandidates, mediaCandidateFilter) : filterMediaCandidates(mediaCandidates, mediaCandidateFilter).slice(0, 3)).map((candidate) => <Button key={candidate.id} title={`${candidate.source === "safari" ? "Safari" : candidate.source === "discover" ? "发现" : "手动"} · ${candidate.kind || "页面"} · ${candidate.qualityHint || candidate.containerHint || candidate.title || new URL(candidate.url).host}`} systemImage="info.circle" action={() => void (async () => { const safariOnly = candidate.source === "safari"; const confirmed = await Dialog.confirm({ title: candidate.title || new URL(candidate.url).host, message: `类型：${candidate.kind || "未知"}\n采集来源：${candidate.captureSource || (safariOnly ? "未知" : "不适用")}\n质量：${candidateDetailValue(candidate.qualityHint, safariOnly)}\n容器：${candidateDetailValue(candidate.containerHint, safariOnly)}\n编码/音轨/大小：${candidateDetailValue(undefined, safariOnly)}\n\n仅在确认后分析此候选。`, confirmLabel: "导入并分析", cancelLabel: "取消" }); if (!confirmed) return; if (safariOnly && candidate.pageURL && candidate.kind && candidate.kind !== "page") { await analyzeSafariCandidate({ id: candidate.id, url: candidate.url, kind: candidate.kind, pageURL: candidate.pageURL, pageTitle: candidate.title, discoveredAt: candidate.createdAt, captureSource: candidate.captureSource }); return } safariCandidateURLRef.current = safariOnly ? candidate.url : null; safariCandidateRefererRef.current = safariOnly ? safariPageReferer(candidate.pageURL) || null : null; safariCandidateMediaKindRef.current = safariCandidateNeedsTitleAlignment(candidate) ? "video" : null; safariCandidateTitleRef.current = safariCandidateNeedsTitleAlignment(candidate) ? candidate.title || null : null; setURL(candidate.url); setProbe(null); setSelectedChoice(null); setStatus("正在分析候选库项目。"); await analyzeMedia(candidate.url) })()} disabled={analyzing || downloading || batchQueue.running} />)}
+           {!showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title={`展开其他 ${filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length - 3} 条`} systemImage="chevron.down" action={() => setShowAllMediaCandidates(true)} disabled={analyzing || downloading} /> : null}
+           {showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title="收起较早候选" systemImage="chevron.up" action={() => setShowAllMediaCandidates(false)} disabled={analyzing || downloading} /> : null}
+         </Section> : null}
 
         <Section title="格式">
           {!probe ? <Text foregroundStyle="secondaryLabel">添加链接后将自动识别可下载格式。</Text> : (

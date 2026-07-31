@@ -1,5 +1,5 @@
 import { Script } from "scripting"
-import { redactURL, safeText, summarizeOutput } from "./services/logs"
+import { redactURL, safeText, shouldPersist, summarizeOutput } from "./services/logs"
 
 const signedURL = "https://cdn.example.com/video.mp4?token=secret&expires=123"
 const sanitized = safeText(`failed: ${signedURL} and https://example.com/page?session=private`)
@@ -17,6 +17,11 @@ const checks: Array<[string, boolean]> = [
   ["preserves UTF-8 path text", redactURL("https://example.com/中文?token=secret") === "https://example.com/中文?[redacted]"],
   ["summarizeOutput drops host noise", !summarizeOutput(noisy).includes("Script window host view deinit")],
   ["summarizeOutput keeps ERROR lines", /Unsupported URL/.test(summarizeOutput(noisy)) && /HTTP Error 403/.test(summarizeOutput(noisy))],
+  ["persists launch clipboard acceptance", shouldPersist({ timestamp: "", level: "info", event: "clipboard-launch.accepted" })],
+  ["persists automatic download selection", shouldPersist({ timestamp: "", level: "info", event: "auto-download.selected" })],
+  ["persists Safari candidate import", shouldPersist({ timestamp: "", level: "info", event: "safari-candidate.imported" })],
+  ["persists Safari page probe fallback", shouldPersist({ timestamp: "", level: "info", event: "safari-candidate.page-probe.fallback" })],
+  ["persists direct media fallback", shouldPersist({ timestamp: "", level: "info", event: "probe.direct-media.fallback" })],
 ]
 
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name)

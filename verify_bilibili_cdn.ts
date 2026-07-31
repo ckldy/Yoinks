@@ -43,11 +43,17 @@ async function runTests() {
   assert(isBilibiliCdnUrl(mcdnUrl), "识别 mcdn bilivideo.cn URL")
   const rewritten = rewriteBilibiliCdnUrl(mcdnUrl)
   assert(
-    rewritten.startsWith(`https://${BILIBILI_CORS_FREE_HOST}/upgcxcode/`),
-    "mcdn URL host 被重写并去掉非标准端口"
+    rewritten === mcdnUrl,
+    "mcdn 边缘 URL 保持原 host、端口与签名参数"
   )
-  assert(!rewritten.includes(":4483"), "非标准端口被移除")
-  assert(rewritten.includes("deadline="), "查询参数被保留")
+
+  // COS 签名 URL 的 upsig 与原 host 绑定，改写到 HW mirror 会导致 403。
+  const cosSignedUrl =
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/zz/zz/zz-zz.m4s?og=cos&os=cosbv&upsig=signature"
+  assert(
+    rewriteBilibiliCdnUrl(cosSignedUrl) === cosSignedUrl,
+    "COS 签名 mirror URL 保持原 host"
+  )
 
   // Non-Bilibili URL unchanged
   const other = "https://example.com/video.mp4"
