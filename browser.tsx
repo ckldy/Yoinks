@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Yoinks
 // @namespace https://github.com/ckldy/Yoinks
-// @version 1.1.1
+// @version 1.1.2
 // @description Collect public media candidates from the current page for Yoinks.
 // @match http://*/*
 // @match https://*/*
@@ -32,6 +32,9 @@ const REPORT_STORAGE_KEY = "yoinks-media-candidates-frame-report-v1"
 const ALWAYS_SHOW_FLOATING_ENTRY_KEY = "yoinks-floating-entry-always-visible-v1"
 const FLOATING_ENTRY_ID = "yoinks-media-candidate-entry"
 const FLOATING_ENTRY_LONG_PRESS_MS = 700
+const FLOATING_ENTRY_POSITION_KEY = "yoinks-floating-entry-position-v1"
+const FLOATING_ENTRY_DRAG_THRESHOLD_PX = 8
+const FLOATING_ENTRY_EDGE_MARGIN_PX = 12
 const CAPTURE_DELAY_MS = 1500
 const SESSION_WAIT_MS = 2600
 const SESSION_TTL_MS = 8000
@@ -122,21 +125,93 @@ async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: bool
     await GM.setValue(SESSION_STORAGE_KEY, null)
   }
 }
-function showFloatingFeedback(entry: any, text: string): void { const feedback = document.createElement("span"); feedback.className = "yoinks-media-candidate-feedback"; feedback.textContent = text; entry.appendChild(feedback); setTimeout(() => feedback.remove(), 2200) }
-function installFloatingEntry(alwaysVisible: boolean): void {
+function safeAreaInset(): { top: number; left: number; right: number; bottom: number } {
+  const probe = document.createElement("div")
+  probe.style.cssText = "position: fixed; top: env(safe-area-inset-top); left: env(safe-area-inset-left); right: env(safe-area-inset-right); bottom: env(safe-area-inset-bottom); visibility: hidden; pointer-events: none;"
+  document.documentElement.appendChild(probe)
+  const styles = window.getComputedStyle(probe)
+  const read = (value: string): number => { const parsed = parseFloat(value); return Number.isFinite(parsed) ? parsed : 0 }
+  const inset = { top: read(styles.top), left: read(styles.left), right: read(styles.right), bottom: read(styles.bottom) }
+  probe.remove()
+  return inset
+}
+function clamp(value: number, min: number, max: number): number { return Math.max(min, Math.min(max, value)) }
+function showFloatingFeedback(entry: any, text: string): void {
+  const feedback = document.createElement("span")
+  feedback.className = "yoinks-media-candidate-feedback"
+  feedback.textContent = text
+  entry.appendChild(feedback)
+  if (entry.getBoundingClientRect().left < 140) { feedback.style.right = "auto"; feedback.style.left = "56px" }
+  setTimeout(() => feedback.remove(), 2200)
+}
+async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
   if (!isTopLevel() || document.getElementById(FLOATING_ENTRY_ID)) return
-  GM.addStyle(`#${FLOATING_ENTRY_ID} { position: fixed; z-index: 2147483647; right: max(16px, env(safe-area-inset-right)); bottom: max(96px, calc(env(safe-area-inset-bottom) + 72px)); width: 48px; height: 48px; border: 0; border-radius: 24px; background: #34c759; color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.25); display: grid; place-items: center; padding: 0; font: 700 23px -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; touch-action: manipulation; } #${FLOATING_ENTRY_ID}:active { transform: scale(.94); } #${FLOATING_ENTRY_ID} .yoinks-media-candidate-feedback { position: absolute; right: 56px; white-space: nowrap; background: rgba(28,28,30,.92); color: #fff; border-radius: 10px; padding: 7px 10px; font: 13px -apple-system, BlinkMacSystemFont, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,.2); }`)
+  const savedPosition = await GM.getValue(FLOATING_ENTRY_POSITION_KEY, null)
+  GM.addStyle(`#${FLOATING_ENTRY_ID} { position: fixed; z-index: 2147483647; right: max(16px, env(safe-area-inset-right)); bottom: max(96px, calc(env(safe-area-inset-bottom) + 72px)); width: 48px; height: 48px; border: 0; border-radius: 24px; background: #34c759; color: #fff; box-shadow: 0 6px 18px rgba(0,0,0,.25); display: grid; place-items: center; padding: 0; font: 700 23px -apple-system, BlinkMacSystemFont, sans-serif; -webkit-tap-highlight-color: transparent; touch-action: none; -webkit-user-select: none; user-select: none; cursor: grab; } #${FLOATING_ENTRY_ID}:active { transform: scale(.94); } #${FLOATING_ENTRY_ID}.yoinks-media-candidate-dragging { cursor: grabbing; transform: scale(1.08); box-shadow: 0 12px 28px rgba(0,0,0,.38); } #${FLOATING_ENTRY_ID} .yoinks-media-candidate-feedback { position: absolute; right: 56px; white-space: nowrap; background: rgba(28,28,30,.92); color: #fff; border-radius: 10px; padding: 7px 10px; font: 13px -apple-system, BlinkMacSystemFont, sans-serif; box-shadow: 0 4px 12px rgba(0,0,0,.2); }`)
   const entry = document.createElement("button"); entry.id = FLOATING_ENTRY_ID; entry.type = "button"; entry.title = "采集媒体候选到 Yoinks"; entry.setAttribute("aria-label", "采集媒体候选到 Yoinks"); entry.textContent = "↓"
+  if (savedPosition && typeof savedPosition.x === "number" && typeof savedPosition.y === "number") {
+    const inset = safeAreaInset()
+    entry.style.right = "auto"; entry.style.bottom = "auto"
+    entry.style.left = `${clamp(savedPosition.x, inset.left, Math.max(inset.left, window.innerWidth - 48 - inset.right))}px`
+    entry.style.top = `${clamp(savedPosition.y, inset.top, Math.max(inset.top, window.innerHeight - 48 - inset.bottom))}px`
+  }
   let longPressTimer: any = null, longPressTriggered = false
+  let dragState: { startX: number; startY: number; offsetX: number; offsetY: number; left: number; top: number } | null = null
+  let dragging = false, suppressClick = false
   const clearLongPress = () => { if (longPressTimer) clearTimeout(longPressTimer); longPressTimer = null }
-  entry.addEventListener("pointerdown", () => { longPressTriggered = false; if (!alwaysVisible) longPressTimer = setTimeout(() => { longPressTriggered = true; entry.remove() }, FLOATING_ENTRY_LONG_PRESS_MS) })
-  entry.addEventListener("pointerup", clearLongPress); entry.addEventListener("pointercancel", clearLongPress); entry.addEventListener("pointerleave", clearLongPress)
-  entry.addEventListener("click", async () => { clearLongPress(); if (longPressTriggered) return; entry.disabled = true; try { showFloatingFeedback(entry, "正在等待媒体地址…"); const result = await captureCurrentPage(); showFloatingFeedback(entry, result.count ? `已捕获 ${result.count} 个候选` : result.hasFrameClue ? "已获取链接信息，需要解析！" : "未捕获到媒体链接") } catch { showFloatingFeedback(entry, "采集失败") } finally { entry.disabled = false } })
+  entry.addEventListener("pointerdown", (event: any) => {
+    longPressTriggered = false; suppressClick = false; dragging = false
+    const rect = entry.getBoundingClientRect()
+    dragState = { startX: event.clientX, startY: event.clientY, offsetX: rect.left - event.clientX, offsetY: rect.top - event.clientY, left: rect.left, top: rect.top }
+    if (!alwaysVisible) longPressTimer = setTimeout(() => { longPressTriggered = true; entry.remove() }, FLOATING_ENTRY_LONG_PRESS_MS)
+  })
+  entry.addEventListener("pointermove", (event: any) => {
+    if (!dragState) return
+    if (!dragging && Math.hypot(event.clientX - dragState.startX, event.clientY - dragState.startY) > FLOATING_ENTRY_DRAG_THRESHOLD_PX) {
+      dragging = true; clearLongPress()
+      try { entry.setPointerCapture(event.pointerId) } catch {}
+      entry.classList.add("yoinks-media-candidate-dragging")
+      entry.style.right = "auto"; entry.style.bottom = "auto"
+      entry.style.left = `${dragState.left}px`; entry.style.top = `${dragState.top}px`
+    }
+    if (dragging) {
+      const inset = safeAreaInset()
+      entry.style.left = `${clamp(event.clientX + dragState.offsetX, inset.left, window.innerWidth - entry.offsetWidth - inset.right)}px`
+      entry.style.top = `${clamp(event.clientY + dragState.offsetY, inset.top, window.innerHeight - entry.offsetHeight - inset.bottom)}px`
+    }
+  })
+  const finishDrag = () => {
+    if (!dragging || !dragState) return
+    suppressClick = true
+    entry.classList.remove("yoinks-media-candidate-dragging")
+    const inset = safeAreaInset()
+    const width = entry.offsetWidth, height = entry.offsetHeight
+    const left = parseFloat(entry.style.left) || dragState.left
+    const top = clamp(parseFloat(entry.style.top) || dragState.top, inset.top, Math.max(inset.top, window.innerHeight - height - inset.bottom))
+    const snappedLeft = left + width / 2 < window.innerWidth / 2
+      ? Math.max(inset.left, FLOATING_ENTRY_EDGE_MARGIN_PX)
+      : Math.max(inset.left, Math.min(window.innerWidth - width - inset.right - FLOATING_ENTRY_EDGE_MARGIN_PX, window.innerWidth - width - inset.right))
+    entry.style.left = `${snappedLeft}px`; entry.style.top = `${top}px`
+    void GM.setValue(FLOATING_ENTRY_POSITION_KEY, { x: snappedLeft, y: top })
+  }
+  entry.addEventListener("pointerup", () => { clearLongPress(); finishDrag(); dragState = null; dragging = false })
+  entry.addEventListener("pointercancel", () => { clearLongPress(); finishDrag(); dragState = null; dragging = false })
+  entry.addEventListener("pointerleave", clearLongPress)
+  entry.addEventListener("click", async () => {
+    clearLongPress()
+    if (longPressTriggered || suppressClick) { suppressClick = false; return }
+    entry.disabled = true
+    try {
+      showFloatingFeedback(entry, "正在等待媒体地址…")
+      const result = await captureCurrentPage()
+      showFloatingFeedback(entry, result.count ? `已捕获 ${result.count} 个候选` : result.hasFrameClue ? "已获取链接信息，需要解析！" : "未捕获到媒体链接")
+    } catch { showFloatingFeedback(entry, "采集失败") } finally { entry.disabled = false }
+  })
   document.documentElement.appendChild(entry)
 }
 if (isTopLevel()) {
   GM.registerMenuCommand("导入本页媒体候选到 Yoinks", captureCurrentPage)
-  void (async () => { const alwaysVisible = await GM.getValue(ALWAYS_SHOW_FLOATING_ENTRY_KEY, true); GM.registerMenuCommand(`始终显示浮动入口：${alwaysVisible ? "开" : "关"}`, async () => { const next = !alwaysVisible; await GM.setValue(ALWAYS_SHOW_FLOATING_ENTRY_KEY, next); document.getElementById(FLOATING_ENTRY_ID)?.remove(); installFloatingEntry(next) }); installFloatingEntry(alwaysVisible) })()
+  void (async () => { const alwaysVisible = await GM.getValue(ALWAYS_SHOW_FLOATING_ENTRY_KEY, true); GM.registerMenuCommand(`始终显示浮动入口：${alwaysVisible ? "开" : "关"}`, async () => { const next = !alwaysVisible; await GM.setValue(ALWAYS_SHOW_FLOATING_ENTRY_KEY, next); document.getElementById(FLOATING_ENTRY_ID)?.remove(); await installFloatingEntry(next) }); await installFloatingEntry(alwaysVisible) })()
 } else {
   GM.addValueChangeListener(SESSION_STORAGE_KEY, (_: string, __: unknown, value: CaptureSession) => { void reportFrame(value) })
   void (async () => { const session = await GM.getValue(SESSION_STORAGE_KEY, null); if (validSession(session)) await reportFrame(session) })()
