@@ -1,6 +1,6 @@
 import { AbortController, Path, Script, fetch } from "scripting"
 import { createTaskId, logEvent } from "./logs"
-import { extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
+import { extractPublicPlayerFrameSources, extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
 import type { AuthPlatform } from "./platform-auth"
 import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
 import { cancelBackgroundDownloads, downloadURLToFileWithProgress } from "./background-download"
@@ -922,9 +922,18 @@ export type ProbeOptions = {
 const PUBLIC_PLAYER_PAGE_TIMEOUT_MS = 12_000
 const PUBLIC_PLAYER_MAX_HTML_BYTES = 1_500_000
 
-async function fetchPublicHTML(url: string): Promise<{ finalURL: string; contentType?: string; html: string; title?: string } | null> {
+/** 公开播放器单次 HTML/JSON 拉取允许的最长毫秒数；传入 deadline 时不超过其剩余时间。 */
+export function publicPlayerFetchTimeoutMilliseconds(deadline?: number): number {
+  const remainingMilliseconds = deadline ? Math.max(0, deadline - Date.now()) : PUBLIC_PLAYER_PAGE_TIMEOUT_MS
+  return Math.min(PUBLIC_PLAYER_PAGE_TIMEOUT_MS, remainingMilliseconds)
+}
+
+async function fetchPublicHTML(url: string, deadline?: number): Promise<{ finalURL: string; contentType?: string; html: string; title?: string } | null> {
+  // 公开 HTML 回退也必须计入 45 秒总预算，避免 yt-dlp 超时后再叠加页面+iframe 解析造成无界等待。
+  const timeoutMilliseconds = publicPlayerFetchTimeoutMilliseconds(deadline)
+  if (timeoutMilliseconds <= 0) return null
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), PUBLIC_PLAYER_PAGE_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds)
   try {
     const response = await fetch(url, { headers: { Accept: "text/html,application/xhtml+xml" }, signal: controller.signal })
     if (!response.ok) return null
@@ -962,9 +971,44 @@ function publicChoice(source: PublicPlayerSource): MediaChoice | null {
   }
 }
 
-async function probePublicPlayerSource(sourceURL: string, taskId: string): Promise<MediaProbe | null> {
-  await logEvent({ level: "info", event: "probe.public-player.started", taskId, details: { sourceURL } })
-  const extracted = await extractPublicPlayerSources({ pageURL: sourceURL, fetchHTML: fetchPublicHTML })
+export async function probeSafariPublicPlayerFrame(frameURL: string, pageTitle?: string): Promise<MediaProbe | null> {
+  const taskId = createTaskId()
+  const deadline = Date.now() + PUBLIC_PLAYER_PAGE_TIMEOUT_MS
+  let remainingBytes = PUBLIC_PLAYER_MAX_HTML_BYTES
+  const fetchText = async (url: string, accept: string): Promise<{ finalURL: string; contentType?: string; text: string } | null> => {
+    const remainingMilliseconds = deadline - Date.now()
+    if (remainingMilliseconds <= 0 || remainingBytes <= 0) return null
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), remainingMilliseconds)
+    try {
+      const response = await fetch(url, { headers: { Accept: accept }, signal: controller.signal })
+      if (!response.ok) return null
+      const contentLength = Number(response.headers.get("content-length") || 0)
+      if (Number.isFinite(contentLength) && contentLength > remainingBytes) return null
+      const text = await response.text()
+      const bytes = new TextEncoder().encode(text).length
+      if (bytes > remainingBytes) return null
+      remainingBytes -= bytes
+      return { finalURL: response.url || url, contentType: response.headers.get("content-type") || undefined, text }
+    } catch { return null } finally { clearTimeout(timeout) }
+  }
+  await logEvent({ level: "info", event: "safari-public-player.started", taskId, details: { hasFrame: true } })
+  let stage = "started"
+  const extracted = await extractPublicPlayerFrameSources({
+    frameURL,
+    pageTitle,
+    fetchText,
+    onStage: (value) => { stage = value },
+  })
+  const choices = extracted?.sources.map(publicChoice).filter((choice): choice is MediaChoice => Boolean(choice)) || []
+  await logEvent({ level: "info", event: "safari-public-player.completed", taskId, details: { hit: choices.length > 0, checkedIframes: extracted?.checkedIframes || 0, candidateCount: choices.length, stage } })
+  return choices.length ? { title: extracted?.title || pageTitle || "未命名媒体", webpageURL: frameURL, choices } : null
+}
+
+async function probePublicPlayerSource(sourceURL: string, taskId: string, deadline?: number): Promise<MediaProbe | null> {
+  await logEvent({ level: "info", event: "probe.public-player.started", taskId, details: { sourceURL, deadlineApplied: Boolean(deadline) } })
+  const fetchHTML = deadline ? (url: string) => fetchPublicHTML(url, deadline) : fetchPublicHTML
+  const extracted = await extractPublicPlayerSources({ pageURL: sourceURL, fetchHTML })
   if (!extracted) {
     await logEvent({ level: "info", event: "probe.public-player.completed", taskId, details: { hit: false, checkedIframes: 0 } })
     return null
@@ -1180,7 +1224,8 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   const tryPublicPlayerFallback = async (message: string): Promise<MediaProbe | null> => {
     if (options.skipPublicPlayerFallback) return null
     if (!isNoDownloadableFormatFailure(message) && !isProbeTimeoutFailure(message)) return null
-    return probePublicPlayerSource(sourceURL, taskId)
+    if (Date.now() >= deadline) return null
+    return probePublicPlayerSource(sourceURL, taskId, deadline)
   }
   const runProbe = async (insecure = false) => {
     const remainingMilliseconds = deadline - Date.now()
@@ -1250,7 +1295,11 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   }
 
 
-  if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
+  if (result.exitCode !== 0) {
+    const error = new Error(compactMessage(result.output || "媒体探测失败")) as Error & { rawOutput?: string }
+    error.rawOutput = result.output || ""
+    throw error
+  }
   let payload: Record<string, unknown>
   try {
     payload = parseLastJSON(result.output)
@@ -1260,7 +1309,11 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
     await logEvent({ level: "warn", event: "probe.output.retry", taskId, details: { delayMilliseconds: 0 } })
     result = await runProbe(insecure)
     await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output, afterOutputRetry: true, tlsInsecure: insecure } })
-    if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "媒体探测失败"))
+    if (result.exitCode !== 0) {
+      const error = new Error(compactMessage(result.output || "媒体探测失败")) as Error & { rawOutput?: string }
+      error.rawOutput = result.output || ""
+      throw error
+    }
     payload = parseLastJSON(result.output)
   }
   if (payload.ok !== true) throw new Error(compactMessage(stringValue(payload.error) || "媒体探测失败"))
@@ -1285,14 +1338,25 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   }).filter((item) => Boolean(item.formatId))
   const choices = buildChoices(formats)
   if (!choices.length) {
-    const directChoice = directMediaChoice(sourceURL, options.safariMediaKind)
-    if (directChoice) {
-      directChoice.previewReferer = referer
-      directChoice.previewHeaders = referer ? { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA } : undefined
-      choices.push(directChoice)
-      await logEvent({ level: "info", event: "probe.direct-media.fallback", taskId, details: { sourceURL, extension: extensionOf(sourceURL) || (options.safariMediaKind === "audio" ? ".m4a" : options.safariMediaKind === "video" ? ".mp4" : ""), knownSafariMediaKind: options.safariMediaKind || null, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
+    // An explicit Safari-captured HLS manifest that yt-dlp's generic probe returned with
+    // empty formats is still a valid HLS playlist. Keep it as a direct HLS choice instead
+    // of mis-treating the .m3u8 as a standalone media file (which fails instantly).
+    const safariHlsChoice = referer && isM3U8URL(sourceURL) ? hlsMediaChoice(sourceURL) : null
+    if (safariHlsChoice) {
+      safariHlsChoice.previewReferer = referer
+      safariHlsChoice.previewHeaders = referer ? { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA } : undefined
+      choices.push(safariHlsChoice)
+      await logEvent({ level: "warn", event: "probe.safari-hls.empty-formats-fallback", taskId, details: { sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
     } else {
-      throw new Error("未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）")
+      const directChoice = directMediaChoice(sourceURL, options.safariMediaKind)
+      if (directChoice) {
+        directChoice.previewReferer = referer
+        directChoice.previewHeaders = referer ? { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA } : undefined
+        choices.push(directChoice)
+        await logEvent({ level: "info", event: "probe.direct-media.fallback", taskId, details: { sourceURL, extension: extensionOf(sourceURL) || (options.safariMediaKind === "audio" ? ".m4a" : options.safariMediaKind === "video" ? ".mp4" : ""), knownSafariMediaKind: options.safariMediaKind || null, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
+      } else {
+        throw new Error("未找到可下载的视频格式（该帖可能是纯文字/图文，或需要登录后才能访问媒体）")
+      }
     }
   }
   // Prefer the probe-pinned X /video/N URL so download reuses a single-item page.
@@ -1309,12 +1373,15 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   return probe
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    const rawOutput = error instanceof Error ? (error as Error & { rawOutput?: string }).rawOutput || "" : ""
     // A Safari-captured HLS manifest is already an explicit user-selected media URL.
     // If yt-dlp's generic probe is rejected by Cloudflare or the CDN closes only its
     // Python connection, preserve that public manifest as a direct HLS choice. The
     // download path still uses only Referer + UA; no Safari cookies, challenge tokens,
     // or authorization data are read or transferred.
-    const safariHlsChoice = referer && isSafariHlsDirectFallbackFailure(message)
+    // compactMessage() maps the raw CDN disconnect into a friendly line, so also check
+    // the original yt-dlp output attached to the thrown error.
+    const safariHlsChoice = referer && (isSafariHlsDirectFallbackFailure(message) || isSafariHlsDirectFallbackFailure(rawOutput))
       ? hlsMediaChoice(sourceURL)
       : null
     if (safariHlsChoice && referer) {
@@ -1628,6 +1695,259 @@ async function readHlsManifestSummary(sourceURL: string, referer?: string, userA
   }
 }
 
+async function fetchHlsWithSafariHeaders(url: string, referer?: string, userAgent?: string): Promise<string | null> {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/vnd.apple.mpegurl, */*;q=0.9",
+        ...(userAgent ? { "User-Agent": userAgent } : {}),
+        ...(referer ? { Referer: referer } : {}),
+      },
+    })
+    if (!response.ok) return null
+    return await response.text()
+  } catch {
+    return null
+  }
+}
+
+/** Media playlist URI lines (skip #-tags) resolved against the playlist URL. */
+function hlsSegmentURLs(playlistText: string, baseURL: string): string[] {
+  const segments: string[] = []
+  for (const line of String(playlistText || "").split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    try {
+      segments.push(new URL(trimmed, baseURL).toString())
+    } catch {}
+  }
+  return segments
+}
+
+/**
+ * Mode switch for the native HLS segment downloader.
+ * - "curl": runs `curl -Z` batches in an independent process (zero JS/native bridge memory,
+ *   survives heavy load; capture off is the fastest).
+ * - "fetch": Scripting fetch stream-to-disk at low concurrency (fallback if curl misbehaves).
+ */
+const HLS_NATIVE_MODE: "curl" | "fetch" = "curl"
+
+async function downloadHlsSegmentsCurlBatches(options: {
+  workDirectory: string
+  referer?: string
+  userAgent?: string
+  onProgress?: (value: { fraction: number; stage: string; downloadedBytes?: number; totalBytes?: number; speed?: number }) => void
+  isCancelFlagSet?: () => boolean
+}, segments: string[], count: number): Promise<void> {
+  const BATCH = 100
+  const PARALLEL = 8
+  const headerArgs = [options.userAgent ? `-A ${quote(options.userAgent)}` : "", options.referer ? `-e ${quote(options.referer)}` : ""].filter(Boolean).join(" ")
+  const segmentFile = (index: number) => Path.join(options.workDirectory, `seg_${String(index).padStart(5, "0")}.ts`)
+  const fileExists = (index: number): boolean => {
+    try {
+      const path = segmentFile(index)
+      return FileManager.existsSync(path) && FileManager.statSync(path).size > 0
+    } catch {
+      return false
+    }
+  }
+  const progress = (completed: number) => {
+    let files = completed
+    try {
+      files = FileManager.readDirectorySync(options.workDirectory).filter((n) => n.startsWith("seg_")).length
+    } catch {}
+    options.onProgress?.({
+      fraction: 0.15 + 0.78 * (Math.min(files, count) / count),
+      stage: `正在下载分片 ${Math.min(files, count)} / ${count}`,
+    })
+  }
+  let completed = 0
+  const failures: string[] = []
+  for (let start = 0; start < count && !options.isCancelFlagSet?.(); start += BATCH) {
+    const end = Math.min(count, start + BATCH)
+    const curlParts: string[] = ["curl", "-k", "-sS", "-f", "-Z", `--parallel-max ${PARALLEL}`, "--connect-timeout 15"]
+    if (headerArgs) curlParts.push(headerArgs)
+    for (let i = start; i < end; i += 1) curlParts.push(`-o ${quote(segmentFile(i))}`, quote(segments[i]))
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const poll = () => {
+      if (stopped) return
+      progress(completed)
+      timer = setTimeout(poll, 500)
+    }
+    timer = setTimeout(poll, 500)
+    const result = await runCommand(curlParts.join(" "), 600)
+    stopped = true
+    if (timer) clearTimeout(timer)
+    if (options.isCancelFlagSet?.()) break
+    const missing = Array.from({ length: end - start }, (_, i) => start + i).filter((index) => !fileExists(index))
+    for (const index of missing) {
+      if (options.isCancelFlagSet?.()) break
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const retry = await runCommand(`curl -k -sS -f --connect-timeout 15 --max-time 60 ${headerArgs} -o ${quote(segmentFile(index))} ${quote(segments[index])}`, 90)
+        if (retry.exitCode === 0 && fileExists(index)) break
+      }
+      if (!fileExists(index)) failures.push(`分片 ${index + 1}`)
+    }
+    completed = end
+    progress(completed)
+  }
+  if (options.isCancelFlagSet?.()) throw new Error("下载已取消")
+  if (failures.length) throw new Error(`分片下载失败（已完成 ${completed}/${count}）：${failures.slice(0, 3).join("、")} 等 ${failures.length} 片下载失败`)
+}
+
+/**
+ * Some CDNs accept Safari/native TLS but drop ffmpeg's OpenSSL handshake ("End of file" /
+ * "Remote end closed connection without response"). When that happens, download the VOD
+ * segments with Scripting fetch (native TLS, Referer + UA only, no cookies) and remux them
+ * locally with ffmpeg so no network TLS is needed for the media bytes.
+ */
+async function downloadHlsSegmentsNative(options: {
+  sourceURL: string
+  destination: string
+  workDirectory: string
+  referer?: string
+  userAgent?: string
+  onProgress?: (value: { fraction: number; stage: string; downloadedBytes?: number; totalBytes?: number; speed?: number }) => void
+  isCancelFlagSet?: () => boolean
+}): Promise<HlsManifestSummary | undefined> {
+  const master = await fetchHlsWithSafariHeaders(options.sourceURL, options.referer, options.userAgent)
+  if (!master) return undefined
+  let mediaURL = options.sourceURL
+  let mediaText = master
+  const variant = master.match(/^\s*#EXT-X-STREAM-INF:[^\r\n]*\r?\n\s*([^#\r\n][^\r\n]*)/m)?.[1]?.trim()
+  if (variant) {
+    try {
+      mediaURL = new URL(variant, options.sourceURL).toString()
+    } catch {
+      return undefined
+    }
+    mediaText = (await fetchHlsWithSafariHeaders(mediaURL, options.referer, options.userAgent)) || ""
+    if (!mediaText) return undefined
+  }
+  const summary = parseHlsManifestSummary(mediaText)
+  // Only VOD (ENDLIST) TS playlists without encryption or fMP4 init sections are supported.
+  if (!summary || !summary.endList) return undefined
+  if (/^\s*#EXT-X-KEY:/m.test(mediaText) || /^\s*#EXT-X-MAP:/m.test(mediaText)) return undefined
+  const segments = hlsSegmentURLs(mediaText, mediaURL)
+  const count = segments.length
+  if (!count) return undefined
+  const finish = async (): Promise<void> => {
+    const listPath = Path.join(options.workDirectory, "segments.txt")
+    await FileManager.writeAsString(listPath, segments.map((_, index) => `file 'seg_${String(index).padStart(5, "0")}.ts'`).join("\n"))
+    const concat = await runCommand(
+      `ffmpeg -nostdin -y -f concat -safe 0 -i ${quote(listPath)} -c copy -bsf:a aac_adtstoasc -movflags +faststart ${quote(options.destination)}`,
+      1800,
+    )
+    if (concat.exitCode !== 0 || !FileManager.existsSync(options.destination)) throw new Error("分片合成失败")
+  }
+  if (HLS_NATIVE_MODE === "curl") {
+    await downloadHlsSegmentsCurlBatches(options, segments, count)
+    options.onProgress?.({ fraction: 0.94, stage: "分片下载完成，正在合成 MP4" })
+    await finish()
+    options.onProgress?.({ fraction: 0.99, stage: "正在验证媒体文件" })
+    return summary
+  }
+  // Measured on-device under HTTPS capture: 24/32 concurrent in-flight requests exhaust
+  // device memory (ENOMEM) after a few hundred segments — even via BackgroundURLSession,
+  // so the pressure is from the connections/buffers themselves, not the JS bridge. 4 was
+  // the only level that stayed stable; every segment is streamed straight to disk and its
+  // Data/reader references are dropped before the next one. Turning capture off removes
+  // most per-connection buffering and is the biggest lever.
+  const maxConcurrent = 4
+  let cursor = 0
+  let completed = 0
+  const failures: Error[] = []
+  let downloadedBytes = 0
+  let sampleBytes = 0
+  let sampleAt = Date.now()
+  let speed = 0
+  const sizes: number[] = []
+  const downloadOne = async (index: number): Promise<void> => {
+    if (options.isCancelFlagSet?.()) return
+    let lastError: Error | null = null
+    const destination = Path.join(options.workDirectory, `seg_${String(index).padStart(5, "0")}.ts`)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (options.isCancelFlagSet?.()) return
+      try {
+        if (FileManager.existsSync(destination)) FileManager.removeSync(destination)
+      } catch {}
+      try {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 30_000)
+        try {
+          const response = await fetch(segments[index], {
+            headers: {
+              Accept: "*/*",
+              ...(options.userAgent ? { "User-Agent": options.userAgent } : {}),
+              ...(options.referer ? { Referer: options.referer } : {}),
+            },
+            signal: controller.signal,
+          })
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          const reader = response.dataStream.getReader()
+          let size = 0
+          try {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (value) {
+                await FileManager.appendData(destination, value)
+                size += value.size
+              }
+            }
+          } finally {
+            try {
+              reader.releaseLock()
+            } catch {}
+          }
+          downloadedBytes += size
+          sizes.push(size)
+          return
+        } finally {
+          clearTimeout(timeout)
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 300 * (attempt + 1)))
+      }
+    }
+    failures.push(lastError || new Error("分片下载失败"))
+  }
+  const workers = Array.from({ length: Math.min(maxConcurrent, count) }, async () => {
+    while (!failures.length && !options.isCancelFlagSet?.() && cursor < count) {
+      const index = cursor
+      cursor += 1
+      await downloadOne(index)
+      completed += 1
+      if (options.isCancelFlagSet?.()) break
+      const now = Date.now()
+      if (now - sampleAt >= 1000) {
+        speed = ((downloadedBytes - sampleBytes) * 1000) / Math.max(1, now - sampleAt)
+        sampleBytes = downloadedBytes
+        sampleAt = now
+      }
+      const avg = sizes.length ? sizes.reduce((sum, size) => sum + size, 0) / sizes.length : 0
+      const totalEstimate = avg > 0 ? Math.round(avg * count) : undefined
+      options.onProgress?.({
+        fraction: 0.15 + 0.78 * (completed / count),
+        stage: `正在下载分片 ${completed} / ${count}`,
+        downloadedBytes,
+        totalBytes: totalEstimate,
+        speed,
+      })
+    }
+  })
+  await Promise.all(workers)
+  if (options.isCancelFlagSet?.()) throw new Error("下载已取消")
+  const failedError = failures[0]
+  if (failedError) throw new Error(`分片下载失败（已完成 ${completed}/${count}）：${failedError.message}`)
+  options.onProgress?.({ fraction: 0.94, stage: "分片下载完成，正在合成 MP4" })
+  await finish()
+  options.onProgress?.({ fraction: 0.99, stage: "正在验证媒体文件" })
+  return summary
+}
+
 async function verifyMediaFile(filePath: string, choice: MediaChoice, taskId: string) {
   // Prefer stream type lines; -v error still surfaces codec open failures on this n5.0.1 build.
   const result = await runCommand(`ffprobe -v error -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 ${quote(filePath)}`, 60)
@@ -1815,6 +2135,38 @@ export async function downloadMedia(options: {
     await logEvent({ level: "info", event: "download.m3u8.started", taskId, details: { sourceURL, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
     tracker.emit(0.05, "正在准备 m3u8 下载")
     const workPath = Path.join(workDirectory, `hls_${Date.now()}.mp4`)
+    // Safari-imported HLS: prefer the parallel native segment downloader. ffmpeg's own
+    // TLS is either dropped by the CDN or runs at only ~3x realtime, so the native path
+    // (parallel native-TLS fetches, Referer + UA only) is both more reliable and much
+    // faster. Only fall through to ffmpeg when the playlist is not supported natively
+    // (encrypted / fMP4 / live) — native returns undefined for those.
+    if (referer) {
+      tracker.emit(0.08, "正在解析 HLS 分片清单")
+      let nativeError: string | null = null
+      const nativeManifest = await downloadHlsSegmentsNative({
+        sourceURL,
+        destination: workPath,
+        workDirectory,
+        referer,
+        userAgent: safariUserAgent,
+        onProgress: (value) => tracker.emit(value.fraction, value.stage, { downloadedBytes: value.downloadedBytes, totalBytes: value.totalBytes, speed: value.speed }),
+        isCancelFlagSet,
+      }).catch((error) => {
+        nativeError = error instanceof Error ? error.message : String(error)
+        return undefined
+      })
+      if (nativeManifest) {
+        await logEvent({ level: "warn", event: "download.m3u8.native-segments", taskId, details: { segmentCount: nativeManifest.segmentCount, durationSeconds: Math.round(nativeManifest.durationSeconds), safariRefererApplied: true, cookieTransfer: false } })
+        const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest: hlsManifest || nativeManifest, outputTitle: options.outputTitle })
+        tracker.emit(1, "m3u8 下载并验证完成")
+        await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "m3u8" } })
+        return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+      }
+      if (nativeError) {
+        await logEvent({ level: "error", event: "download.m3u8.native-segments.failed", taskId, details: { reason: nativeError, safariRefererApplied: true, cookieTransfer: false } })
+        throw new Error(nativeError)
+      }
+    }
     await logEvent({ level: "info", event: "download.m3u8.manifest.checked", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
     try {
       // FFmpeg's Shell output is only available after exit. Sample its growing work file instead:
@@ -1852,6 +2204,36 @@ export async function downloadMedia(options: {
       await logEvent({ level: ffmpegResult.exitCode === 0 ? "info" : "error", event: "download.m3u8.ffmpeg.completed", taskId, details: { exitCode: ffmpegResult.exitCode, output: ffmpegResult.output } })
       if (isCancelFlagSet() || ffmpegResult.exitCode === 130) throw new Error("下载已取消")
       if (ffmpegResult.exitCode !== 0 || !FileManager.existsSync(workPath)) {
+        // Safari-imported HLS: some CDNs drop ffmpeg's OpenSSL TLS handshake ("End of file" /
+        // "Remote end closed connection without response") while accepting native TLS. When
+        // that happens, download the VOD segments with Scripting fetch (Referer + UA only,
+        // no cookies) and remux them locally so no network TLS is needed for the media bytes.
+        tracker.emit(0.15, "FFmpeg 直连失败，尝试原生分片下载")
+        await logEvent({ level: "info", event: "download.m3u8.native-fallback.started", taskId, details: { segmentCount: null, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+        let nativeError: string | null = null
+        const nativeManifest = await downloadHlsSegmentsNative({
+          sourceURL,
+          destination: workPath,
+          workDirectory,
+          referer,
+          userAgent: safariUserAgent,
+          onProgress: (value) => tracker.emit(value.fraction, value.stage, { downloadedBytes: value.downloadedBytes, totalBytes: value.totalBytes, speed: value.speed }),
+          isCancelFlagSet,
+        }).catch((error) => {
+          nativeError = error instanceof Error ? error.message : String(error)
+          return undefined
+        })
+        if (nativeManifest) {
+          await logEvent({ level: "warn", event: "download.m3u8.native-fallback", taskId, details: { segmentCount: nativeManifest.segmentCount, durationSeconds: Math.round(nativeManifest.durationSeconds), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+          const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest: hlsManifest || nativeManifest, outputTitle: options.outputTitle })
+          tracker.emit(1, "m3u8 下载并验证完成")
+          await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "m3u8" } })
+          return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+        }
+        if (nativeError) {
+          await logEvent({ level: "error", event: "download.m3u8.native-fallback.failed", taskId, details: { reason: nativeError, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+          throw new Error(nativeError)
+        }
         // A .m3u8 URL is a playlist, never a standalone media asset. Downloading it through
         // the generic fallback can yield only its first .ts segment, which still has A/V streams
         // and would otherwise be mispublished as a complete video.

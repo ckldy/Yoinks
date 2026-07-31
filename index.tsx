@@ -48,6 +48,7 @@ import {
   installYtDlp,
   mediaPlatformLabel,
   probeMedia,
+  probeSafariPublicPlayerFrame,
   resolveAutomaticChoice,
   resolveInitialMediaChoice,
   saveResult,
@@ -398,6 +399,8 @@ function View() {
   const closingRef = useRef(false)
   const analysisGenerationRef = useRef(0)
   const analysisBusyRef = useRef(false)
+  /** 停止等待后的释放说明：常规探测 45 秒，Safari 公开播放器解析 12 秒。 */
+  const analysisStopNoteRef = useRef("后台探测将在完成或 45 秒超时后释放。")
   const launchClipboardSuppressedRef = useRef(false)
    /** Safari 直链可能带短期签名；仅在当前下载周期内标记，绝不写入最近链接历史。 */
    const safariCandidateURLRef = useRef<string | null>(null)
@@ -644,6 +647,7 @@ function View() {
     analysisBusyRef.current = true
     setAnalysisDraining(false)
     setAnalyzing(true)
+    analysisStopNoteRef.current = "后台探测将在完成或 45 秒超时后释放。"
     probeAuthorizedPlatformRef.current = null
     setProbe(null)
     setSelectedChoice(null)
@@ -810,7 +814,7 @@ function View() {
     setProbe(null)
     setSelectedChoice(null)
     setProgress({ fraction: 0, stage: "分析已停止" })
-    setStatus("已停止等待分析结果；后台探测将在完成或 45 秒超时后释放。")
+    setStatus(`已停止等待分析结果；${analysisStopNoteRef.current}`)
     await logEvent({ level: "info", event: "probe.stop-requested", details: { mode: "discard-result" } })
   }
 
@@ -1008,11 +1012,43 @@ function View() {
   }
 
   const importSafariMediaCandidate = async () => {
-    if (analyzing || downloading || batchQueueRef.current.running) return
+    if (analyzing || analysisBusyRef.current || downloading || batchQueueRef.current.running) return
     const [envelope, diagnostic] = await Promise.all([readSafariMediaCandidates(), readSafariMediaCandidateDiagnostic()])
     if (!envelope) {
-      const summary = diagnostic ? `最近采集：候选 ${diagnostic.candidateCount}，媒体类资源 ${diagnostic.mediaLikeResourceCount}，iframe ${diagnostic.iframeCount}。` : ""
+      if (diagnostic) await logEvent({ level: "warn", event: "safari-candidate.empty", details: { candidateCount: diagnostic.candidateCount, topLevelCandidateCount: diagnostic.topLevelCandidateCount, frameReportCount: diagnostic.frameReportCount, frameCandidateCount: diagnostic.frameCandidateCount, mediaLikeResourceCount: diagnostic.mediaLikeResourceCount, iframeCount: diagnostic.iframeCount, waitMs: diagnostic.waitMs, errorKind: diagnostic.errorKind || null } })
+      const summary = diagnostic ? `最近采集：候选 ${diagnostic.candidateCount}，媒体类资源 ${diagnostic.mediaLikeResourceCount}，iframe ${diagnostic.iframeCount}，frame 报告 ${diagnostic.frameReportCount}。` : ""
       setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
+      return
+    }
+    if (!envelope.candidates.length && envelope.playerFrameURL) {
+      // 公开播放器链路解析阶段：锁定页面（禁止重复点击/新操作），并展示超时说明与“停止分析”终止键。
+      analysisBusyRef.current = true
+      setAnalysisDraining(false)
+      setAnalyzing(true)
+      setProbe(null)
+      setSelectedChoice(null)
+      setProgress({ fraction: 0.02, stage: "正在解析媒体" })
+      analysisStopNoteRef.current = "后台公开播放器解析将在完成或 12 秒超时后释放。"
+      setStatus("正在匿名解析 Safari 公开播放器链路（最长 12 秒；可点「停止分析」终止）。")
+      const parseGen = analysisGenerationRef.current
+      let probe: MediaProbe | null = null
+      try {
+        probe = await probeSafariPublicPlayerFrame(envelope.playerFrameURL, envelope.pageTitle)
+      } finally {
+        analysisBusyRef.current = false
+        setAnalysisDraining(false)
+        if (parseGen === analysisGenerationRef.current) setAnalyzing(false)
+      }
+      if (parseGen !== analysisGenerationRef.current) return
+      if (!probe?.choices.length) {
+        setStatus("公开播放器链路未返回可导入媒体；可能需要登录、挑战验证或不公开播放地址。")
+        return
+      }
+      const frameURL = envelope.playerFrameURL
+      const recovered: SafariMediaCandidate[] = probe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || frameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: frameURL, pageTitle: probe.title || envelope.pageTitle, discoveredAt: envelope.capturedAt, captureSource: "metadata" }))
+      if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0]); return }
+      const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
+      if (selected != null && recovered[selected]) await analyzeSafariCandidate(recovered[selected])
       return
     }
     for (const candidate of envelope.candidates) {

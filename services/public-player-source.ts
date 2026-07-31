@@ -5,6 +5,8 @@ export type PublicPlayerPage = { url: string; html: string; title?: string; orig
 export type PublicHTMLResponse = { finalURL: string; contentType?: string; html: string; title?: string }
 export type PublicHTMLFetcher = (url: string) => Promise<PublicHTMLResponse | null>
 export type PublicPlayerExtractionResult = { title: string; sources: PublicPlayerSource[]; checkedIframes: number }
+export type PublicTextResponse = { finalURL: string; contentType?: string; text: string }
+export type PublicTextFetcher = (url: string, accept: string) => Promise<PublicTextResponse | null>
 
 const MAX_CANDIDATES = 12
 const MAX_IFRAMES = 3
@@ -132,6 +134,88 @@ export function extractPublicPlayerSourcesFromHTML(page: PublicPlayerPage, maxCa
     candidates.push({ url, kind: classified.kind, origin: page.origin, referer: page.url, height, index: candidates.length })
   }
   return candidates.sort((a, b) => rank(a.kind) - rank(b.kind) || (b.height || 0) - (a.height || 0) || a.index - b.index).slice(0, maxCandidates).map(({ index, ...item }) => item)
+}
+
+function sameOrigin(a: string, b: string): boolean { try { return new URL(a).origin === new URL(b).origin } catch { return false } }
+
+function firstSameOriginScript(pageURL: string, html: string): string | null {
+  for (const raw of attributeValues(html, "script", "src")) {
+    const url = normalizePublicURL(raw, pageURL)
+    if (url && sameOrigin(pageURL, url)) return url
+  }
+  return null
+}
+
+function publicJSONEndpoints(baseURL: string, text: string): string[] {
+  const found = new Set<string>()
+  const add = (value: string) => {
+    const url = normalizePublicURL(value, baseURL)
+    if (url && sameOrigin(baseURL, url) && /(?:stream|player|media)/i.test(`${new URL(url).pathname}${new URL(url).search}`)) found.add(url)
+  }
+  for (const match of text.matchAll(/(?:fetch|axios\.(?:get|post)|\$\.getJSON)\s*\(\s*["']([^"']+)["']/gi)) add(match[1])
+  // Allow one explicitly constructed same-origin endpoint only when a fetch receives a non-literal expression.
+  // Query values are copied from the public iframe URL; no headers, cookies, or arbitrary script execution occur.
+  const fetchArg = text.match(/(?:fetch|axios\.(?:get|post)|\$\.getJSON)\s*\(\s*([A-Za-z_$][\w$]*)\s*(?:\(|[,)])/i)?.[1]
+  if (!found.size && fetchArg) {
+    const constructed = [...text.matchAll(/new\s+URL\(\s*["'`](\/(?:[^"'`]*(?:stream|player|media)[^"'`]*))["'`]\s*,\s*location\.origin\s*\)/gi)]
+    const used = constructed.find((match) => {
+      const before = text.slice(Math.max(0, (match.index || 0) - 200), match.index || 0)
+      const bindings = [...before.matchAll(/(?:function\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function|\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/g)]
+      const last = bindings[bindings.length - 1]
+      return last ? (last[1] || last[2]) === fetchArg : false
+    })
+    const path = used?.[1]
+    if (path) {
+      const endpoint = new URL(path, baseURL)
+      const iframe = new URL(baseURL)
+      iframe.searchParams.forEach((value, key) => {
+        if (!/(?:authorization|cookie|token|license|drm|signature|sig|key)/i.test(key)) endpoint.searchParams.set(key, value)
+      })
+      const id = iframe.pathname.match(/\/e\/([a-z0-9_-]+)/i)?.[1]
+      if (id) endpoint.searchParams.set("id", id)
+      add(endpoint.toString())
+    }
+  }
+  return [...found].slice(0, 1)
+}
+
+function mediaValues(value: unknown, key = ""): string[] {
+  if (typeof value === "string") return /^(stream|url|src|file)$/i.test(key) ? [value] : []
+  if (!value || typeof value !== "object") return []
+  const result: string[] = []
+  for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) result.push(...mediaValues(childValue, childKey))
+  return result
+}
+
+export async function extractPublicPlayerFrameSources(input: { frameURL: string; pageTitle?: string; fetchText: PublicTextFetcher; onStage?: (stage: string) => void }): Promise<PublicPlayerExtractionResult | null> {
+  const stage = input.onStage || (() => {})
+  const frameURL = normalizePublicURL(input.frameURL)
+  if (!frameURL) return null
+  const pageResponse = await input.fetchText(frameURL, "text/html,application/xhtml+xml")
+  const pageURL = pageResponse && normalizePublicURL(pageResponse.finalURL)
+  if (!pageResponse || !pageURL) { stage("frame-html-failed"); return null }
+  stage("frame-html-read")
+  const page: PublicPlayerPage = { url: pageURL, html: pageResponse.text, title: input.pageTitle || titleOf(pageResponse.text), origin: "iframe" }
+  const staticSources = extractPublicPlayerSourcesFromHTML(page)
+  if (staticSources.length) { stage("static-media"); return { title: page.title || "未命名媒体", sources: staticSources, checkedIframes: 1 } }
+  const scriptURL = firstSameOriginScript(pageURL, pageResponse.text)
+  if (!scriptURL) { stage("script-not-found"); return null }
+  const script = await input.fetchText(scriptURL, "text/javascript,application/javascript")
+  if (!script || !sameOrigin(pageURL, script.finalURL)) { stage("script-failed"); return null }
+  stage("script-read")
+  const endpoint = publicJSONEndpoints(pageURL, `${pageResponse.text}\n${script.text}`)[0]
+  if (!endpoint) { stage("endpoint-not-found"); return null }
+  stage("endpoint-found")
+  const json = await input.fetchText(endpoint, "application/json")
+  if (!json || !sameOrigin(pageURL, json.finalURL)) { stage("json-failed"); return null }
+  stage("json-read")
+  let parsed: unknown
+  try { parsed = JSON.parse(json.text) } catch { stage("json-failed"); return null }
+  const html = mediaValues(parsed).map(value => `<source src="${value.replace(/"/g, "&quot;")}">`).join("")
+  const sources = extractPublicPlayerSourcesFromHTML({ ...page, html })
+  if (!sources.length) { stage("media-filtered"); return null }
+  stage("media-found")
+  return { title: page.title || "未命名媒体", sources, checkedIframes: 1 }
 }
 
 function titleOf(html: string): string | undefined {

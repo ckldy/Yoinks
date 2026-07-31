@@ -3,6 +3,7 @@ import {
   classifyPublicMediaURL,
   extractAllowedIframeURLs,
   extractPublicPlayerSources,
+  extractPublicPlayerFrameSources,
   extractPublicPlayerSourcesFromHTML,
   isSamePublicSite,
   normalizePublicURL,
@@ -59,8 +60,72 @@ const noIframeCalls: string[] = []
 await extractPublicPlayerSources({ pageURL: "https://example.com/a", fetchHTML: async (url) => { noIframeCalls.push(url); return { finalURL: url, html: '<video src="/ok.mp4"></video>' } } })
 check("does not fetch iframe after page hit", noIframeCalls.length === 1)
 
+const frameCalls: string[] = []
+const frameResult = await extractPublicPlayerFrameSources({
+  frameURL: "https://player.example/embed/one",
+  pageTitle: "Outer title",
+  fetchText: async (url) => {
+    frameCalls.push(url)
+    if (url.endsWith("/embed/one")) return { finalURL: url, text: '<script src="/assets/player.js"></script>' }
+    if (url.endsWith("/assets/player.js")) return { finalURL: url, text: 'fetch("/stream?id=abc")' }
+    if (url.includes("/stream?")) return { finalURL: url, text: '{"media":{"stream":"https://cdn.example/video.m3u8?sig=ok"},"token":"must-not-be-a-candidate"}' }
+    return null
+  },
+})
+check("follows one same-origin script to one public JSON media field", frameCalls.length === 3 && frameResult?.sources.length === 1 && frameResult.sources[0]?.kind === "hls")
+check("uses frame URL as public media referer", frameResult?.sources[0]?.referer === "https://player.example/embed/one")
+
+const variableCalls: string[] = []
+const variableResult = await extractPublicPlayerFrameSources({
+  frameURL: "https://player.example/e/abc?poster=https%3A%2F%2Fcover.example%2Fa.jpg",
+  fetchText: async (url) => {
+    variableCalls.push(url)
+    if (url.includes("/e/abc")) return { finalURL: url, text: '<script src="/assets/embed.js"></script>' }
+    if (url.endsWith("/assets/embed.js")) return { finalURL: url, text: 'function o(e){let t=new URL(`/stream`,location.origin);new URLSearchParams(location.search).forEach((value,key)=>t.searchParams.set(key,value));t.searchParams.set(`id`,e);return t.toString()} (function(){let e=document.location.pathname.match(/\/e\/([a-z0-9_]+)/i);e&&fetch(o(e[1]))})()' }
+    if (url.includes("/stream?")) return { finalURL: url, text: '{"media":{"stream":"https://cdn.example/variable.m3u8"}}' }
+    return null
+  },
+})
+check("follows a fetch variable built from a same-origin stream path", variableCalls.length === 3 && variableCalls[2]?.includes("/stream?") && variableResult?.sources[0]?.kind === "hls")
+
+const unrelatedCalls: string[] = []
+await extractPublicPlayerFrameSources({
+  frameURL: "https://player.example/e/abc",
+  fetchText: async (url) => {
+    unrelatedCalls.push(url)
+    if (url.includes("/e/abc")) return { finalURL: url, text: '<script src="/assets/embed.js"></script>' }
+    if (url.endsWith("/assets/embed.js")) return { finalURL: url, text: 'function o(e){let t=new URL(`/stream`,location.origin);return t.toString()} function load(){return {}} fetch(load())' }
+    return null
+  },
+})
+check("rejects a constructed path not consumed by the fetch call", unrelatedCalls.length === 2)
+
+const crossOriginCalls: string[] = []
+await extractPublicPlayerFrameSources({
+  frameURL: "https://player.example/e/abc",
+  fetchText: async (url) => {
+    crossOriginCalls.push(url)
+    if (url.includes("/e/abc")) return { finalURL: url, text: '<script src="/assets/embed.js"></script>' }
+    if (url.endsWith("/assets/embed.js")) return { finalURL: url, text: 'function o(e){let t=new URL(`https://other.example/stream`,location.origin);return t.toString()} fetch(o(e))' }
+    return null
+  },
+})
+check("rejects an absolute cross-origin constructed path", crossOriginCalls.length === 2)
+
+const noKeywordCalls: string[] = []
+await extractPublicPlayerFrameSources({
+  frameURL: "https://player.example/e/abc",
+  fetchText: async (url) => {
+    noKeywordCalls.push(url)
+    if (url.includes("/e/abc")) return { finalURL: url, text: '<script src="/assets/embed.js"></script>' }
+    if (url.endsWith("/assets/embed.js")) return { finalURL: url, text: 'function o(e){let t=new URL(`/api`,location.origin);return t.toString()} fetch(o(e))' }
+    return null
+  },
+})
+check("rejects a constructed path without stream/player/media keyword", noKeywordCalls.length === 2)
+
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name)
 if (failed.length) throw new Error(`Public player source checks failed: ${failed.join(", ")}`)
 console.log(`Public player source checks passed (${checks.length})`)
 Script.exit({ passed: checks.length })
-})()
+})().catch((error) => Script.exit({ error: error instanceof Error ? error.message : String(error) }))

@@ -20,6 +20,32 @@ export type SafariMediaCandidateEnvelope = {
   pageTitle?: string
   capturedAt: number
   candidates: SafariMediaCandidate[]
+  playerFrameURL?: string
+}
+
+export type SafariFrameCandidateReport = {
+  sessionId: string
+  pageURL: string
+  pageTitle?: string
+  candidates: Array<Partial<SafariMediaCandidate> & { source?: SafariCaptureSource }>
+}
+
+export function mergeSafariFrameCandidates(input: {
+  sessionId: string
+  pageURL: string
+  pageTitle?: string
+  capturedAt: number
+  topLevel: Array<Partial<SafariMediaCandidate> & { source?: SafariCaptureSource }>
+  frames: SafariFrameCandidateReport[]
+}): SafariMediaCandidateEnvelope {
+  const rawCandidates: Array<Record<string, unknown>> = []
+  for (const candidate of input.topLevel) rawCandidates.push({ ...candidate, pageURL: input.pageURL, pageTitle: candidate.pageTitle ?? input.pageTitle })
+  for (const frame of input.frames) {
+    if (frame.sessionId !== input.sessionId || !isHTTPURL(frame.pageURL)) continue
+    for (const candidate of frame.candidates) rawCandidates.push({ ...candidate, pageURL: frame.pageURL, pageTitle: candidate.pageTitle ?? frame.pageTitle ?? input.pageTitle })
+  }
+  const envelope = sanitizeSafariMediaCandidates({ version: 1, pageURL: input.pageURL, pageTitle: input.pageTitle, capturedAt: input.capturedAt, candidates: rawCandidates })
+  return envelope || { version: 1, pageURL: input.pageURL, pageTitle: safeTitle(input.pageTitle), capturedAt: input.capturedAt, candidates: [] }
 }
 
 export const SAFARI_MEDIA_CANDIDATE_STORAGE_KEY = "yoinks-media-candidates-v1"
@@ -112,6 +138,7 @@ export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandid
     if (!item || typeof item !== "object" || candidates.length >= MAX_SAFARI_MEDIA_CANDIDATES) continue
     const candidate = item as Record<string, unknown>
     const url = normalizeSafariCandidateURL(candidate.url as string)
+    const candidatePageURL = safariPageReferer(candidate.pageURL) || pageURL
     const kind = typeof candidate.kind === "string" && MEDIA_KINDS.has(candidate.kind as SafariMediaCandidateKind)
       ? candidate.kind as SafariMediaCandidateKind
       : url ? classifySafariMediaURL(url) : null
@@ -121,14 +148,15 @@ export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandid
       id: typeof candidate.id === "string" && candidate.id.trim() ? candidate.id.slice(0, 96) : `candidate-${candidates.length + 1}`,
       url,
       kind,
-      pageURL,
+      pageURL: candidatePageURL,
       pageTitle: safeTitle(candidate.pageTitle ?? raw.pageTitle),
       discoveredAt: typeof candidate.discoveredAt === "number" && Number.isFinite(candidate.discoveredAt) ? candidate.discoveredAt : capturedAt,
       captureSource: CAPTURE_SOURCES.has(candidate.source as SafariCaptureSource) ? candidate.source as SafariCaptureSource : undefined,
     })
   }
-  if (!candidates.length) return null
-  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates) }
+  const playerFrameURL = safariPageReferer(raw.playerFrameURL)
+  if (!candidates.length && !playerFrameURL) return null
+  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates), ...(playerFrameURL ? { playerFrameURL } : {}) }
 }
 
 /**
@@ -144,6 +172,11 @@ export type SafariMediaCandidateDiagnostic = {
   iframeCount: number
   resourceHostCount: number
   initiators: Record<string, number>
+  topLevelCandidateCount: number
+  frameReportCount: number
+  frameCandidateCount: number
+  waitMs: number
+  errorKind?: "session" | "report" | "storage"
 }
 
 export function sanitizeSafariMediaCandidateDiagnostic(value: unknown): SafariMediaCandidateDiagnostic | null {
@@ -157,7 +190,8 @@ export function sanitizeSafariMediaCandidateDiagnostic(value: unknown): SafariMe
       if (/^[a-z]{1,24}$/i.test(key) && typeof value === "number" && Number.isFinite(value) && Object.keys(initiators).length < 20) initiators[key] = Math.max(0, Math.min(100000, Math.floor(value)))
     }
   }
-  return { stage: raw.stage, capturedAt: number("capturedAt"), candidateCount: number("candidateCount"), resourceCount: number("resourceCount"), mediaLikeResourceCount: number("mediaLikeResourceCount"), iframeCount: number("iframeCount"), resourceHostCount: number("resourceHostCount"), initiators }
+  const errorKind = raw.errorKind === "session" || raw.errorKind === "report" || raw.errorKind === "storage" ? raw.errorKind : undefined
+  return { stage: raw.stage, capturedAt: number("capturedAt"), candidateCount: number("candidateCount"), resourceCount: number("resourceCount"), mediaLikeResourceCount: number("mediaLikeResourceCount"), iframeCount: number("iframeCount"), resourceHostCount: number("resourceHostCount"), initiators, topLevelCandidateCount: number("topLevelCandidateCount"), frameReportCount: number("frameReportCount"), frameCandidateCount: number("frameCandidateCount"), waitMs: number("waitMs"), errorKind }
 }
 
 export function safariMediaCandidatePath(): string {
