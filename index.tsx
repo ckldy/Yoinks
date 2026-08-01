@@ -149,6 +149,12 @@ import {
   type SafariMediaCandidate,
 } from "./services/safari-media-candidates"
 import { activeTaskIdFromCancelPath, clearDownloadCache, downloadCacheSize } from "./services/cache"
+import {
+  getBrowserPluginStatus,
+  publishBrowserUserscript,
+  summarizePublishResult,
+  type BrowserPluginStatus,
+} from "./services/browser-script"
 import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
 import { DiscoverTab } from "./components/DiscoverTab"
@@ -419,6 +425,8 @@ function View() {
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const probeAuthorizedPlatformRef = useRef<AuthPlatform | null>(null)
   const [importedCookieActive, setImportedCookieActive] = useState<boolean>(Boolean(getImportedCookiePath()))
+  const [browserPlugin, setBrowserPlugin] = useState<BrowserPluginStatus>(() => getBrowserPluginStatus())
+  const [publishingBrowser, setPublishingBrowser] = useState(false)
    const [mediaCandidates, setMediaCandidates] = useState<MediaCandidate[]>(() => listMediaCandidates())
   const [mediaCandidateFilter, setMediaCandidateFilter] = useState<MediaCandidateFilter>("all")
    const [showAllMediaCandidates, setShowAllMediaCandidates] = useState(false)
@@ -564,8 +572,29 @@ function View() {
     await Promise.all(supportedAuthPlatforms().map((platform) => sessionForPlatform(platform)))
   }
 
+  const publishBrowserPlugin = async () => {
+    setPublishingBrowser(true)
+    try {
+      const result = await publishBrowserUserscript()
+      setBrowserPlugin(getBrowserPluginStatus())
+      if (result.ok) {
+        await Dialog.alert({
+          title: "已同步到 Safari 浏览器脚本",
+          message: `${summarizePublishResult(result)}\n\n刷新 Safari 页面后生效。插件由 Scripting 的「Safari 浏览器脚本」管理（开关/编辑/更新/删除）；若同时存在项目内置版，建议在其中禁用其一，避免重复菜单。`,
+        })
+        setStatus("Safari 浏览器脚本已同步。")
+      } else {
+        await Dialog.alert({ title: "同步失败", message: summarizePublishResult(result) })
+        setStatus("Safari 浏览器脚本同步失败。")
+      }
+    } finally {
+      setPublishingBrowser(false)
+    }
+  }
+
   useEffect(() => {
     void refreshTools()
+    setBrowserPlugin(getBrowserPluginStatus())
     void refreshHistory()
     void refreshLoggedInSessions()
     return () => {
@@ -1046,10 +1075,14 @@ function View() {
     await analyzeMedia(record.url)
   }
 
-  // .vid 等重定向型媒体端点是明确的媒体直链（如 sxyprn cdn8 → c8...553MB MP4）。
-  // 直接分析直链，避免“页面优先”触发 yt-dlp 对站点（sxyprn 等 Piracy 名单）的必然失败。
+  // 重定向型媒体端点是明确的媒体直链（如 sxyprn cdn8 → c8...553MB MP4 的 .vid、
+  // porntrex get_file/.../3002115.mp4/ 尾部斜杠直链）。直接分析直链，避免“页面优先”
+  // 触发 yt-dlp 对站点（sxyprn 等 Piracy 名单 / porntrex 无 extractor）的必然失败。
   const safariCandidateIsVidRedirect = (candidate: SafariMediaCandidate): boolean => {
-    try { return /\.vid(?:$|[?#])/i.test(new URL(candidate.url).pathname) } catch { return false }
+    try {
+      const pathname = new URL(candidate.url).pathname
+      return /\.vid(?:$|[?#])/i.test(pathname) || /\.(?:mp4|m4v|mov|webm|mkv)\/$/i.test(pathname)
+    } catch { return false }
   }
 
   const analyzeSafariCandidate = async (candidate: SafariMediaCandidate, playerFrameURL?: string, directOnly = false) => {
@@ -2340,7 +2373,7 @@ function DownloadView() {
           {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || analysisDraining || downloading || batchQueue.running} /> : null}
         </Section>
 
-        {mediaCandidates.length ? <Section title="最近候选库">
+        {preferences.showRecentCandidates && mediaCandidates.length ? <Section title="最近候选库">
           <Button title={`筛选：${mediaCandidateFilter === "all" ? "全部" : mediaCandidateFilter === "recommended" ? "推荐" : mediaCandidateFilter.toUpperCase()}`} systemImage="line.3.horizontal.decrease.circle" action={() => void (async () => { const filters: MediaCandidateFilter[] = ["all", "recommended", "hls", "dash", "video", "audio", "page"]; const selected = await Dialog.actionSheet({ title: "筛选候选", actions: filters.map(filter => ({ label: filter === "all" ? "全部" : filter === "recommended" ? "推荐" : filter.toUpperCase() })), cancelButton: true }); if (selected != null) setMediaCandidateFilter(filters[selected]) })()} disabled={analyzing || downloading} />
           <Button title="读取 Safari 最新采集" systemImage="arrow.clockwise" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
           <Button title="清空候选" systemImage="trash" role="destructive" action={() => void (async () => { if (await Dialog.confirm({ title: "清空最近候选", message: "这不会删除下载记录或文件。", confirmLabel: "清空", cancelLabel: "取消" })) { clearMediaCandidates(); setMediaCandidates([]) } })()} disabled={analyzing || downloading} />
@@ -2463,6 +2496,8 @@ return (
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
               <Button title={`在线预览：${PREVIEW_AUTOPLAY_LABELS[preferences.previewAutoplayMode]}`} systemImage="play.circle" action={() => void choosePreviewAutoplayMode()} disabled={downloading || analyzing} />
+              <Toggle title="显示最近候选库" systemImage="clock.arrow.circlepath" value={preferences.showRecentCandidates} onChanged={(value) => updatePreferences({ ...preferences, showRecentCandidates: value })} />
+              <Text font="caption" foregroundStyle="secondaryLabel">关闭后下载页不再展示最近候选库区域，减少占用；仍可随时重新打开。</Text>
             </Section>
             <Section title="自动下载">
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
@@ -2543,6 +2578,23 @@ return (
                 setStatus("运行日志已清空。")
               })()} />
               <Text font="caption" foregroundStyle="secondaryLabel">默认只记录主链里程碑与警告/错误。临时详细日志约 15 分钟后自动关闭，不影响下载与在线预览。</Text>
+            </Section>
+            <Section title="Safari 浏览器脚本">
+              <HStack spacing={10}>
+                <Image systemName={browserPlugin.upToDate ? "checkmark.circle.fill" : browserPlugin.currentKnown ? "exclamationmark.triangle.fill" : "questionmark.circle"} foregroundStyle={browserPlugin.upToDate ? "green" : browserPlugin.currentKnown ? "orange" : "secondaryLabel"} />
+                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>
+                  源码 v{browserPlugin.expected ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
+                </Text>
+              </HStack>
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                {browserPlugin.upToDate
+                  ? "Safari 中运行的插件已是最新版本。浮动入口下方会显示版本号。"
+                  : browserPlugin.currentKnown
+                    ? "Safari 中运行的插件版本与源码不一致，请同步更新并刷新 Safari 页面。"
+                    : "尚未捕获过媒体，Safari 版本未知。同步后刷新 Safari 页面，再捕获一次即可确认。"}
+              </Text>
+              <Button title={publishingBrowser ? "同步中…" : "同步到 Safari 浏览器脚本"} systemImage="arrow.triangle.2.circlepath" action={() => void publishBrowserPlugin()} disabled={publishingBrowser || downloading || analyzing} />
+              <Text font="caption" foregroundStyle="secondaryLabel">插件由 Scripting 的「Safari 浏览器脚本」管理（开关/编辑/更新/删除）。本按钮仅把 browser.tsx 重新生成并覆盖 Yoinks.user.js；刷新 Safari 页面即生效。若同时存在项目内置版，请在 Scripting 管理中禁用其一，避免重复菜单。</Text>
             </Section>
           </List>
         </NavigationStack>

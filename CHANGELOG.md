@@ -1,5 +1,27 @@
 # 更新日志
 
+## 1.6.6 — 2026-08-01
+
+### 新功能
+
+- Safari 候选采集器更新至 **1.2.5**（1.1.9 → 1.2.5）：
+  - **PH 系站点正片捕获**（redtube / YouPorn / Pornhub / Tube8 等）：主动识别播放器配置 `mediaDefinition` 中的签名清单端点（`/media/hls?s=...`、`/media/mp4?s=...`；YouPorn 为 `/media/hls/?s=...` 尾部斜杠形态）并 fetch 解析出各档 HLS master.m3u8 与 MP4 直链，无需等待播放即可拿到真实链接。
+  - porntrex 等站点 kt_player **flashvars 直链捕获**（`video_url` / 别名键），并过滤全广告 iframe（`go.gsrv.dev` 等），避免把广告当播放器线索。
+  - **非媒体资源噪音过滤**：播放器脚本中的头像/图标（如 `default-userAvatar.svg`）等不再误入候选列表。
+  - **捕获性能优化**：PH 端点已解析出真实媒体时直接返回、跳过 30 秒播放监听循环；多个签名端点改为并发 fetch；端点超时收短——实测捕获耗时从约 37 秒降至 2-5 秒。
+- **通用清晰度补全**：直链媒体（MP4 等）从页面元数据与文件本体（moov 头）解析分辨率；m3u8 单清单从 TS 分片 H.264 SPS 解析分辨率（ffprobe 兑底），格式标签更准确。
+- 下载页「最近候选库」可在设置中关闭（默认显示）：设置页「下载偏好」新增开关，关闭后下载页不再展示候选库区域，减少占用。
+
+### 改进与修复
+
+- 修复同步管线（browser.tsx.src → Yoinks.user.js 转换器）把“首个变量带类型标注但无初始化器”的多变量 `let` 声明吞成单变量（丢失 `bestScore` 声明），导致 Safari 采集在含 iframe 页面偶发 `ReferenceError` 采集失败的问题；新增回归检查，部署产物校验更严格。
+- PH 系签名端点 fetch 优先走 GM.xmlHttpRequest（扩展特权请求），失败回退页面 fetch，兼容无 CSP 与受限环境。
+
+### 验证
+
+- 已通过 TypeScript 项目诊断、`scripting-ts project "Yoinks"` 启动回归及 Safari/PH/redtube/YouPorn/porntrex/浏览器发布回归（19+19+19+15+21 项）。
+- 真机验收通过：redtube / YouPorn 捕获出真实直链（多档 HLS/MP4）、捕获提速（约 37 秒 → 2-5 秒）、最近候选库开关、Safari 页面刷新后新版采集器生效。
+
 ## 1.6.5 — 2026-08-01
 
 ### 新功能

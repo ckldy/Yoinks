@@ -363,6 +363,12 @@ function isVidURL(value: string): boolean {
   try { return /\.vid(?:$|[?#])/i.test(new URL(value).pathname) } catch { return false }
 }
 
+// porntrex 等站点 get_file/.../3002115.mp4/ 尾部斜杠重定向型直链（302 → CDN 签名 MP4）。
+// yt-dlp generic 对这类 URL 常因 IncompleteRead/重试耗尽探测预算，需提前走 302 解析。
+function isTrailingSlashDirectMediaURL(value: string): boolean {
+  try { return /\.(?:mp4|m4v|mov|webm|mkv|vid)\/$/i.test(new URL(value).pathname) } catch { return false }
+}
+
 /**
  * 重定向型媒体端点（如 sxyprn.com/cdn8/<obfuscated>.vid → c8.trafficdeposit.com/widi/...vid，
  * 553MB 渐进式 MP4）：yt-dlp generic 常因 302 后被 CDN 断开/SSL 失败。用浏览器式 GET
@@ -398,7 +404,8 @@ async function resolveRedirectedDirectMedia(sourceURL: string, referer: string, 
 }
 
 /**
- * 从 Safari 来源页 HTML 提取视频分辨率（如 sxyprn 页面 "resolution:<b>HD</b>720"）。
+ * 从来源页 HTML 提取视频分辨率：优先 og:video:height / meta itemprop 宽高（最可靠），
+ * 其次 "resolution:HD 720" 文本（sxyprn 等），最后 1920x1080 宽高。
  * 仅在页面为 text/html 且体积受限时尝试，最多 6 秒；失败返回 undefined，不影响主流程。
  */
 async function fetchPageResolutionHint(pageURL: string): Promise<number | undefined> {
@@ -414,11 +421,249 @@ async function fetchPageResolutionHint(pageURL: string): Promise<number | undefi
     if (Number.isFinite(contentLength) && contentLength > 262144) return undefined
     const text = await response.text()
     if (text.length > 262144) return undefined
-    const match = text.match(/resolution[^0-9]{0,40}?(\d{3,4})(?:p|\b|$)/i)
-    if (!match) return undefined
-    const height = Number(match[1])
+    const wxh = text.match(/(\d{3,4})[x×](\d{3,4})/i)
+    const match =
+      text.match(/property=["']og:video:height["'][^>]*content=["'](\d{3,4})["']/i)
+      || text.match(/itemprop=["'](?:width|height)["'][^>]*content=["'](\d{3,4})["']/i)
+      || text.match(/resolution[^0-9]{0,40}?(\d{3,4})(?:p|\b|$)/i)
+    const raw = match ? match[1] : wxh ? wxh[2] : undefined
+    if (!raw) return undefined
+    const height = Number(raw)
     return height >= 240 && height <= 4320 ? height : undefined
   } catch { return undefined } finally { clearTimeout(timeout) }
+}
+
+// ---- 通用 MP4 文件头分辨率解析（不依赖站点/URL/页面）----
+function readU32BE(buf: Uint8Array, offset: number): number {
+  return (buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]
+}
+function readU16BE(buf: Uint8Array, offset: number): number {
+  return (buf[offset] << 8) | buf[offset + 1]
+}
+function boxTypeOf(buf: Uint8Array, offset: number): string {
+  return String.fromCharCode(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3])
+}
+// FastStart：按顶层 box 顺序定位 moov（文件头附近）
+function findTopLevelMoov(buf: Uint8Array): number | null {
+  let offset = 0
+  while (offset + 8 <= buf.length) {
+    const size = readU32BE(buf, offset)
+    if (size < 8) return null
+    if (boxTypeOf(buf, offset + 4) === "moov") return offset
+    if (size === 1) return null // 64-bit size 不处理
+    offset += size
+  }
+  return null
+}
+// 任意切片内定位 moov box（非 FastStart：moov 在文件尾，尾部切片不在 box 边界）
+function findMoovBoxAnywhere(buf: Uint8Array): number | null {
+  for (let i = 0; i + 8 <= buf.length; i += 1) {
+    if (boxTypeOf(buf, i + 4) === "moov") {
+      const size = readU32BE(buf, i)
+      if (size >= 8 && i + size <= buf.length) return i
+    }
+  }
+  return null
+}
+// 在 moov 内找视频 sample entry（stsd 的 avc1/hvc1/hev1/av01/vp09/mp4v），
+// 从 visual sample entry 偏移读真实 width/height（ISO 14496-12 §12.1.3.2：
+// size+format(8) + reserved+data_ref(8) + pre_defined+reserved+pre_defined[3](16)，
+// width/height 在 entry+32/+34）
+function findVideoSampleEntryResolution(buf: Uint8Array, moovOffset: number): { width: number; height: number } | null {
+  const moovSize = readU32BE(buf, moovOffset)
+  const end = Math.min(moovOffset + moovSize, buf.length)
+  const codecTypes = ["avc1", "hvc1", "hev1", "av01", "vp09", "mp4v"]
+  for (let i = moovOffset; i + 8 <= end; i += 1) {
+    if (!codecTypes.includes(boxTypeOf(buf, i + 4))) continue
+    const size = readU32BE(buf, i)
+    if (size < 78 || i + size > end) continue
+    const width = readU16BE(buf, i + 32)
+    const height = readU16BE(buf, i + 34)
+    if (width >= 16 && width <= 7680 && height >= 16 && height <= 7680) return { width, height }
+  }
+  return null
+}
+// Range 拉取并返回 buffer + 文件总大小（content-range 或 content-length）
+async function fetchRangeBytes(url: string, start: number, end: number, referer?: string, userAgent?: string): Promise<{ buffer: Uint8Array; total: number } | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 6000)
+  try {
+    const headers: Record<string, string> = { Range: `bytes=${start}-${end}`, Accept: "*/*" }
+    if (referer) headers.Referer = referer
+    headers["User-Agent"] = userAgent || "Mozilla/5.0"
+    const response = await fetch(url, { headers, signal: controller.signal })
+    if (!response.ok) return null
+    const buffer = new Uint8Array(await response.arrayBuffer())
+    if (buffer.length < 8) return null
+    const totalMatch = (response.headers.get("content-range") || "").match(/\/(\d+)$/)
+    const total = totalMatch ? Number(totalMatch[1]) : Number(response.headers.get("content-length") || 0)
+    return { buffer, total: Number.isFinite(total) ? total : 0 }
+  } catch { return null } finally { clearTimeout(timeout) }
+}
+// 从任意 progressive MP4 直链解析真实分辨率（FastStart moov 在头 / 非 FastStart 在尾；
+// 长视频 moov 很大时按 moov 范围单独拉取完整 moov 再解析）
+async function sniffMp4Resolution(url: string, referer?: string, userAgent?: string): Promise<number | undefined> {
+  if (!isAllowedURL(url)) return undefined
+  const HEAD_BYTES = 65536
+  const head = await fetchRangeBytes(url, 0, HEAD_BYTES - 1, referer, userAgent)
+  if (!head) return undefined
+  const headMoov = findTopLevelMoov(head.buffer)
+  if (headMoov != null) {
+    const moovSize = readU32BE(head.buffer, headMoov)
+    if (headMoov + moovSize <= head.buffer.length) {
+      const entry = findVideoSampleEntryResolution(head.buffer, headMoov)
+      if (entry) return entry.height
+    } else if (moovSize >= 8 && moovSize <= 4 * 1024 * 1024 && head.total > 0 && headMoov + moovSize <= head.total) {
+      // moov 超出 64KB 头（长视频 stbl 表很大）：按 moov 范围拉完整 moov 再解析
+      const moovFetch = await fetchRangeBytes(url, headMoov, headMoov + moovSize - 1, referer, userAgent)
+      if (moovFetch) {
+        const entry = findVideoSampleEntryResolution(moovFetch.buffer, 0)
+        if (entry) return entry.height
+      }
+    }
+    return undefined
+  }
+  if (head.total > HEAD_BYTES) {
+    const tailStart = Math.max(0, head.total - HEAD_BYTES)
+    const tail = await fetchRangeBytes(url, tailStart, head.total - 1, referer, userAgent)
+    if (tail) {
+      const tailMoov = findMoovBoxAnywhere(tail.buffer)
+      if (tailMoov != null) {
+        const entry = findVideoSampleEntryResolution(tail.buffer, tailMoov)
+        if (entry) return entry.height
+      }
+    }
+  }
+  return undefined
+}
+
+// 单清晰度 HLS（media playlist 无 #EXT-X-STREAM-INF 变体）清单本身不含分辨率：
+// 用 ffprobe 远程探测实际视频流宽高（ffprobe 下载首个分片解析 SPS）。
+// 失败（CDN 拒绝 / 加密 / 超时）返回 undefined，不影响主流程。
+async function probeHlsResolutionWithFfprobe(sourceURL: string, referer?: string): Promise<number | undefined> {
+  const headers = referer ? ` -headers ${quote(`Referer: ${referer}\r\n`)}` : ""
+  const result = await runCommand(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0${headers} ${quote(sourceURL)}`, 25)
+  if (result.exitCode !== 0) return undefined
+  const match = result.output.trim().match(/(\d+),(\d+)/)
+  if (!match) return undefined
+  const height = Number(match[2])
+  return height >= 240 && height <= 4320 ? height : undefined
+}
+
+// ---- HLS TS 分片 H.264 SPS 分辨率解析（通用主方案，浏览器式 fetch，CDN 不会拒绝）----
+class H264BitReader {
+  private pos = 0
+  constructor(private buf: Uint8Array) {}
+  readBits(n: number): number {
+    let v = 0
+    for (let i = 0; i < n; i++) {
+      const byte = this.buf[this.pos >> 3]
+      if (byte === undefined) return -1
+      v = (v << 1) | ((byte >> (7 - (this.pos & 7))) & 1)
+      this.pos++
+    }
+    return v
+  }
+  readUE(): number {
+    let zeros = 0
+    while (this.readBits(1) === 0) { zeros++; if (zeros > 31) return -1 }
+    if (zeros === 0) return 0
+    return (1 << zeros) - 1 + this.readBits(zeros)
+  }
+}
+// 解析 H.264 SPS（nal 不含 NAL header）：输出真实宽高
+function parseH264Sps(nal: Uint8Array): { width: number; height: number } | null {
+  const r = new H264BitReader(nal)
+  const profile = r.readBits(8)
+  r.readBits(8); r.readBits(8) // constraint + level
+  r.readUE() // seq_parameter_set_id
+  const highProfile = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profile)
+  if (highProfile) {
+    const chroma = r.readUE()
+    if (chroma === 3) r.readBits(1)
+    r.readUE(); r.readUE() // bit depths
+    r.readBits(1) // qpprime
+    if (r.readBits(1)) {
+      const count = chroma === 3 ? 12 : 8
+      for (let i = 0; i < count; i++) {
+        if (r.readBits(1)) {
+          const size = i < 6 ? 16 : 64
+          let last = 8, next = 8
+          for (let j = 0; j < size; j++) {
+            if (next !== 0) {
+              const delta = r.readUE()
+              next = (last + delta + 256) % 256
+            }
+            last = next === 0 ? last : next
+          }
+        }
+      }
+    }
+  }
+  r.readUE() // log2_max_frame_num_minus4
+  const pocType = r.readUE()
+  if (pocType === 0) r.readUE()
+  else if (pocType === 1) { r.readBits(1); r.readUE(); r.readUE() }
+  r.readUE() // max_num_ref_frames
+  r.readBits(1) // gaps_in_frame_num_value_allowed_flag
+  const picWidthInMbs = r.readUE()
+  const picHeightInMapUnits = r.readUE()
+  const frameMbsOnly = r.readBits(1)
+  if (frameMbsOnly === 0) r.readBits(1)
+  r.readBits(1) // direct_8x8
+  const width = (picWidthInMbs + 1) * 16
+  const height = (2 - frameMbsOnly) * (picHeightInMapUnits + 1) * 16
+  return width > 0 && height > 0 ? { width, height } : null
+}
+// 在 TS 分片 buffer 中定位 Annex-B SPS NAL（00 00 01 / 00 00 00 01 + type 7）
+function findH264Sps(buf: Uint8Array): Uint8Array | null {
+  for (let i = 0; i + 5 < buf.length; i++) {
+    if (buf[i] !== 0 || buf[i + 1] !== 0) continue
+    const len = buf[i + 2] === 1 ? 3 : (buf[i + 2] === 0 && buf[i + 3] === 1 ? 4 : 0)
+    if (!len) continue
+    const nalHeader = i + len
+    if ((buf[nalHeader] & 0x1f) !== 7) continue
+    let end = nalHeader + 1
+    const maxEnd = Math.min(buf.length, nalHeader + 2048)
+    while (end + 3 < maxEnd && !(buf[end] === 0 && buf[end + 1] === 0 && (buf[end + 2] === 1 || (buf[end + 2] === 0 && buf[end + 3] === 1)))) end++
+    return buf.subarray(nalHeader + 1, end)
+  }
+  return null
+}
+// 拉取 HLS 清单文本（带 Referer + UA，检查 #EXTM3U，≤256KB）
+async function fetchHlsPlaylistText(sourceURL: string, referer?: string, userAgent?: string): Promise<string | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 8000)
+  try {
+    const headers: Record<string, string> = { Accept: "*/*" }
+    if (referer) headers.Referer = referer
+    headers["User-Agent"] = userAgent || "Mozilla/5.0"
+    const response = await fetch(sourceURL, { headers, signal: controller.signal })
+    if (!response.ok) return null
+    const text = await response.text()
+    return text.length <= 262144 && /^\s*#EXTM3U/m.test(text || "") ? text : null
+  } catch { return null } finally { clearTimeout(timeout) }
+}
+// 单清晰度 HLS 分辨率：拉第一个 TS 分片解析 H.264 SPS（实测 1280x720 等），
+// 失败（HEVC/加密/无法取分片）返回 undefined，由调用方 ffprobe 兜底。
+async function probeHlsTsResolution(sourceURL: string, referer?: string, userAgent?: string): Promise<number | undefined> {
+  const ua = userAgent || "Mozilla/5.0"
+  const playlist = referer ? await sniffHlsManifest(sourceURL, referer, ua) : await fetchHlsPlaylistText(sourceURL, referer, ua)
+  if (!playlist) return undefined
+  let segment = ""
+  for (const line of playlist.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed && !trimmed.startsWith("#")) { segment = trimmed; break }
+  }
+  if (!segment) return undefined
+  let segmentURL: string
+  try { segmentURL = new URL(segment, sourceURL).toString() } catch { return undefined }
+  const seg = await fetchRangeBytes(segmentURL, 0, 262143, referer, ua)
+  if (!seg) return undefined
+  const sps = findH264Sps(seg.buffer)
+  if (!sps) return undefined
+  const resolution = parseH264Sps(sps)
+  return resolution ? resolution.height : undefined
 }
 
 export function directMediaChoice(sourceURL: string, knownKind?: "video" | "audio"): MediaChoice | null {
@@ -1334,7 +1579,63 @@ async function downloadDouyinDirect(options: {
 }
 
 
+/**
+ * 统一清晰度补全：对 probe 中尚无 height 的视频 choice，依次尝试
+ * 1) direct 直链：来源页 metadata（og:video:height / resolution 文本 / WxH）→ MP4 moov 文件本体解析
+ * 2) m3u8 单清单（无变体）：ffprobe 远程探测实际视频流分辨率
+ * 这样所有直链（普通 MP4、.vid 302 直链、公开播放器抽取）与单清晰度 HLS 都能尽量拿到
+ * 清晰度，而不必为每个站点单独打补丁。失败静默（保持无 height），不影响主流程。
+ */
+async function enrichProbeResolutions(probe: MediaProbe, sourceURL: string, options: ProbeOptions): Promise<MediaProbe> {
+  if (detectMediaPlatform(sourceURL) === "douyin") return probe
+  const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
+  const userAgent = referer ? MOBILE_SAFARI_UA : undefined
+  let pageHint: number | undefined
+  let enriched = 0
+  for (const choice of probe.choices) {
+    if (choice.kind !== "video" || choice.height) continue
+    const target = choice.sourceURL || choice.previewURL
+    if (!target || !isAllowedURL(target)) continue
+    const started = Date.now()
+    await logEvent({ level: "info", event: "probe.resolution.enrich.started", details: { sourceURL: target, formatExpression: choice.formatExpression, hasReferer: Boolean(referer) } })
+    let height: number | undefined
+    let source = ""
+    if (choice.formatExpression === "direct") {
+      if (pageHint === undefined && referer) pageHint = await fetchPageResolutionHint(referer)
+      if (pageHint) {
+        height = pageHint
+        source = "page"
+      } else {
+        height = await sniffMp4Resolution(target, referer, userAgent)
+        source = "mp4-sniff"
+      }
+    } else if (choice.formatExpression === "m3u8") {
+      // 单清晰度 HLS media playlist（无变体）清单本身不含分辨率：
+      // 先 TS 分片 H.264 SPS 解析（浏览器式 fetch，CDN 不拒），失败再 ffprobe 兜底。
+      height = await probeHlsTsResolution(target, referer, userAgent) || await probeHlsResolutionWithFfprobe(target, referer)
+      source = "hls-sps"
+    }
+    if (height) {
+      choice.height = height
+      choice.label = choice.formatExpression === "m3u8"
+        ? `HLS 原始清单 · ${height}p`
+        : `原始视频 · 容器·${(choice.container || "mp4").toUpperCase()} · ${height}p`
+      enriched += 1
+      await logEvent({ level: "info", event: "probe.resolution.enrich.resolved", details: { sourceURL: target, height, elapsedMilliseconds: Date.now() - started, source } })
+    } else {
+      await logEvent({ level: "warn", event: "probe.resolution.enrich.failed", details: { sourceURL: target, formatExpression: choice.formatExpression, elapsedMilliseconds: Date.now() - started, pageHint: Boolean(pageHint) } })
+    }
+  }
+  if (enriched) await logEvent({ level: "info", event: "probe.resolution.enrich.completed", details: { enriched } })
+  return probe
+}
+
 export async function probeMedia(url: string, options: ProbeOptions = {}): Promise<MediaProbe> {
+  const probe = await probeMediaCore(url, options)
+  return enrichProbeResolutions(probe, url, options)
+}
+
+async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<MediaProbe> {
   const extractedURL = extractFirstURL(url)
   if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
   // X multi-video bare status URLs extract as playlists with empty top-level formats.
@@ -1381,6 +1682,24 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   }
 
   try {
+  // 尾部斜杠重定向型直链（porntrex get_file/.../xxx.mp4/，Safari 上下文带 Referer）：
+  // yt-dlp generic 会因 IncompleteRead/重试耗尽 45s 预算，catch 分支的 redirect-resolve
+  // 根本没机会执行。直接跟随 302 解析最终直链（与 .vid 相同思路，但提前到探测之前）。
+  if (referer && isTrailingSlashDirectMediaURL(sourceURL)) {
+    const resolvedChoice = await resolveRedirectedDirectMedia(sourceURL, referer, safariUserAgent || MOBILE_SAFARI_UA, options.safariMediaKind)
+    if (resolvedChoice) {
+      await logEvent({ level: "info", event: "probe.direct-redirect-resolved", taskId, details: { sourceURL, finalURL: resolvedChoice.sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+      return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [resolvedChoice] }
+    }
+    const fallbackChoice = directMediaChoice(sourceURL, options.safariMediaKind || "video")
+    if (fallbackChoice) {
+      fallbackChoice.sourceReferer = referer
+      fallbackChoice.previewReferer = referer
+      fallbackChoice.previewHeaders = { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA }
+      await logEvent({ level: "warn", event: "probe.direct-redirect-fallback", taskId, details: { sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+      return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [fallbackChoice] }
+    }
+  }
   let insecure = false
   let result = await runProbe(insecure)
   await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "probe.command.completed", taskId, details: { exitCode: result.exitCode, output: result.exitCode === 0 ? "媒体信息已返回" : result.output } })

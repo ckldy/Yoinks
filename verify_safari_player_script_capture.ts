@@ -47,16 +47,16 @@ function bindingMatches(text: string): string[] {
   return values
 }
 
-const source = FileManager.readAsStringSync(`${Script.directory}/browser.tsx`)
+const source = FileManager.readAsStringSync(`${Script.directory}/browser.tsx.src`)
 const mediaSource = FileManager.readAsStringSync(`${Script.directory}/services/media.ts`)
 
 const checks: Array<[string, boolean]> = [
   // browser.tsx plugin-side changes
-  ["browser.tsx bumps to 1.1.6", /\/\/ @version 1\.1\.6/.test(source)],
+  ["browser.tsx bumps to 1.2.3", /\/\/ @version 1\.2\.3/.test(source)],
   ["media element scan reads JS-set src via IDL", /function mediaElementURLs\([\s\S]*element\.currentSrc \|\| element\.src/.test(source)],
   ["<source> scan is restricted to video/audio parents", /querySelectorAll\("video source, audio source"\)/.test(source)],
   ["player script extraction is present", /function playerScriptSourceURLs\(\)/.test(source)],
-  ["player script extraction requires a media element", /if \(document\.querySelector\("video, audio"\)\) \{ for \(const value of playerScriptSourceURLs\(\)\)/.test(source)],
+  ["player script extraction runs for media element or player container", /if \(document\.querySelector\("video, audio, \.fp-player, \.kt_player, \.kt-player, \.player-wrap, \.player-holder, \.premium-player, \[class\*='player' i\]"\)\) \{ for \(const value of playerScriptSourceURLs\(\)\)/.test(source)],
   ["mergeCandidates no longer re-classifies by URL shape", !/mergeCandidates[\s\S]{0,400}!classify\(candidate\.url\)/.test(source)],
   // regex behavior against the real 8xx3 player script
   ["hls.js loadSource literal is extracted", literalMatches(REAL_PLAYER_SCRIPT).includes(EXPECTED_ENDPOINT)],
@@ -69,7 +69,7 @@ const checks: Array<[string, boolean]> = [
   ["hlsMediaChoice still guards on .m3u8 shape", hlsMediaChoice(EXPECTED_ENDPOINT) === null],
   ["plugin classify still rejects the extensionless endpoint (root cause)", classifySafariMediaURL(EXPECTED_ENDPOINT) === null],
   ["empty-formats branch sniffs for #EXTM3U", /const sniffedMaster = referer \? await sniffHlsManifest\(/.test(mediaSource) && /probe\.safari-hls\.sniffed-endpoint/.test(mediaSource)],
-  ["failed-probe branch also sniffs for #EXTM3U", /if \(referer\) \{\n\s*const sniffedMaster = await sniffHlsManifest\(/.test(mediaSource)],
+  ["failed-probe branch also sniffs for #EXTM3U", /if \(safariHlsChoice && referer\) \{\n[\s\S]{0,300}const sniffedMaster = await sniffHlsManifest\(/.test(mediaSource)],
   ["sniff bounds body to 256 KB", /contentLength > 262144/.test(mediaSource) && /text\.length <= 262144/.test(mediaSource)],
   ["sniff sends only Referer + UA (no cookies)", /headers: \{ Accept: "\*\/\*", Referer: referer, "User-Agent": userAgent \}/.test(mediaSource)],
 ]

@@ -18,6 +18,8 @@ export type YoinksPreferences = {
   maxManagedBytes: number | null
   maxHistoryRecords: number | null
   experimentalDiscoveryEnabled: boolean
+  /** 下载页是否显示“最近候选库”区域（默认显示，可在设置中关闭）。 */
+  showRecentCandidates: boolean
 }
 
 export const DEFAULT_PREFERENCES: YoinksPreferences = {
@@ -31,6 +33,7 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   maxManagedBytes: 2 * 1024 * 1024 * 1024,
   maxHistoryRecords: 100,
   experimentalDiscoveryEnabled: false,
+  showRecentCandidates: true,
 }
 
 function isSaveMode(value: unknown): value is SaveMode {
@@ -74,6 +77,7 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     maxManagedBytes: isLimit(source.maxManagedBytes) ? source.maxManagedBytes : DEFAULT_PREFERENCES.maxManagedBytes,
     maxHistoryRecords: source.maxHistoryRecords === null ? null : isLimit(source.maxHistoryRecords) ? Math.floor(source.maxHistoryRecords) : DEFAULT_PREFERENCES.maxHistoryRecords,
     experimentalDiscoveryEnabled: isBoolean(source.experimentalDiscoveryEnabled) ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
+    showRecentCandidates: isBoolean(source.showRecentCandidates) ? source.showRecentCandidates : DEFAULT_PREFERENCES.showRecentCandidates,
   }
 }
 
