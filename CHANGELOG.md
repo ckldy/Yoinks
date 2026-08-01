@@ -5,7 +5,7 @@
 ### 新功能
 
 - Safari 候选采集器更新至 **1.2.5**（1.1.9 → 1.2.5）：
-  - **PH 系站点正片捕获**（redtube / YouPorn / Pornhub / Tube8 等）：主动识别播放器配置 `mediaDefinition` 中的签名清单端点（`/media/hls?s=...`、`/media/mp4?s=...`；YouPorn 为 `/media/hls/?s=...` 尾部斜杠形态）并 fetch 解析出各档 HLS master.m3u8 与 MP4 直链，无需等待播放即可拿到真实链接。
+  - **PH 系站点正片捕获**）：主动识别播放器配置 `mediaDefinition` 中的签名清单端点（`/media/hls?s=...`、`/media/mp4?s=...`；YouPorn 为 `/media/hls/?s=...` 尾部斜杠形态）并 fetch 解析出各档 HLS master.m3u8 与 MP4 直链，无需等待播放即可拿到真实链接。
   - porntrex 等站点 kt_player **flashvars 直链捕获**（`video_url` / 别名键），并过滤全广告 iframe（`go.gsrv.dev` 等），避免把广告当播放器线索。
   - **非媒体资源噪音过滤**：播放器脚本中的头像/图标（如 `default-userAvatar.svg`）等不再误入候选列表。
   - **捕获性能优化**：PH 端点已解析出真实媒体时直接返回、跳过 30 秒播放监听循环；多个签名端点改为并发 fetch；端点超时收短——实测捕获耗时从约 37 秒降至 2-5 秒。
