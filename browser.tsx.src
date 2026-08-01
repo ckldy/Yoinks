@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Yoinks
 // @namespace https://github.com/ckldy/Yoinks
-// @version 1.2.5
+// @version 1.2.9
 // @description Collect public media candidates from the current page for Yoinks.
 // @match http://*/*
 // @match https://*/*
@@ -158,9 +158,9 @@ function mediaElementURLs(element: any): string[] {
 }
 // hls.js 等播放器通过 loadSource()/video.src= 显式传入媒体地址；该地址往往是无扩展名端点
 // （如 play.php?site_id=...）。仅读取同文档内联脚本文本的字面量/变量绑定 URL，不执行脚本、不跨域。
-function playerScriptSourceURLs(): string[] {
+function scriptSourceURLsFromDocument(doc: any): string[] {
   const values: string[] = []
-  for (const script of Array.from(document.querySelectorAll("script")) as any[]) {
+  for (const script of Array.from(doc.querySelectorAll("script")) as any[]) {
     const text = String(script.textContent || "")
     if (text.length > 100000) continue
     for (const match of text.matchAll(PLAYER_LITERAL_PATTERN)) { const url = normalizeURL(match[1]); if (url) values.push(url) }
@@ -171,6 +171,63 @@ function playerScriptSourceURLs(): string[] {
       if (new RegExp(`(?:loadSource\\s*\\(\\s*|(?:video|audio|player|hls|media)\\.src\\s*=\\s*)${id}\\b`).test(text)) values.push(url)
     }
   }
+  return values
+}
+function playerScriptSourceURLs(): string[] { return scriptSourceURLsFromDocument(document) }
+// avtoday.io/player 等同源播放器 iframe：顶层页面常无视频元素，正片地址写在 iframe 内联
+// 脚本的 m3u8_url 变量里；iframe 报告链路（SESSION/REPORT storage）在部分站点漏报，
+// 顶层直接遍历同源 iframe 的 contentDocument 提取（仅读取脚本文本，不跨域、不执行）。
+function sameOriginFrameScriptSourceURLs(): string[] {
+  const values: string[] = []
+  for (const frame of Array.from(document.querySelectorAll("iframe")) as any[]) {
+    let doc: any = null
+    try { doc = frame.contentDocument } catch { continue }
+    if (!doc || typeof doc.querySelectorAll !== "function") continue
+    values.push(...scriptSourceURLsFromDocument(doc))
+  }
+  return values
+}
+// jvlook 类 Vue 单页：正片地址存在组件 data 的 videoDetail.videoUrlOne/Two/Three（多线路），
+// 不在内联脚本文本里；遍历 Vue 组件树读取运行时 data，仅提取媒体 URL，不执行脚本、不跨域。
+// 覆盖 videoUrl* 键与常见 detail 容器（videoDetail/videoInfo/playInfo/playerData）。
+const VUE_MEDIA_DETAIL_KEYS = /(?:videoDetail|videoInfo|playInfo|playerData|videoData)/i
+const VUE_MEDIA_URL_KEYS = /^videoUrl(?:One|Two|Three|1|2|3)?$/i
+function vueComponentMediaURLs(): string[] {
+  const values: string[] = []
+  const seen = new Set<string>()
+  const pushMedia = (value: unknown): void => {
+    if (typeof value !== "string" || !/^https?:\/\//i.test(value)) return
+    try {
+      const url = normalizeURL(value)
+      if (url && !seen.has(url) && classify(url)) { seen.add(url); values.push(url) }
+    } catch {}
+  }
+  const visitDetail = (value: unknown): void => {
+    if (!value || typeof value !== "object") return
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (VUE_MEDIA_URL_KEYS.test(key)) pushMedia(child)
+      else if (typeof child === "string" && /^(?:videoUrl|file|src)$/i.test(key)) pushMedia(child)
+      else if (child && typeof child === "object") visitDetail(child)
+    }
+  }
+  const walk = (node: any, depth: number): void => {
+    if (depth > 8 || !node || values.length > 12) return
+    try {
+      const data = node.$data || node
+      if (data && typeof data === "object") {
+        for (const [key, value] of Object.entries(data)) {
+          if (VUE_MEDIA_DETAIL_KEYS.test(key)) visitDetail(value)
+          else if (VUE_MEDIA_URL_KEYS.test(key)) pushMedia(value)
+          else if (value && typeof value === "object" && !Array.isArray(value)) walk(value, depth + 1)
+        }
+      }
+    } catch {}
+    try { for (const child of Array.from(node.$children || [])) walk(child, depth + 1) } catch {}
+  }
+  try {
+    const root = (document.querySelector("#app") as any)?.__vue__
+    if (root) walk(root, 0)
+  } catch {}
   return values
 }
 // 页面内联脚本里的 mediaDefinition 配置中，指向签名清单端点的 videoUrl（如 /media/hls?s=...）。
@@ -251,6 +308,12 @@ async function collectCandidates(): Promise<Candidate[]> {
   // （kt_player/flowplayer 等）设置媒体地址；有媒体元素或播放器容器（div 类名含
   // player 的 flowplayer 壳，porntrex kt_player 在页面无 <video> 时也适用）即提取。
   if (document.querySelector("video, audio, .fp-player, .kt_player, .kt-player, .player-wrap, .player-holder, .premium-player, [class*='player' i]")) { for (const value of playerScriptSourceURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" }) }
+  // avtoday.io/player 等同源 iframe 播放器：顶层无媒体元素时正片地址仍在 iframe 内联脚本
+  // （var m3u8_url = '...'）里，直接读同源 iframe 的 contentDocument 脚本，不依赖 iframe 报告链路。
+  for (const value of sameOriginFrameScriptSourceURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
+  // jvlook 类 Vue 单页：videoDetail.videoUrlOne/Two/Three 在组件 data 里（镜像源常藏在
+  // videoUrlTwo/Three），运行时读取 Vue 树即可拿到真实媒体地址，避免只抓到 Twitter 原始源。
+  for (const value of vueComponentMediaURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
   // PH 系签名清单端点：主动 fetch 解析（无需用户点击播放），把真实媒体 URL 加入候选。
   // 并发 fetch（hls/mp4 端点互不依赖），避免串行等待拖慢捕获（真机曾串行耗时 6s+）。
   const endpointResults = await Promise.all(playerMediaEndpointURLs().slice(0, MAX_MEDIA_ENDPOINT_FETCHES).map(endpoint => resolvePHMediaEndpoint(endpoint)))
@@ -324,6 +387,9 @@ async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: bool
   const startedAt = Date.now(), session: CaptureSession = { id: `capture-${startedAt}-${Math.random().toString(36).slice(2, 10)}`, startedAt, pageURL: normalizeURL(location.href) || "" }
   activeSessionId = session.id; activeReports.clear()
   try {
+    // 每次点击浮标重新捕获前先清除旧候选数据（含上一次页面残留）：即使本次捕获失败/异常，
+    // 导入时也不会看到旧页面的候选或链接。REPORT/SESSION 由 finally 清理，这里只需清主存储。
+    await GM.setValue(STORAGE_KEY, null)
     await GM.setValue(REPORT_STORAGE_KEY, null)
     await GM.setValue(SESSION_STORAGE_KEY, session)
     await wait(CAPTURE_DELAY_MS)
@@ -458,6 +524,9 @@ async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
     if (longPressTriggered || suppressClick) { suppressClick = false; return }
     entry.disabled = true
     try {
+      // 最优先：清除上一次捕获的旧候选数据（防止旧页面链接残留），
+      // 再触发播放/进入监听，最后才执行捕获覆盖新数据。
+      await GM.setValue(STORAGE_KEY, null)
       showFloatingFeedback(entry, "正在等待媒体地址…")
       // beeg 等站点需点击播放后才请求 m3u8；在用户激活内同步触发播放，绕过 iOS 自动播放拦截。
       triggerPlaybackIfIdle()

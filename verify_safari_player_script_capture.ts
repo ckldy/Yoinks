@@ -20,7 +20,20 @@ const REAL_PLAYER_SCRIPT = `
     }
 `
 
+// Real inline player script from https://avtoday.io/player?s=FC2PPV-4934366: the top-level
+// page has no media element, and the m3u8 lives only in this same-origin iframe script as a
+// var binding consumed by hls.loadSource(m3u8_url).
+const AVTODAY_PLAYER_SCRIPT = `
+    var m3u8_url = 'https://avtoday.io/streaming/FC2PPV-4934366/7cab89a1119ccd7b5cae08f05569a9d0.m3u8';
+    var cover = '/pic/2026/08/FC2PPV-4934366-1785585378.jpg';
+    var spcode = 'FC2PPV-4934366';
+    var hls = new Hls();
+    hls.loadSource(m3u8_url);
+    hls.attachMedia(video);
+`
+
 const EXPECTED_ENDPOINT = "https://m.892539.xyz/play.php?site_id=20&source_id=206169"
+const EXPECTED_AVTODAY = "https://avtoday.io/streaming/FC2PPV-4934366/7cab89a1119ccd7b5cae08f05569a9d0.m3u8"
 
 // Mirrors browser.tsx: PLAYER_LITERAL_PATTERN / PLAYER_BINDING_PATTERN.
 const PLAYER_LITERAL_PATTERN = /(?:loadSource\s*\(\s*|(?:video|audio|player|hls|media)\.src\s*=\s*)["'`]([^"'`]+)["'`]/gi
@@ -52,16 +65,24 @@ const mediaSource = FileManager.readAsStringSync(`${Script.directory}/services/m
 
 const checks: Array<[string, boolean]> = [
   // browser.tsx plugin-side changes
-  ["browser.tsx bumps to 1.2.3", /\/\/ @version 1\.2\.3/.test(source)],
+  ["browser.tsx bumps to 1.2.9", /\/\/ @version 1\.2\.9/.test(source)],
   ["media element scan reads JS-set src via IDL", /function mediaElementURLs\([\s\S]*element\.currentSrc \|\| element\.src/.test(source)],
   ["<source> scan is restricted to video/audio parents", /querySelectorAll\("video source, audio source"\)/.test(source)],
   ["player script extraction is present", /function playerScriptSourceURLs\(\)/.test(source)],
+  ["same-origin iframe script extraction is present", /function sameOriginFrameScriptSourceURLs\(\)/.test(source)],
+  ["same-origin iframe read runs in collectCandidates", /for \(const value of sameOriginFrameScriptSourceURLs\(\)\)/.test(source)],
+  ["Vue component media extraction is present", /function vueComponentMediaURLs\(\)/.test(source) && /VUE_MEDIA_DETAIL_KEYS/.test(source)],
+  ["Vue component media read runs in collectCandidates", /for \(const value of vueComponentMediaURLs\(\)\)/.test(source)],
+  ["capture clears stale candidates before re-capture", /await GM\.setValue\(STORAGE_KEY, null\)/.test(source)],
+  ["capture clears before playback trigger", /await GM\.setValue\(STORAGE_KEY, null\)[\s\S]{0,220}triggerPlaybackIfIdle\(\)/.test(source)],
   ["player script extraction runs for media element or player container", /if \(document\.querySelector\("video, audio, \.fp-player, \.kt_player, \.kt-player, \.player-wrap, \.player-holder, \.premium-player, \[class\*='player' i\]"\)\) \{ for \(const value of playerScriptSourceURLs\(\)\)/.test(source)],
   ["mergeCandidates no longer re-classifies by URL shape", !/mergeCandidates[\s\S]{0,400}!classify\(candidate\.url\)/.test(source)],
   // regex behavior against the real 8xx3 player script
   ["hls.js loadSource literal is extracted", literalMatches(REAL_PLAYER_SCRIPT).includes(EXPECTED_ENDPOINT)],
   ["native video.src assignment is extracted", literalMatches(REAL_PLAYER_SCRIPT).includes(EXPECTED_ENDPOINT)],
   ["identifier binding is resolved when used by loadSource", bindingMatches("const u = 'https://cdn.example/v.m3u8'; hls.loadSource(u);").includes("https://cdn.example/v.m3u8")],
+  ["avtoday same-origin iframe var binding is resolved", bindingMatches(AVTODAY_PLAYER_SCRIPT).includes(EXPECTED_AVTODAY)],
+  ["avtoday m3u8 var is classified as hls", classifySafariMediaURL(EXPECTED_AVTODAY) === "hls"],
   ["identifier binding is ignored when not used by a player", !bindingMatches("const u = 'https://cdn.example/analytics.gif'; foo(u);").length],
   ["picture/source ad URLs stay non-candidates", classifySafariMediaURL("https://www.8xx3.lol/ad/8728.gif") === null],
   // media.ts app-side changes

@@ -35,3 +35,10 @@ export function candidateDetailValue(value: string | undefined, safariOnly: bool
 export function safariManifestNeedsTitleAlignment(kind: MediaCandidateKind | "inferred" | undefined, title: string | undefined): boolean { return (kind === "hls" || kind === "dash") && Boolean(title) }
 export function safariCandidateNeedsTitleAlignment(candidate: Pick<MediaCandidate, "source" | "kind" | "title">): boolean { return candidate.source === "safari" && safariManifestNeedsTitleAlignment(candidate.kind, candidate.title) }
 export function clearMediaCandidates(): void { Storage.remove(KEY) }
+/** 仅清除 Safari 采集来源的最近候选（保留发现/手动来源），供新捕获导入前清理旧链接。 */
+export function clearSafariMediaCandidatesFromLibrary(): MediaCandidate[] {
+  const now = Date.now()
+  const next = read(now).filter((candidate) => candidate.source !== "safari")
+  Storage.set(KEY, next)
+  return next
+}

@@ -2,7 +2,7 @@
 
 面向 [Scripting](https://scripting.fun) 的 iOS 媒体下载脚本。粘贴或分享公开媒体链接，探测可选格式后下载，并可保存到相册或文件。
 
-当前版本：**1.6.6**
+当前版本：**1.6.8**
 
 作者：**vcncv**
 
@@ -126,6 +126,8 @@ scripting-ts project "Yoinks" --check
 
 | 版本 | 要点 |
 |------|------|
+| **1.6.8** | 修复「最近候选库」残留旧 Safari 数据：启动时同步 Safari 最新捕获时间戳，新捕获晚于候选库最新 Safari 候选时自动清除旧 Safari 来源候选（保留发现/手动来源）；采集器 1.2.9 清除逻辑回归确认 |
+| **1.6.7** | Safari 采集器 1.2.9：同源 iframe 直读 m3u8（avtoday）+ 公开播放器解析 UA/重试；Vue 组件树提取镜像源 videoUrlOne/Two/Three + 候选分析回退链（jvlook）；点击浮动入口捕获前最优先清除旧候选数据；已完成真机验收 |
 | **1.6.6** | Safari 采集器 1.2.5：PH 系站点（redtube / YouPorn 等）签名清单端点捕获（/media/hls?s=、/media/mp4?s=）、porntrex flashvars 直链、非媒体资源噪音过滤、捕获性能优化（37 秒 → 2-5 秒）；通用清晰度补全（moov / TS SPS / ffprobe）；最近候选库可关闭；转换器同步管线修复；已完成真机验收 |
 | **1.6.5** | Safari 采集器 1.1.9：捕获 `.vid` 重定向型正片端点（sxyprn 等，302 解析出最终 CDN 直链并回填 720p 清晰度）；预览噪音过滤（bkcdn library / trafficdeposit pivi / vidthumb.mp4）；主媒体延迟设置时自动补捕获；`.vid` 导入直链分析 + 失败兜底；已完成真机验收 |
 | **1.6.4** | HLS 原生 HTTP/2 分片优先下载（自动最高清晰度/多档选择/可即时取消）；无 referer m3u8 直链也原生分片；Safari 采集器 1.1.6（无扩展名 HLS、跨域 iframe、播放触发捕获）；重复下载检测、缓存清理、yt-dlp 缺失防御；下载逻辑拆分 HLS 模块；已完成真机验收 |

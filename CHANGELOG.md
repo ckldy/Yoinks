@@ -1,11 +1,42 @@
 # 更新日志
 
+## 1.6.8 — 2026-08-02
+
+### 改进与修复
+
+- **修复「最近候选库」残留旧 Safari 数据**：之前仅在点击「从 Safari 导入媒体候选」时才清除 Safari 来源的历史候选；若用户在插件里又捕获了新数据但尚未导入，直接打开 App 时「最近候选库」仍显示上一次页面的旧链接。现改为 App 启动时同步 Safari 最新捕获时间戳——新捕获晚于候选库最新 Safari 候选时，自动清除旧 Safari 来源候选（保留发现/手动来源）。
+- 回归确认采集器 1.2.9 清除逻辑正确：点击浮动入口捕获前最优先清空旧候选（click handler + captureCurrentPage 双重兜底），部署产物与源码版本一致，无残留通道。
+
+### 验证
+
+- 已通过 TypeScript 项目诊断、verify_safari_player_script_capture 26 项、verify_browser_publish 19 项、verify_download_cancel 40 项、verify_hls_variant_choices 21 项、verify_hls_highest_variant 9 项、新增 verify_media_candidates_sync 7 项（候选库同步语义：新捕获清除旧 Safari 候选 / 保留发现手动 / 旧 envelope 不误清）。
+
+## 1.6.7 — 2026-08-02
+
+### 新功能
+
+- Safari 候选采集器更新至 **1.2.9**（1.2.5 → 1.2.9）：
+  - **avtoday 同源 iframe 直读**：正片 m3u8 藏在同源 iframe 的脚本变量中，采集器直接遍历同源 iframe 文档提取真实播放地址，不再依赖被 Cloudflare 断连的跨 frame 探测。
+  - **jvlook Vue 镜像源提取**：读取页面 Vue 组件树中的 `videoDetail.videoUrlOne/Two/Three` 镜像源字段，与 Twitter 原始源一并入库，避免只抓到 403 原始源而漏掉可用镜像。
+  - **捕获前清除旧数据**：点击浮动入口捕获时，最优先清空上一次捕获的候选数据（先清除 → 再触发播放 → 再捕获），防止旧页面链接残留；`captureCurrentPage` 内部同样兜底清空。
+
+### 改进与修复
+
+- 公开播放器 frame 解析带 Safari UA + 重试，规避 Cloudflare 断连；`normalizePublicURL` 修剪尾部 `'"` 引号残留；运行日志上限 128K → 512K。
+- 候选分析失败时自动回退尝试镜像源（回退链 `safari-candidate.fallback-next`），Twitter 原始源 403 不再整条失败。
+- 导入 Safari 候选时先清除「最近候选库」中 Safari 来源的历史记录（保留手动/发现来源），避免旧链接累积。
+
+### 验证
+
+- 已通过 TypeScript 项目诊断、verify_safari_player_script_capture 26 项、verify_browser_publish 19 项、`scripting-ts project "Yoinks"` 启动回归。
+- 真机验收通过：avtoday / jvlook 捕获出真实链接并可分析；点击浮动入口旧数据被清除后再捕获；jvlook 镜像源解析成功。
+
 ## 1.6.6 — 2026-08-01
 
 ### 新功能
 
 - Safari 候选采集器更新至 **1.2.5**（1.1.9 → 1.2.5）：
-  - **PH 系站点正片捕获**）：主动识别播放器配置 `mediaDefinition` 中的签名清单端点（`/media/hls?s=...`、`/media/mp4?s=...`；YouPorn 为 `/media/hls/?s=...` 尾部斜杠形态）并 fetch 解析出各档 HLS master.m3u8 与 MP4 直链，无需等待播放即可拿到真实链接。
+  - **PH 系站点正片捕获**（redtube / YouPorn / Pornhub / Tube8 等）：主动识别播放器配置 `mediaDefinition` 中的签名清单端点（`/media/hls?s=...`、`/media/mp4?s=...`；YouPorn 为 `/media/hls/?s=...` 尾部斜杠形态）并 fetch 解析出各档 HLS master.m3u8 与 MP4 直链，无需等待播放即可拿到真实链接。
   - porntrex 等站点 kt_player **flashvars 直链捕获**（`video_url` / 别名键），并过滤全广告 iframe（`go.gsrv.dev` 等），避免把广告当播放器线索。
   - **非媒体资源噪音过滤**：播放器脚本中的头像/图标（如 `default-userAvatar.svg`）等不再误入候选列表。
   - **捕获性能优化**：PH 端点已解析出真实媒体时直接返回、跳过 30 秒播放监听循环；多个签名端点改为并发 fetch；端点超时收短——实测捕获耗时从约 37 秒降至 2-5 秒。

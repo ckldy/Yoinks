@@ -99,6 +99,7 @@ import {
 import {
   candidateDetailValue,
   clearMediaCandidates,
+  clearSafariMediaCandidatesFromLibrary,
   filterMediaCandidates,
   listMediaCandidates,
   rememberMediaCandidate,
@@ -597,6 +598,21 @@ function View() {
     setBrowserPlugin(getBrowserPluginStatus())
     void refreshHistory()
     void refreshLoggedInSessions()
+    // 启动时同步 Safari 最新捕获：若用户在插件里又捕获了新数据但尚未导入，
+    // 旧 safari 来源候选仍会残留在「最近候选库」。比较捕获时间戳，新捕获
+    // 晚于候选库最新 safari 候选时先清掉旧 safari 候选（保留发现/手动来源），
+    // 避免用户打开 App 后看到上一次页面的旧链接。导入按钮路径另有清理。
+    void (async () => {
+      try {
+        const envelope = await readSafariMediaCandidates()
+        if (!envelope) return
+        const latestSafariAt = listMediaCandidates().reduce((max, candidate) => candidate.source === "safari" ? Math.max(max, candidate.createdAt) : max, 0)
+        if (envelope.capturedAt > latestSafariAt) {
+          clearSafariMediaCandidatesFromLibrary()
+          setMediaCandidates(listMediaCandidates())
+        }
+      } catch { /* Safari 存储不可读时静默跳过 */ }
+    })()
     return () => {
       for (const session of Object.values(platformSessionsRef.current)) {
         if (session?.retention === "temporary") disposePlatformSession(session)
@@ -1085,7 +1101,7 @@ function View() {
     } catch { return false }
   }
 
-  const analyzeSafariCandidate = async (candidate: SafariMediaCandidate, playerFrameURL?: string, directOnly = false) => {
+  const analyzeSafariCandidate = async (candidate: SafariMediaCandidate, playerFrameURL?: string, directOnly = false, fallbackCandidates: SafariMediaCandidate[] = []) => {
     launchClipboardSuppressedRef.current = false
     analysisGenerationRef.current += 1
     disposeTemporarySession()
@@ -1112,6 +1128,14 @@ function View() {
     const analyzed = await analyzeMedia(analysisURL, false, preferPageFormats)
     if (analyzed || !preferPageFormats) {
       if (analyzed) await clearSafariMediaCandidates()
+      return
+    }
+    // 页面优先探测失败但还有同页面候选（如 jvlook 镜像源在 videoUrlTwo/Three）：
+    // 自动尝试下一个候选，避免用户停留在 Twitter 原始源 403 失败后无路可走。
+    if (fallbackCandidates.length) {
+      const [next, ...rest] = fallbackCandidates
+      await logEvent({ level: "warn", event: "safari-candidate.fallback-next", details: { failedURL: candidate.url, nextURL: next.url, remaining: rest.length } })
+      await analyzeSafariCandidate(next, undefined, safariCandidateIsVidRedirect(next), rest)
       return
     }
     // 页面优先探测失败：正片常藏在跨域 iframe 的静态播放器里（如 mydaddy.cc 的
@@ -1148,6 +1172,10 @@ function View() {
       setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
       return
     }
+    // 每次导入新捕获前先清掉旧的 safari 来源候选（保留发现/手动来源），
+    // 避免「最近候选库」残留上一次页面的链接；公开播放器分支与候选循环都覆盖。
+    clearSafariMediaCandidatesFromLibrary()
+    setMediaCandidates(listMediaCandidates())
     if (envelope.playerFrameURL) {
       // 公开播放器链路优先：正片常藏在跨域 iframe 播放器（如 mydaddy.cc fluidplayer 的
       // 360/720/1080），且来源页 yt-dlp 大多不支持。解析成功则一次到位展示格式；
@@ -1207,7 +1235,9 @@ function View() {
     if (selected == null) return
     const candidate = envelope.candidates[selected]
     if (!candidate) return
-    await analyzeSafariCandidate(candidate, envelope.playerFrameURL, safariCandidateIsVidRedirect(candidate))
+    // 分析失败时自动尝试同页面其他候选（如 jvlook 镜像源），避免 Twitter 原始源 403 后无路可走。
+    const fallbacks = envelope.candidates.filter((c) => c.url !== candidate.url)
+    await analyzeSafariCandidate(candidate, envelope.playerFrameURL, safariCandidateIsVidRedirect(candidate), fallbacks)
   }
 
   const chooseRecentLink = async () => {

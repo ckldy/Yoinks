@@ -1305,25 +1305,28 @@ export function publicPlayerFetchTimeoutMilliseconds(deadline?: number): number 
 
 async function fetchPublicHTML(url: string, deadline?: number): Promise<{ finalURL: string; contentType?: string; html: string; title?: string } | null> {
   // 公开 HTML 回退也必须计入 45 秒总预算，避免 yt-dlp 超时后再叠加页面+iframe 解析造成无界等待。
-  const timeoutMilliseconds = publicPlayerFetchTimeoutMilliseconds(deadline)
-  if (timeoutMilliseconds <= 0) return null
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds)
-  try {
-    const response = await fetch(url, { headers: { Accept: "text/html,application/xhtml+xml" }, signal: controller.signal })
-    if (!response.ok) return null
-    const contentType = response.headers.get("content-type") || undefined
-    const contentLength = Number(response.headers.get("content-length") || 0)
-    if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) return null
-    if (Number.isFinite(contentLength) && contentLength > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
-    const html = await response.text()
-    if (html.length > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
-    return { finalURL: response.url || url, contentType, html }
-  } catch {
-    return null
-  } finally {
-    clearTimeout(timeout)
+  // 浏览器化请求头：Cloudflare 等 CDN 会断连无 UA 的裸 fetch（如 avtoday.io/player RemoteDisconnected），
+  // 必须携带移动 Safari UA + Accept-Language；失败重试一次以规避 CDN 瞬断。
+  for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+    const timeoutMilliseconds = publicPlayerFetchTimeoutMilliseconds(deadline)
+    if (timeoutMilliseconds <= 0) return null
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds)
+    try {
+      const response = await fetch(url, { headers: { Accept: "text/html,application/xhtml+xml", "User-Agent": MOBILE_SAFARI_UA, "Accept-Language": "zh-CN,zh-Hans;q=0.9,en;q=0.8" }, signal: controller.signal })
+      if (!response.ok) return null
+      const contentType = response.headers.get("content-type") || undefined
+      const contentLength = Number(response.headers.get("content-length") || 0)
+      if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) return null
+      if (Number.isFinite(contentLength) && contentLength > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
+      const html = await response.text()
+      if (html.length > PUBLIC_PLAYER_MAX_HTML_BYTES) return null
+      return { finalURL: response.url || url, contentType, html }
+    } catch { /* 瞬断：进入下一次重试 */ } finally {
+      clearTimeout(timeout)
+    }
   }
+  return null
 }
 
 function publicChoice(source: PublicPlayerSource): MediaChoice | null {
@@ -1351,25 +1354,30 @@ export async function probeSafariPublicPlayerFrame(frameURL: string, pageTitle?:
   const deadline = Date.now() + PUBLIC_PLAYER_PAGE_TIMEOUT_MS
   let remainingBytes = PUBLIC_PLAYER_MAX_HTML_BYTES
   const fetchText = async (url: string, accept: string): Promise<{ finalURL: string; contentType?: string; text: string } | null> => {
-    const remainingMilliseconds = deadline - Date.now()
-    if (remainingMilliseconds <= 0 || remainingBytes <= 0) return null
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), remainingMilliseconds)
-    try {
-      // 公开播放器常校验 Referer（如 mydaddy.cc 仅放行来源站点的无浏览器请求）。
-      // referer 来自用户 Safari 当前页（公开 URL），不携带 Cookie/授权/请求头。
-      const headers: Record<string, string> = { Accept: accept }
-      if (referer && /^https?:\/\//i.test(referer)) headers.Referer = referer
-      const response = await fetch(url, { headers, signal: controller.signal })
-      if (!response.ok) return null
-      const contentLength = Number(response.headers.get("content-length") || 0)
-      if (Number.isFinite(contentLength) && contentLength > remainingBytes) return null
-      const text = await response.text()
-      const bytes = new TextEncoder().encode(text).length
-      if (bytes > remainingBytes) return null
-      remainingBytes -= bytes
-      return { finalURL: response.url || url, contentType: response.headers.get("content-type") || undefined, text }
-    } catch { return null } finally { clearTimeout(timeout) }
+    // 浏览器化请求头：Cloudflare 等 CDN 会断连无 UA 的裸 fetch（如 avtoday.io/player），
+    // 必须携带移动 Safari UA + Accept-Language；失败重试一次以规避 CDN 瞬断。
+    for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+      const remainingMilliseconds = deadline - Date.now()
+      if (remainingMilliseconds <= 0 || remainingBytes <= 0) return null
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), remainingMilliseconds)
+      try {
+        // 公开播放器常校验 Referer（如 mydaddy.cc 仅放行来源站点的无浏览器请求）。
+        // referer 来自用户 Safari 当前页（公开 URL），不携带 Cookie/授权/请求头。
+        const headers: Record<string, string> = { Accept: accept, "User-Agent": MOBILE_SAFARI_UA, "Accept-Language": "zh-CN,zh-Hans;q=0.9,en;q=0.8" }
+        if (referer && /^https?:\/\//i.test(referer)) headers.Referer = referer
+        const response = await fetch(url, { headers, signal: controller.signal })
+        if (!response.ok) return null
+        const contentLength = Number(response.headers.get("content-length") || 0)
+        if (Number.isFinite(contentLength) && contentLength > remainingBytes) return null
+        const text = await response.text()
+        const bytes = new TextEncoder().encode(text).length
+        if (bytes > remainingBytes) return null
+        remainingBytes -= bytes
+        return { finalURL: response.url || url, contentType: response.headers.get("content-type") || undefined, text }
+      } catch { /* 瞬断：进入下一次重试 */ } finally { clearTimeout(timeout) }
+    }
+    return null
   }
   await logEvent({ level: "info", event: "safari-public-player.started", taskId, details: { hasFrame: true } })
   let stage = "started"

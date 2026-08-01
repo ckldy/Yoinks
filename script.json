@@ -21,7 +21,7 @@
   },
   "name" : "Yoinks",
   "runInApp" : true,
-  "version" : "1.6.6",
+  "version" : "1.6.8",
   "icon" : "arrow.down.to.line.compact",
   "permissions" : null,
   "remoteResource" : {

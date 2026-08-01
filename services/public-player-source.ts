@@ -30,7 +30,10 @@ export function normalizePublicURL(value: unknown, baseURL?: string): string | n
   const raw = cleanText(value)
   if (!raw || /[\r\n]/.test(String(value ?? ""))) return null
   try {
-    const url = new URL(decodeValue(raw), baseURL)
+    // URL 字面量正则可能吞掉 JS 语句尾（如 avtoday `var m3u8_url='...m3u8';` 里
+    // 的引号+分号），导致 pathname 以 `';` 结尾而 /\\.m3u8$/ 不匹配；统一修剪尾部
+    // 引号/分号，避免误把语句终止符并入媒体 URL。
+    const url = new URL(decodeValue(raw).replace(/[`'"\;]+$/, ""), baseURL)
     if (url.protocol !== "https:" && url.protocol !== "http:") return null
     url.hash = ""
     return url.toString()
