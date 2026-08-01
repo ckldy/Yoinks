@@ -16,7 +16,8 @@ const checks: Array<[string, boolean]> = [
   ["capture returns waitingForPlayback when player idle", /Promise<\{ count: number; hasFrameClue: boolean; waitingForPlayback\?: boolean \}>/.test(source) && /\.\.\.\(candidates\.length === 0 && hasMediaElement\(\) \? \{ waitingForPlayback: true \} : \{\}\)/.test(source)],
   ["listens for playback media then recaptures", /const startMedia = collectMediaLikeURLs\(\)[\s\S]*const listenDeadline = Date\.now\(\) \+ LISTEN_TIMEOUT_MS[\s\S]*collectMediaLikeURLs\(\)\.size > startMedia\.size \|\| videoStarted\(\)[\s\S]*candidatesAfterPlayback[\s\S]*GM\.setValue\(STORAGE_KEY, envelopeAfter\)/.test(source)],
   ["waiting-for-playback feedback is user-facing", /showFloatingFeedback\(entry, result\.count \? `已捕获 \$\{result\.count\} 个候选` : result\.waitingForPlayback \? "请点击页面播放按钮，播放后自动捕获"/.test(source)],
-  ["version bumped to 1.1.6", /\/\/ @version 1\.1\.6/.test(source)],
+  ["listens when main media src is unresolved even with preview candidates", /if \(hasMediaElement\(\) && !mainMediaResolved\(\)\)/.test(source) && /function mainMediaResolved[\s\S]*currentSrc \|\| element\.src/.test(source)],
+  ["version bumped to 1.1.9", /\/\/ @version 1\.1\.9/.test(source)],
 ]
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name)
 if (failed.length) throw new Error(`Safari delayed capture checks failed: ${failed.join(", ")}`)

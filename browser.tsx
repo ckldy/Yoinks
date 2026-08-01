@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Yoinks
 // @namespace https://github.com/ckldy/Yoinks
-// @version 1.1.6
+// @version 1.1.9
 // @description Collect public media candidates from the current page for Yoinks.
 // @match http://*/*
 // @match https://*/*
@@ -45,7 +45,7 @@ const PLAYBACK_TRIGGER_MS = 1500
 const LISTEN_POLL_MS = 400
 const LISTEN_TIMEOUT_MS = 30000
 const MAX_CANDIDATES = 50
-const VIDEO_PATTERN = /\.(?:mp4|m4v|mov|webm|mkv|avi|flv)$/i
+const VIDEO_PATTERN = /\.(?:mp4|m4v|mov|webm|mkv|avi|flv|vid)$/i
 const AUDIO_PATTERN = /\.(?:m4a|aac|mp3|opus|ogg|wav)$/i
 const SEGMENT_PATTERN = /\.(?:ts|m4s)$/i
 const PLAYER_LITERAL_PATTERN = /(?:loadSource\s*\(\s*|(?:video|audio|player|hls|media)\.src\s*=\s*)["'`]([^"'`]+)["'`]/gi
@@ -69,7 +69,7 @@ function collectMediaLikeURLs(): Set<string> {
     if (!url) continue
     try {
       const parsed = new URL(url)
-      if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|ts|m4s)(?:$|[?#])/i.test(parsed.pathname) || /(?:manifest|playlist|m3u8|mpd)=/i.test(parsed.search)) set.add(url)
+      if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|ts|m4s|vid)(?:$|[?#])/i.test(parsed.pathname) || /(?:manifest|playlist|m3u8|mpd)=/i.test(parsed.search)) set.add(url)
     } catch {}
   }
   return set
@@ -77,6 +77,16 @@ function collectMediaLikeURLs(): Set<string> {
 function videoStarted(): boolean {
   const video = document.querySelector("video") as any
   return Boolean(video && video.readyState >= 1 && video.paused === false)
+}
+// sxyprn 等站点主播放器 src 由 JS 延迟设置（getvsrc()），捕获时可能仍为空，
+// 而推荐/广告预览 mp4 已进候选。存在未就绪的媒体元素时也要进入监听循环，
+// 等正片地址出现（.vid 等）后自动补捕获，而不是把预览片段当正片。
+function mainMediaResolved(): boolean {
+  for (const element of Array.from(document.querySelectorAll("video, audio")) as any[]) {
+    const resolved = element.currentSrc || element.src
+    if (typeof resolved === "string" && /^https?:\/\//i.test(resolved)) return true
+  }
+  return false
 }
 
 function normalizeURL(value: string | null | undefined): string | null {
@@ -93,10 +103,16 @@ function classify(value: string): CandidateKind | null {
   if (AUDIO_PATTERN.test(pathname)) return "audio"
   return /(?:^|[?&])(?:manifest|playlist|m3u8|mpd)=/i.test(url.search) ? "inferred" : null
 }
+// 站点“相关视频”预览/广告：CDN77 *.bkcdn.net/library/<id>/<hash>.mp4、trafficdeposit
+// /pivi/ 视频缩略图（vidthumb.mp4）等，均为几十到几百 KB，与正片无关（hqporner/sxyprn
+// 已确认）。正片 CDN（如 c8/c10.trafficdeposit.com/widi/*.vid）不受影响。
+const NOISE_PREVIEW_RE = /(?:\.|^)bkcdn\.net\/library\/|trafficdeposit\.com\/pivi\//i
+const NOISE_VIDEO_THUMB_RE = /vidthumb\.mp4(?:$|[?#])/i
 function priority(candidate: Candidate): number {
   const pathname = new URL(candidate.url).pathname.toLowerCase()
   if (candidate.kind === "hls") return /(?:^|[-_.\/])(?:master|playlist)(?:[-_.\/]|$)/i.test(pathname) ? 0 : /(?:^|[-_.])(?:a\d+|audio)(?:[-_.]|$)/i.test(pathname) ? 4 : 1
-  return candidate.kind === "dash" ? 2 : candidate.kind === "video" ? 3 : candidate.kind === "audio" ? 4 : 5
+  const base = candidate.kind === "dash" ? 2 : candidate.kind === "video" ? 3 : candidate.kind === "audio" ? 4 : 5
+  return NOISE_PREVIEW_RE.test(pathname) || NOISE_VIDEO_THUMB_RE.test(pathname) ? 6 : base
 }
 function sourceURLs(element: any): string[] { const values = [element.getAttribute("src")], srcset = element.getAttribute("srcset"); if (srcset) values.push(...srcset.split(",").map((part: string) => part.trim().split(/\s+/)[0])); return values.filter((value): value is string => !!value) }
 // JS 设置的 video.src / currentSrc 不会出现在 getAttribute("src") 里（MSE 路径还会被覆盖为 blob:），
@@ -140,7 +156,7 @@ function collectCandidates(): Candidate[] {
   document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[name="twitter:player:stream"], meta[property="twitter:player:stream"]').forEach((element: any) => { const value = element.getAttribute("content"); if (value) pending.push({ value, source: "metadata" }) })
   performance.getEntriesByType("resource").forEach((entry: any) => pending.push({ value: entry.name, source: "performance" }))
   const seen = new Set<string>(), candidates: Candidate[] = []
-  for (const item of pending) { const url = normalizeURL(item.value), kind = url ? classify(url) || item.mediaKind : null; if (!url || !kind || seen.has(url)) continue; seen.add(url); candidates.push({ id: `candidate-${candidates.length + 1}`, url, kind, pageURL, pageTitle, discoveredAt, source: item.source }) }
+  for (const item of pending) { const url = normalizeURL(item.value), kind = url ? classify(url) || item.mediaKind : null; if (!url || !kind || seen.has(url)) continue; if (NOISE_PREVIEW_RE.test(url) || NOISE_VIDEO_THUMB_RE.test(url)) continue; seen.add(url); candidates.push({ id: `candidate-${candidates.length + 1}`, url, kind, pageURL, pageTitle, discoveredAt, source: item.source }) }
   return sortCandidates(candidates)
 }
 function sortCandidates(candidates: Candidate[]): Candidate[] { return candidates.map((candidate, index) => ({ candidate, index })).sort((a, b) => priority(a.candidate) - priority(b.candidate) || a.index - b.index).slice(0, MAX_CANDIDATES).map(({ candidate }) => candidate) }
@@ -170,7 +186,7 @@ function validSession(value: any): value is CaptureSession { return !!value && t
 function validReport(value: any): value is FrameReport { return !!value && typeof value.sessionId === "string" && typeof value.reportId === "string" && typeof value.pageURL === "string" && Array.isArray(value.candidates) }
 function captureDiagnostic(candidateCount: number, topLevelCandidateCount: number, frameReportCount: number, frameCandidateCount: number, waitMs: number, errorKind?: string): Record<string, unknown> {
   const entries = performance.getEntriesByType("resource") as Array<{ name?: string; initiatorType?: string }>, initiators: Record<string, number> = {}, hosts = new Set<string>(); let mediaLikeResourceCount = 0, iframeCount = 0
-  for (const entry of entries) { const initiator = String(entry.initiatorType || "other").slice(0, 40); initiators[initiator] = (initiators[initiator] || 0) + 1; if (initiator === "iframe") iframeCount += 1; try { const url = new URL(String(entry.name || "")); hosts.add(url.host); if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|m4a|mp3|aac|opus|ogg|wav)(?:$|[?#])/i.test(url.pathname) || /(?:manifest|playlist|m3u8|mpd|stream|media|video)=/i.test(url.search)) mediaLikeResourceCount += 1 } catch {} }
+  for (const entry of entries) { const initiator = String(entry.initiatorType || "other").slice(0, 40); initiators[initiator] = (initiators[initiator] || 0) + 1; if (initiator === "iframe") iframeCount += 1; try { const url = new URL(String(entry.name || "")); hosts.add(url.host); if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|m4a|mp3|aac|opus|ogg|wav|vid)(?:$|[?#])/i.test(url.pathname) || /(?:manifest|playlist|m3u8|mpd|stream|media|video)=/i.test(url.search)) mediaLikeResourceCount += 1 } catch {} }
   return { version: 1, stage: candidateCount ? "captured" : "empty", capturedAt: Date.now(), pageURL: normalizeURL(location.href), candidateCount, resourceCount: entries.length, mediaLikeResourceCount, iframeCount, resourceHostCount: hosts.size, initiators, topLevelCandidateCount, frameReportCount, frameCandidateCount, waitMs, ...(errorKind ? { errorKind } : {}) }
 }
 function mergeCandidates(topLevel: Candidate[], reports: FrameReport[]): Candidate[] {
@@ -209,8 +225,9 @@ async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: bool
     const reports = [...activeReports.values()], candidates = mergeCandidates(topLevel, reports)
     const playerFrameURL = firstPublicFrameURL()
     // beeg 类站点：页面有播放器但未播放时没有媒体请求。等待用户/自动触发播放，
-    // 一旦 performance entries 出现 m3u8/mpd/ts 或视频开始播放，立即重新捕获并覆盖存储。
-    if (candidates.length === 0 && hasMediaElement()) {
+    // 一旦 performance entries 出现 m3u8/mpd/ts/vid 或视频开始播放，立即重新捕获并覆盖存储。
+    // sxyprn 等站点主播放器 src 延迟设置：即使已有预览候选，也进入监听等正片地址出现。
+    if (hasMediaElement() && !mainMediaResolved()) {
       await wait(PLAYBACK_TRIGGER_MS)
       const startMedia = collectMediaLikeURLs()
       const listenDeadline = Date.now() + LISTEN_TIMEOUT_MS

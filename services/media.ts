@@ -359,6 +359,68 @@ async function sniffHlsManifest(sourceURL: string, referer: string, userAgent: s
   } catch { return null } finally { clearTimeout(timeout) }
 }
 
+function isVidURL(value: string): boolean {
+  try { return /\.vid(?:$|[?#])/i.test(new URL(value).pathname) } catch { return false }
+}
+
+/**
+ * 重定向型媒体端点（如 sxyprn.com/cdn8/<obfuscated>.vid → c8.trafficdeposit.com/widi/...vid，
+ * 553MB 渐进式 MP4）：yt-dlp generic 常因 302 后被 CDN 断开/SSL 失败。用浏览器式 GET
+ * （Range: bytes=0-1 + Referer + Safari UA）跟随重定向，仅当最终响应为音视频 content-type
+ * 时返回直链 choice；否则返回 null（交由 HLS 嗅探/公开播放器回退处理）。
+ */
+async function resolveRedirectedDirectMedia(sourceURL: string, referer: string, userAgent: string, knownKind?: "video" | "audio"): Promise<MediaChoice | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 8000)
+  try {
+    const response = await fetch(sourceURL, { headers: { Range: "bytes=0-1", Accept: "*/*", Referer: referer, "User-Agent": userAgent }, signal: controller.signal })
+    if (!response.ok) return null
+    const finalURL = response.url || sourceURL
+    const contentType = response.headers.get("content-type") || ""
+    if (!/^(?:video|audio)\//i.test(contentType)) return null
+    const choice = directMediaChoice(finalURL, knownKind || (/^audio\//i.test(contentType) ? "audio" : "video"))
+    if (!choice) return null
+    choice.sourceURL = finalURL
+    choice.sourceReferer = referer
+    choice.previewReferer = referer
+    choice.previewHeaders = { Referer: referer, "User-Agent": userAgent }
+    // 重定向后的直链（如 c8.../6a6c61ac44a37.vid）通常不带分辨率；来源页常标注
+    // "resolution:HD 720"，据此回填清晰度，让格式列表显示 720p。
+    if (!choice.height) {
+      const height = await fetchPageResolutionHint(referer)
+      if (height) {
+        choice.height = height
+        choice.label = `原始视频 · 容器·${(choice.container || "mp4").toUpperCase()} · ${height}p`
+      }
+    }
+    return choice
+  } catch { return null } finally { clearTimeout(timeout) }
+}
+
+/**
+ * 从 Safari 来源页 HTML 提取视频分辨率（如 sxyprn 页面 "resolution:<b>HD</b>720"）。
+ * 仅在页面为 text/html 且体积受限时尝试，最多 6 秒；失败返回 undefined，不影响主流程。
+ */
+async function fetchPageResolutionHint(pageURL: string): Promise<number | undefined> {
+  if (!/^https?:\/\//i.test(pageURL)) return undefined
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 6000)
+  try {
+    const response = await fetch(pageURL, { headers: { Accept: "text/html,application/xhtml+xml" }, signal: controller.signal })
+    if (!response.ok) return undefined
+    const contentType = response.headers.get("content-type") || ""
+    if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) return undefined
+    const contentLength = Number(response.headers.get("content-length") || 0)
+    if (Number.isFinite(contentLength) && contentLength > 262144) return undefined
+    const text = await response.text()
+    if (text.length > 262144) return undefined
+    const match = text.match(/resolution[^0-9]{0,40}?(\d{3,4})(?:p|\b|$)/i)
+    if (!match) return undefined
+    const height = Number(match[1])
+    return height >= 240 && height <= 4320 ? height : undefined
+  } catch { return undefined } finally { clearTimeout(timeout) }
+}
+
 export function directMediaChoice(sourceURL: string, knownKind?: "video" | "audio"): MediaChoice | null {
   const detectedExtension = extensionOf(sourceURL)
   const extension = DIRECT_MEDIA_EXTENSIONS.has(detectedExtension)
@@ -1501,9 +1563,28 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
       })
       return { title: "Safari HLS 视频", webpageURL: sourceURL, choices: [safariHlsChoice] }
     }
+    // .vid 重定向型媒体端点（sxyprn cdn8 → c8/c10...vid）不可能是 HLS：跳过 sniff
+    // （无 Range 的 sniff 会触发数百 MB body 下载 + 慢 TTFB 拖垮后续），直接跟随 302
+    // 解析最终直链；解析失败（CDN 慢/限流/临时 503）时保留 .vid 源直链兜底，
+    // 下载/预览由 NSURLSession/AVPlayer 自行跟随 302（与页面播放器一致）。
+    if (referer && isVidURL(sourceURL)) {
+      const resolvedChoice = await resolveRedirectedDirectMedia(sourceURL, referer, safariUserAgent || MOBILE_SAFARI_UA, options.safariMediaKind)
+      if (resolvedChoice) {
+        await logEvent({ level: "info", event: "probe.vid.redirect-resolved", taskId, details: { sourceURL, finalURL: resolvedChoice.sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+        return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [resolvedChoice] }
+      }
+      const fallbackChoice = directMediaChoice(sourceURL, options.safariMediaKind || "video")
+      if (fallbackChoice) {
+        fallbackChoice.sourceReferer = referer
+        fallbackChoice.previewReferer = referer
+        fallbackChoice.previewHeaders = { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA }
+        await logEvent({ level: "warn", event: "probe.vid.direct-fallback", taskId, details: { sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+        return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [fallbackChoice] }
+      }
+    }
     // A non-.m3u8 Safari endpoint may still be HLS (e.g. play.php?site_id=...); sniff the
     // body when yt-dlp itself was rejected, so the probe survives CDN anti-bot closes.
-    if (referer) {
+    if (referer && !isVidURL(sourceURL)) {
       const sniffedMaster = await sniffHlsManifest(sourceURL, referer, safariUserAgent || "Mozilla/5.0")
       if (sniffedMaster) {
         const hlsChoices = hlsEndpointChoices(sourceURL, sniffedMaster).map((hlsChoice) => {
@@ -1513,6 +1594,12 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
         })
         await logEvent({ level: "warn", event: "probe.safari-hls.sniffed-endpoint", taskId, details: { sourceURL, reason: "probe-failed", variantCount: hlsChoices.filter((c) => c.hlsVariantURI).length, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
         return { title: "Safari HLS 视频", webpageURL: sourceURL, choices: hlsChoices }
+      }
+      // 无扩展名端点（非 .vid）也可能是 302→media 的直链：跟随重定向解析最终 URL。
+      const resolvedChoice = await resolveRedirectedDirectMedia(sourceURL, referer, safariUserAgent || MOBILE_SAFARI_UA, options.safariMediaKind)
+      if (resolvedChoice) {
+        await logEvent({ level: "info", event: "probe.vid.redirect-resolved", taskId, details: { sourceURL, finalURL: resolvedChoice.sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+        return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [resolvedChoice] }
       }
     }
     const extracted = await tryPublicPlayerFallback(message)

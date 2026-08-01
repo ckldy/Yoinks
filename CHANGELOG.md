@@ -1,5 +1,25 @@
 # 更新日志
 
+## 1.6.5 — 2026-08-01
+
+### 新功能
+
+- Safari 候选采集器更新至 **1.1.9**：支持捕获**重定向型媒体端点 `.vid`**——sxyprn 等站点的正片通过 `sxyprn.com/cdn8/<obfuscated>.vid`（302）→ `c8/c10.trafficdeposit.com/widi/<...>.vid`（渐进式 MP4，最高数百 MB）提供，`.vid` 已纳入采集媒体名单与候选分类。
+- `.vid` 导入**直接解析出直链**：重定向解析（`Range: bytes=0-1` + 来源页 Referer + Safari UA 跟随 302）拿到最终 CDN 直链，并从来源页提取分辨率（如 `resolution:HD 720` → 720p）回填格式标签；解析失败时保留 `.vid` 源直链兜底，下载/预览由 NSURLSession/AVPlayer 自行跟随 302（与页面播放器一致）。
+- Safari 候选**预览噪音过滤**：相关视频预览片段（CDN77 `*.bkcdn.net/library/*.mp4`、trafficdeposit `/pivi/` 视频缩略图 `vidthumb.mp4` 等）不再进入候选列表，正片 CDN（`widi/*.vid`）不受影响。
+- 主播放器 src 由 JS 延迟设置的页面（如 sxyprn `getvsrc()`），即使已有预览候选也会进入监听循环，等正片地址出现后自动补捕获，避免把预览片段当正片。
+
+### 改进与修复
+
+- `.vid` 探测跳过 HLS sniff（无 Range 的 sniff 会触发数百 MB body 下载并拖垮后续重定向解析），直接跟随 302 解析最终直链。
+- 修复 Safari 导入 `.vid` 偶发“分析不出来”：CDN 慢/限流（如 trafficdeposit 503）时自动走直链兜底，不再整条失败。
+- `.vid` 候选直接走直链分析（candidate-direct），跳过 yt-dlp 对站点的 Piracy/不支持必然失败。
+
+### 验证
+
+- 已通过 TypeScript 项目诊断、`scripting-ts project "Yoinks"` 启动回归及 Safari/直链/公开播放器/HLS 回归（15+16+21+20+26+21 项）。
+- 真机验收通过：sxyprn 页面捕获只出正片 `.vid`、导入出 720p 直链、下载正常；相关视频预览与广告缩略图不再进入候选列表。
+
 ## 1.6.4 — 2026-08-01
 
 ### 新功能

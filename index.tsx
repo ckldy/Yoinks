@@ -1046,6 +1046,12 @@ function View() {
     await analyzeMedia(record.url)
   }
 
+  // .vid 等重定向型媒体端点是明确的媒体直链（如 sxyprn cdn8 → c8...553MB MP4）。
+  // 直接分析直链，避免“页面优先”触发 yt-dlp 对站点（sxyprn 等 Piracy 名单）的必然失败。
+  const safariCandidateIsVidRedirect = (candidate: SafariMediaCandidate): boolean => {
+    try { return /\.vid(?:$|[?#])/i.test(new URL(candidate.url).pathname) } catch { return false }
+  }
+
   const analyzeSafariCandidate = async (candidate: SafariMediaCandidate, playerFrameURL?: string, directOnly = false) => {
     launchClipboardSuppressedRef.current = false
     analysisGenerationRef.current += 1
@@ -1155,7 +1161,7 @@ function View() {
     }
     setMediaCandidates(listMediaCandidates())
     if (envelope.candidates.length === 1) {
-      await analyzeSafariCandidate(envelope.candidates[0], envelope.playerFrameURL)
+      await analyzeSafariCandidate(envelope.candidates[0], envelope.playerFrameURL, safariCandidateIsVidRedirect(envelope.candidates[0]))
       return
     }
     const actions = envelope.candidates.map((candidate) => ({ label: safariCandidateSummary(candidate) }))
@@ -1168,7 +1174,7 @@ function View() {
     if (selected == null) return
     const candidate = envelope.candidates[selected]
     if (!candidate) return
-    await analyzeSafariCandidate(candidate, envelope.playerFrameURL)
+    await analyzeSafariCandidate(candidate, envelope.playerFrameURL, safariCandidateIsVidRedirect(candidate))
   }
 
   const chooseRecentLink = async () => {
