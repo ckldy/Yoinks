@@ -10,7 +10,13 @@ const checks: Array<[string, boolean]> = [
   ["clears temporary session and report values after capture", /finally \{[\s\S]*await GM\.setValue\(REPORT_STORAGE_KEY, null\)[\s\S]*await GM\.setValue\(SESSION_STORAGE_KEY, null\)/.test(source)],
   ["floating short press shows delayed-capture feedback", /showFloatingFeedback\(entry, "正在等待媒体地址…"\)[\s\S]*await captureCurrentPage\(\)/.test(source)],
   ["menu command starts the bounded capture session", /GM\.registerMenuCommand\("导入本页媒体候选到 Yoinks", captureCurrentPage\)/.test(source)],
-  ["long press still cancels click capture", /if \(longPressTriggered\) return/.test(source)],
+  ["long press still cancels click capture", /if \(longPressTriggered \|\| suppressClick\) \{ suppressClick = false; return \}/.test(source)],
+  ["click triggers playback synchronously inside the user gesture", /showFloatingFeedback\(entry, "正在等待媒体地址…"\)[\s\S]*triggerPlaybackIfIdle\(\)[\s\S]*await captureCurrentPage\(\)/.test(source)],
+  ["playback trigger calls video.play and clicks player container", /function triggerPlaybackIfIdle[\s\S]*video\.play\(\)[\s\S]*dispatchEvent\(new MouseEventCtor\("click"/.test(source)],
+  ["capture returns waitingForPlayback when player idle", /Promise<\{ count: number; hasFrameClue: boolean; waitingForPlayback\?: boolean \}>/.test(source) && /\.\.\.\(candidates\.length === 0 && hasMediaElement\(\) \? \{ waitingForPlayback: true \} : \{\}\)/.test(source)],
+  ["listens for playback media then recaptures", /const startMedia = collectMediaLikeURLs\(\)[\s\S]*const listenDeadline = Date\.now\(\) \+ LISTEN_TIMEOUT_MS[\s\S]*collectMediaLikeURLs\(\)\.size > startMedia\.size \|\| videoStarted\(\)[\s\S]*candidatesAfterPlayback[\s\S]*GM\.setValue\(STORAGE_KEY, envelopeAfter\)/.test(source)],
+  ["waiting-for-playback feedback is user-facing", /showFloatingFeedback\(entry, result\.count \? `已捕获 \$\{result\.count\} 个候选` : result\.waitingForPlayback \? "请点击页面播放按钮，播放后自动捕获"/.test(source)],
+  ["version bumped to 1.1.6", /\/\/ @version 1\.1\.6/.test(source)],
 ]
 const failed = checks.filter(([, passed]) => !passed).map(([name]) => name)
 if (failed.length) throw new Error(`Safari delayed capture checks failed: ${failed.join(", ")}`)

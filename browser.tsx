@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Yoinks
 // @namespace https://github.com/ckldy/Yoinks
-// @version 1.1.2
+// @version 1.1.6
 // @description Collect public media candidates from the current page for Yoinks.
 // @match http://*/*
 // @match https://*/*
@@ -38,12 +38,46 @@ const FLOATING_ENTRY_EDGE_MARGIN_PX = 12
 const CAPTURE_DELAY_MS = 1500
 const SESSION_WAIT_MS = 2600
 const SESSION_TTL_MS = 8000
+// beeg 等站点播放器（hls.js）不会自动请求 m3u8：iOS Safari 拦截 video.play() 的
+// NotAllowedError 后只在用户点击播放按钮时才 loadSource()。捕获时若发现页面有媒体
+// 元素但无候选，先主动触发播放，再进入监听循环，等用户点播放后自动补捕获。
+const PLAYBACK_TRIGGER_MS = 1500
+const LISTEN_POLL_MS = 400
+const LISTEN_TIMEOUT_MS = 30000
 const MAX_CANDIDATES = 50
 const VIDEO_PATTERN = /\.(?:mp4|m4v|mov|webm|mkv|avi|flv)$/i
 const AUDIO_PATTERN = /\.(?:m4a|aac|mp3|opus|ogg|wav)$/i
 const SEGMENT_PATTERN = /\.(?:ts|m4s)$/i
+const PLAYER_LITERAL_PATTERN = /(?:loadSource\s*\(\s*|(?:video|audio|player|hls|media)\.src\s*=\s*)["'`]([^"'`]+)["'`]/gi
+const PLAYER_BINDING_PATTERN = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["'`](https?:\/\/[^"'`]+)["'`]/gi
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const isTopLevel = () => { try { return window.top === window } catch { return false } }
+const hasMediaElement = () => Boolean(document.querySelector("video, audio"))
+// 在用户激活（浮动入口 click）内同步调用：video.play() 继承手势可绕过 iOS 自动播放拦截，
+// 播放器容器（beeg .x-player / data-testid=player / class 含 player）dispatch click 触发
+// 站点自己的播放逻辑。失败静默（NotAllowedError 等），由监听循环兜底。
+function triggerPlaybackIfIdle(): void {
+  const video = document.querySelector("video") as any
+  if (video && video.paused !== false) { try { const p = video.play(); if (p && typeof p.catch === "function") p.catch(() => {}) } catch {} }
+  const player = document.querySelector(".x-player, [data-testid='player'], [class*='player' i]") as any
+  if (player) { try { const MouseEventCtor = (window as any).MouseEvent; player.dispatchEvent(new MouseEventCtor("click", { bubbles: true, cancelable: true, view: window })) } catch {} }
+}
+function collectMediaLikeURLs(): Set<string> {
+  const set = new Set<string>()
+  for (const entry of performance.getEntriesByType("resource") as Array<{ name?: string }>) {
+    const url = normalizeURL(String(entry.name || ""))
+    if (!url) continue
+    try {
+      const parsed = new URL(url)
+      if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|ts|m4s)(?:$|[?#])/i.test(parsed.pathname) || /(?:manifest|playlist|m3u8|mpd)=/i.test(parsed.search)) set.add(url)
+    } catch {}
+  }
+  return set
+}
+function videoStarted(): boolean {
+  const video = document.querySelector("video") as any
+  return Boolean(video && video.readyState >= 1 && video.paused === false)
+}
 
 function normalizeURL(value: string | null | undefined): string | null {
   if (!value) return null
@@ -65,11 +99,43 @@ function priority(candidate: Candidate): number {
   return candidate.kind === "dash" ? 2 : candidate.kind === "video" ? 3 : candidate.kind === "audio" ? 4 : 5
 }
 function sourceURLs(element: any): string[] { const values = [element.getAttribute("src")], srcset = element.getAttribute("srcset"); if (srcset) values.push(...srcset.split(",").map((part: string) => part.trim().split(/\s+/)[0])); return values.filter((value): value is string => !!value) }
+// JS 设置的 video.src / currentSrc 不会出现在 getAttribute("src") 里（MSE 路径还会被覆盖为 blob:），
+// 读取 IDL 属性以拿到真实解析后的媒体地址。
+function mediaElementURLs(element: any): string[] {
+  const values: string[] = []
+  const resolved = element.currentSrc || element.src
+  if (resolved && typeof resolved === "string") values.push(resolved)
+  const attr = element.getAttribute("src")
+  if (attr) values.push(attr)
+  const srcset = element.getAttribute("srcset")
+  if (srcset) values.push(...srcset.split(",").map((part: string) => part.trim().split(/\s+/)[0]))
+  return values.filter((value): value is string => !!value)
+}
+// hls.js 等播放器通过 loadSource()/video.src= 显式传入媒体地址；该地址往往是无扩展名端点
+// （如 play.php?site_id=...）。仅读取同文档内联脚本文本的字面量/变量绑定 URL，不执行脚本、不跨域。
+function playerScriptSourceURLs(): string[] {
+  const values: string[] = []
+  for (const script of Array.from(document.querySelectorAll("script")) as any[]) {
+    const text = String(script.textContent || "")
+    if (text.length > 100000) continue
+    for (const match of text.matchAll(PLAYER_LITERAL_PATTERN)) { const url = normalizeURL(match[1]); if (url) values.push(url) }
+    for (const match of text.matchAll(PLAYER_BINDING_PATTERN)) {
+      const url = normalizeURL(match[2]); if (!url) continue
+      const id = match[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      if (new RegExp(`(?:loadSource\\s*\\(\\s*|(?:video|audio|player|hls|media)\\.src\\s*=\\s*)${id}\\b`).test(text)) values.push(url)
+    }
+  }
+  return values
+}
 function collectCandidates(): Candidate[] {
   const discoveredAt = Date.now(), pageURL = normalizeURL(location.href); if (!pageURL) return []
   const pageTitle = document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined
   const pending: Array<{ value: string; source: string; mediaKind?: CandidateKind }> = []
-  document.querySelectorAll("video, audio, source").forEach((element: any) => { const mediaKind: CandidateKind = String(element.tagName || "").toLowerCase() === "audio" ? "audio" : "video"; for (const value of sourceURLs(element)) pending.push({ value, source: "dom", mediaKind }) })
+  document.querySelectorAll("video, audio").forEach((element: any) => { const mediaKind: CandidateKind = String(element.tagName || "").toLowerCase() === "audio" ? "audio" : "video"; for (const value of mediaElementURLs(element)) pending.push({ value, source: "dom", mediaKind }) })
+  // 仅收集真正挂在 video/audio 下的 <source>；<picture><source srcset=...gif> 是响应式图片，不是媒体候选。
+  document.querySelectorAll("video source, audio source").forEach((element: any) => { const mediaKind: CandidateKind = String(element.parentElement?.tagName || "").toLowerCase() === "audio" ? "audio" : "video"; for (const value of sourceURLs(element)) pending.push({ value, source: "dom", mediaKind }) })
+  // 播放器页面的内联脚本会显式调用 loadSource()/video.src= 设置媒体地址；仅在有媒体元素时提取。
+  if (document.querySelector("video, audio")) { for (const value of playerScriptSourceURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" }) }
   document.querySelectorAll('link[rel="preload"][as="video"], link[rel="preload"][as="audio"]').forEach((element: any) => { const value = element.getAttribute("href"); if (value) pending.push({ value, source: "preload" }) })
   document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[name="twitter:player:stream"], meta[property="twitter:player:stream"]').forEach((element: any) => { const value = element.getAttribute("content"); if (value) pending.push({ value, source: "metadata" }) })
   performance.getEntriesByType("resource").forEach((entry: any) => pending.push({ value: entry.name, source: "performance" }))
@@ -78,7 +144,28 @@ function collectCandidates(): Candidate[] {
   return sortCandidates(candidates)
 }
 function sortCandidates(candidates: Candidate[]): Candidate[] { return candidates.map((candidate, index) => ({ candidate, index })).sort((a, b) => priority(a.candidate) - priority(b.candidate) || a.index - b.index).slice(0, MAX_CANDIDATES).map(({ candidate }) => candidate) }
-function firstPublicFrameURL(): string | undefined { for (const frame of Array.from(document.querySelectorAll("iframe")) as any[]) { const url = normalizeURL(frame.getAttribute("src")); if (url) return url } return undefined }
+// 顶层页面常混合广告/追踪 iframe（如 a.adtng.com 横幅）与正片播放器 iframe
+// （如 mydaddy.cc/video/...）。直接取第一个 iframe 会把广告当成播放器线索；
+// 改为评分选择：排除广告/追踪域名，优先播放器特征路径（/video/、/embed/ 等）。
+const AD_FRAME_HOST_RE = /(?:\.|^)(?:adtng|mavrtracktor|magsrv|whitetrafsa|doubleclick|googlesyndication|googletagservices|adnxs|taboola|outbrain|amazon-adsystem|adform|criteo|pubmatic|rubiconproject|openx|casalemedia|serving-sys|zedo)(?:\.|$)/i
+const PLAYER_FRAME_PATH_RE = /(?:^|[\/_.-])(?:video|embed|player|watch|stream|play|episode|share|e)(?:[\/_.-]|$)/i
+function frameURLScore(url: string): number {
+  try {
+    const parsed = new URL(url)
+    if (AD_FRAME_HOST_RE.test(parsed.hostname)) return -1
+    return PLAYER_FRAME_PATH_RE.test(parsed.pathname) ? 2 : 0
+  } catch { return 0 }
+}
+function firstPublicFrameURL(): string | undefined {
+  let best: string | undefined, bestScore = -2
+  for (const frame of Array.from(document.querySelectorAll("iframe")) as any[]) {
+    const url = normalizeURL(frame.getAttribute("src"))
+    if (!url) continue
+    const score = frameURLScore(url)
+    if (score > bestScore) { bestScore = score; best = url }
+  }
+  return best
+}
 function validSession(value: any): value is CaptureSession { return !!value && typeof value.id === "string" && typeof value.startedAt === "number" && Date.now() >= value.startedAt && Date.now() - value.startedAt <= SESSION_TTL_MS }
 function validReport(value: any): value is FrameReport { return !!value && typeof value.sessionId === "string" && typeof value.reportId === "string" && typeof value.pageURL === "string" && Array.isArray(value.candidates) }
 function captureDiagnostic(candidateCount: number, topLevelCandidateCount: number, frameReportCount: number, frameCandidateCount: number, waitMs: number, errorKind?: string): Record<string, unknown> {
@@ -86,7 +173,16 @@ function captureDiagnostic(candidateCount: number, topLevelCandidateCount: numbe
   for (const entry of entries) { const initiator = String(entry.initiatorType || "other").slice(0, 40); initiators[initiator] = (initiators[initiator] || 0) + 1; if (initiator === "iframe") iframeCount += 1; try { const url = new URL(String(entry.name || "")); hosts.add(url.host); if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|m4a|mp3|aac|opus|ogg|wav)(?:$|[?#])/i.test(url.pathname) || /(?:manifest|playlist|m3u8|mpd|stream|media|video)=/i.test(url.search)) mediaLikeResourceCount += 1 } catch {} }
   return { version: 1, stage: candidateCount ? "captured" : "empty", capturedAt: Date.now(), pageURL: normalizeURL(location.href), candidateCount, resourceCount: entries.length, mediaLikeResourceCount, iframeCount, resourceHostCount: hosts.size, initiators, topLevelCandidateCount, frameReportCount, frameCandidateCount, waitMs, ...(errorKind ? { errorKind } : {}) }
 }
-function mergeCandidates(topLevel: Candidate[], reports: FrameReport[]): Candidate[] { const seen = new Set<string>(), result: Candidate[] = []; for (const candidate of [...topLevel, ...reports.flatMap(report => report.candidates)]) { if (!normalizeURL(candidate.url) || !classify(candidate.url) || seen.has(candidate.url)) continue; seen.add(candidate.url); result.push(candidate) } return sortCandidates(result) }
+function mergeCandidates(topLevel: Candidate[], reports: FrameReport[]): Candidate[] {
+  const seen = new Set<string>(), result: Candidate[] = []
+  // 候选的 kind 已在各自文档的 collectCandidates 里确定（classify 或媒体元素兜底）；
+  // 这里只做去重与归一化，不再用 URL 形状二次过滤（否则无扩展名端点会被误删）。
+  for (const candidate of [...topLevel, ...reports.flatMap(report => report.candidates)]) {
+    if (!normalizeURL(candidate.url) || seen.has(candidate.url)) continue
+    seen.add(candidate.url); result.push(candidate)
+  }
+  return sortCandidates(result)
+}
 
 let activeSessionId: string | null = null
 const activeReports = new Map<string, FrameReport>()
@@ -100,7 +196,7 @@ async function reportFrame(session: CaptureSession): Promise<void> {
   const report: FrameReport = { sessionId: session.id, reportId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`, pageURL, pageTitle: document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined, candidates: collectCandidates(), capturedAt: Date.now() }
   await GM.setValue(REPORT_STORAGE_KEY, report)
 }
-async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: boolean }> {
+async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: boolean; waitingForPlayback?: boolean }> {
   if (!isTopLevel()) return { count: 0, hasFrameClue: false }
   const startedAt = Date.now(), session: CaptureSession = { id: `capture-${startedAt}-${Math.random().toString(36).slice(2, 10)}`, startedAt, pageURL: normalizeURL(location.href) || "" }
   activeSessionId = session.id; activeReports.clear()
@@ -111,11 +207,35 @@ async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: bool
     const topLevel = collectCandidates()
     await wait(Math.max(0, SESSION_WAIT_MS - CAPTURE_DELAY_MS))
     const reports = [...activeReports.values()], candidates = mergeCandidates(topLevel, reports)
-    const envelope = { version: 1 as const, pageURL: normalizeURL(location.href), pageTitle: document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined, capturedAt: Date.now(), candidates, ...(candidates.length ? {} : { playerFrameURL: firstPublicFrameURL() }) }
+    const playerFrameURL = firstPublicFrameURL()
+    // beeg 类站点：页面有播放器但未播放时没有媒体请求。等待用户/自动触发播放，
+    // 一旦 performance entries 出现 m3u8/mpd/ts 或视频开始播放，立即重新捕获并覆盖存储。
+    if (candidates.length === 0 && hasMediaElement()) {
+      await wait(PLAYBACK_TRIGGER_MS)
+      const startMedia = collectMediaLikeURLs()
+      const listenDeadline = Date.now() + LISTEN_TIMEOUT_MS
+      while (Date.now() < listenDeadline) {
+        await wait(LISTEN_POLL_MS)
+        if (collectMediaLikeURLs().size > startMedia.size || videoStarted()) {
+          const topLevelAfterPlayback = collectCandidates()
+          const candidatesAfterPlayback = mergeCandidates(topLevelAfterPlayback, [...activeReports.values()])
+          if (candidatesAfterPlayback.length) {
+            const envelopeAfter = { version: 1 as const, pageURL: normalizeURL(location.href), pageTitle: document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined, capturedAt: Date.now(), candidates: candidatesAfterPlayback, ...(playerFrameURL ? { playerFrameURL } : {}) }
+            await GM.setValue(STORAGE_KEY, envelopeAfter)
+            await GM.setValue(DIAGNOSTIC_STORAGE_KEY, captureDiagnostic(candidatesAfterPlayback.length, topLevelAfterPlayback.length, activeReports.size, activeReports.size ? [...activeReports.values()].reduce((sum, report) => sum + report.candidates.length, 0) : 0, Date.now() - startedAt))
+            GM.log("Yoinks media candidates captured after playback", { count: candidatesAfterPlayback.length, frameReports: activeReports.size, hasFrameClue: Boolean(envelopeAfter.playerFrameURL) })
+            return { count: candidatesAfterPlayback.length, hasFrameClue: Boolean(envelopeAfter.playerFrameURL) }
+          }
+        }
+      }
+    }
+    // 正片常位于跨域 iframe（如 mydaddy.cc）里；即使顶层已有候选（可能只是推荐/广告短视频），
+    // 也总是记录第一个公开 iframe 线索，供导入失败后回退到公开播放器解析。
+    const envelope = { version: 1 as const, pageURL: normalizeURL(location.href), pageTitle: document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined, capturedAt: Date.now(), candidates, ...(playerFrameURL ? { playerFrameURL } : {}) }
     await GM.setValue(STORAGE_KEY, envelope)
     await GM.setValue(DIAGNOSTIC_STORAGE_KEY, captureDiagnostic(candidates.length, topLevel.length, reports.length, reports.reduce((sum, report) => sum + report.candidates.length, 0), Date.now() - startedAt))
     GM.log("Yoinks media candidates captured", { count: candidates.length, frameReports: reports.length, hasFrameClue: Boolean(envelope.playerFrameURL) })
-    return { count: candidates.length, hasFrameClue: Boolean(envelope.playerFrameURL) }
+    return { count: candidates.length, hasFrameClue: Boolean(envelope.playerFrameURL), ...(candidates.length === 0 && hasMediaElement() ? { waitingForPlayback: true } : {}) }
   } catch {
     await GM.setValue(DIAGNOSTIC_STORAGE_KEY, captureDiagnostic(0, 0, activeReports.size, 0, Date.now() - startedAt, "storage"))
     throw new Error("capture failed")
@@ -203,8 +323,10 @@ async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
     entry.disabled = true
     try {
       showFloatingFeedback(entry, "正在等待媒体地址…")
+      // beeg 等站点需点击播放后才请求 m3u8；在用户激活内同步触发播放，绕过 iOS 自动播放拦截。
+      triggerPlaybackIfIdle()
       const result = await captureCurrentPage()
-      showFloatingFeedback(entry, result.count ? `已捕获 ${result.count} 个候选` : result.hasFrameClue ? "已获取链接信息，需要解析！" : "未捕获到媒体链接")
+      showFloatingFeedback(entry, result.count ? `已捕获 ${result.count} 个候选` : result.waitingForPlayback ? "请点击页面播放按钮，播放后自动捕获" : result.hasFrameClue ? "已获取链接信息，需要解析！" : "未捕获到媒体链接")
     } catch { showFloatingFeedback(entry, "采集失败") } finally { entry.disabled = false }
   })
   document.documentElement.appendChild(entry)

@@ -148,6 +148,7 @@ import {
   safariPageReferer,
   type SafariMediaCandidate,
 } from "./services/safari-media-candidates"
+import { activeTaskIdFromCancelPath, clearDownloadCache, downloadCacheSize } from "./services/cache"
 import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
 import { DiscoverTab } from "./components/DiscoverTab"
@@ -226,6 +227,29 @@ function toolLabel(tools: ToolStatus | null): string {
   if (!tools) return "下载引擎：未就绪"
   if (!tools.ytDlpVersion) return "下载引擎：未安装"
   return `yt-dlp ${tools.ytDlpVersion} · 就绪`
+}
+
+/**
+ * 该 URL/已选格式是否走不依赖 yt-dlp 的下载管线：
+ * HLS 原生分片（fetch/curl/ffmpeg）、原生直链（BackgroundURLSession）、抖音匿名下载。
+ * 这些管线即使 yt-dlp 环境异常也不应被“开始下载”按钮禁用。
+ */
+function canDownloadWithoutYtDlp(u: string | null | undefined, choice?: MediaChoice | null): boolean {
+  if (!u) return false
+  if (detectMediaPlatform(u) === "douyin") return true
+  if (/\.m3u8|application\/x-mpegurl|application\/vnd\.apple\.mpegurl/i.test(u)) return true
+  if (choice && (choice.formatExpression === "direct" || choice.formatExpression === "m3u8" || choice.id === "m3u8")) return true
+  return false
+}
+
+/** 历史记录中相同来源 URL 且文件仍可用的最近一条；无则返回 null。 */
+async function findExistingDownload(url: string): Promise<DownloadHistoryRecord | null> {
+  const records = await listHistoryRecords()
+  for (const record of records) {
+    if (record.sourceURL !== url) continue
+    if (await isHistoryFileAvailable(record)) return record
+  }
+  return null
 }
 
 function LogDetailView({ event }: { event: YoinksLogEvent }) {
@@ -362,6 +386,9 @@ function View() {
   const [probe, setProbe] = useState<MediaProbe | null>(null)
   const [selectedChoice, setSelectedChoice] = useState<MediaChoice | null>(null)
   const [analyzing, setAnalyzing] = useState(false)
+  /** tmp 下载缓存字节数；null 表示尚未计算。 */
+  const [downloadCacheBytes, setDownloadCacheBytes] = useState<number | null>(null)
+  const [cacheClearing, setCacheClearing] = useState(false)
   /** A stopped Shell probe may still be unwinding; do not queue another probe behind it. */
   const [analysisDraining, setAnalysisDraining] = useState(false)
   const [saveMode, setSaveMode] = useState<SaveMode>(() => getPreferences().defaultSaveMode)
@@ -409,6 +436,8 @@ function View() {
   const safariCandidateMediaKindRef = useRef<"video" | "audio" | null>(null)
    /** Safari 候选页面标题；仅直链回退时替代无元数据 URL 的退化标题。 */
    const safariCandidateTitleRef = useRef<string | null>(null)
+   /** 直链路径（hls/dash/inferred）启用页面标题覆盖；不影响传给探测的媒体类型上下文。 */
+   const safariCandidateTitleAlignRef = useRef<boolean>(false)
    const previewPlayerRef = useRef<HLSPlayerService | DashPlayerService | null>(null)
   /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
   const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
@@ -698,7 +727,8 @@ function View() {
       if (gen !== analysisGenerationRef.current) return
       probeAuthorizedPlatformRef.current = session?.platform || null
       // Safari 来源页失败后会退回实际直链；该直链通常只有随机 path，不能作为用户可见标题或文件名。
-      if (safariMediaKind && safariCandidateTitleRef.current) {
+      // inferred/hls/dash 直链路径经 safariCandidateTitleAlignRef 启用页面标题覆盖。
+      if ((safariMediaKind || safariCandidateTitleAlignRef.current) && safariCandidateTitleRef.current) {
         probeResult = { ...probeResult, title: safariCandidateTitleRef.current }
       }
       setProbe(probeResult)
@@ -795,6 +825,7 @@ function View() {
       }
       safariCandidateURLRef.current = null
       safariCandidateRefererRef.current = null
+      safariCandidateTitleAlignRef.current = false
       setURL(valid)
       setProbe(null)
       setSelectedChoice(null)
@@ -937,6 +968,7 @@ function View() {
     disposeTemporarySession()
     safariCandidateURLRef.current = null
     safariCandidateRefererRef.current = null
+    safariCandidateTitleAlignRef.current = false
     setURL("")
     setProbe(null)
     setSelectedChoice(null)
@@ -950,6 +982,42 @@ function View() {
   useEffect(() => {
     setShowAllMediaCandidates(false)
   }, [mediaCandidates])
+
+  // 挂载时计算一次下载缓存大小，供设置页展示；清理后由 handler 刷新。
+  useEffect(() => {
+    void downloadCacheSize().then(setDownloadCacheBytes)
+  }, [])
+
+  const refreshDownloadCache = async () => {
+    setDownloadCacheBytes(await downloadCacheSize())
+  }
+
+  const clearDownloadCacheNow = async () => {
+    await refreshDownloadCache()
+    const confirmed = await Dialog.confirm({
+      title: "清理下载缓存",
+      message: "将删除未在运行任务的临时分片与工作文件（不影响已下载的成品文件与相册）。确认继续？",
+      confirmLabel: "清理",
+      cancelLabel: "取消",
+    })
+    if (!confirmed) return
+    setCacheClearing(true)
+    try {
+      const activeTaskId = activeTaskIdFromCancelPath(cancelPath)
+      const result = await clearDownloadCache(activeTaskId)
+      await refreshDownloadCache()
+      setStatus(result.removedItems > 0
+        ? `已清理下载缓存：${formatBytes(result.removedBytes)}，${result.removedItems} 项。`
+        : "下载缓存已是最新，无需清理。")
+      await logEvent({ level: "info", event: "cache.cleared", details: { removedBytes: result.removedBytes, removedItems: result.removedItems, activeTaskId: activeTaskId || null } })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setStatus(`清理下载缓存失败：${message}`)
+      await logEvent({ level: "error", event: "cache.clear.failed", details: { message } })
+    } finally {
+      setCacheClearing(false)
+    }
+  }
 
   const closeYoinks = () => {
     closingRef.current = true
@@ -968,6 +1036,7 @@ function View() {
     disposeTemporarySession()
     safariCandidateURLRef.current = null
     safariCandidateRefererRef.current = null
+    safariCandidateTitleAlignRef.current = false
     setURL(record.url)
     setProbe(null)
     setSelectedChoice(null)
@@ -977,17 +1046,21 @@ function View() {
     await analyzeMedia(record.url)
   }
 
-  const analyzeSafariCandidate = async (candidate: SafariMediaCandidate) => {
+  const analyzeSafariCandidate = async (candidate: SafariMediaCandidate, playerFrameURL?: string, directOnly = false) => {
     launchClipboardSuppressedRef.current = false
     analysisGenerationRef.current += 1
     disposeTemporarySession()
-    const preferPageFormats = candidate.kind === "video" || candidate.kind === "audio"
+    // 公开播放器 recovered 候选的 url 已是真实直链（如 s39.bigcdn.cc/.../1080.mp4），
+    // 页面优先只会再次触发来源页 yt-dlp 失败；directOnly 直接分析直链，一次到位。
+    const preferPageFormats = !directOnly && (candidate.kind === "video" || candidate.kind === "audio")
     const analysisURL = preferPageFormats ? candidate.pageURL : candidate.url
     safariCandidateURLRef.current = analysisURL
     safariCandidateRefererRef.current = preferPageFormats ? null : safariPageReferer(candidate.pageURL) || null
     const alignManifestTitle = safariManifestNeedsTitleAlignment(candidate.kind, candidate.pageTitle)
     safariCandidateMediaKindRef.current = preferPageFormats ? null : alignManifestTitle ? "video" : candidate.kind === "video" || candidate.kind === "audio" ? candidate.kind : null
     safariCandidateTitleRef.current = candidate.pageTitle || null
+    // 直链路径（hls/dash/inferred）的探测标题通常是 URL 文件名（如 "play"），用 Safari 页面标题覆盖。
+    safariCandidateTitleAlignRef.current = !preferPageFormats
     setURL(analysisURL)
     setProbe(null)
     setSelectedChoice(null)
@@ -1002,9 +1075,25 @@ function View() {
       if (analyzed) await clearSafariMediaCandidates()
       return
     }
+    // 页面优先探测失败：正片常藏在跨域 iframe 的静态播放器里（如 mydaddy.cc 的
+    // fluidplayer 3 清晰度），先尝试公开播放器 iframe 解析，成功则优先采用；
+    // 失败再回退到 Safari 采集的直接媒体资源。
+    if (playerFrameURL) {
+      setStatus("来源页未返回格式，正在匿名解析其公开播放器 iframe。")
+      const frameProbe = await probeSafariPublicPlayerFrame(playerFrameURL, candidate.pageTitle, candidate.pageURL)
+      if (frameProbe?.choices.length) {
+        const recovered: SafariMediaCandidate[] = frameProbe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || playerFrameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: playerFrameURL, pageTitle: frameProbe.title || candidate.pageTitle, discoveredAt: candidate.discoveredAt, captureSource: "metadata" }))
+        if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0], undefined, true); return }
+        const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
+        if (selected != null && recovered[selected]) { await analyzeSafariCandidate(recovered[selected], undefined, true); return }
+        return
+      }
+      await logEvent({ level: "warn", event: "safari-candidate.frame-probe.fallback", details: { frameURL: playerFrameURL, candidateURL: candidate.url } })
+    }
     safariCandidateURLRef.current = candidate.url
     safariCandidateRefererRef.current = safariPageReferer(candidate.pageURL) || null
     safariCandidateMediaKindRef.current = candidate.kind === "video" || candidate.kind === "audio" ? candidate.kind : null
+    safariCandidateTitleAlignRef.current = true
     setURL(candidate.url)
     setStatus("来源页未返回格式，正在回退至 Safari 采集的直接媒体资源。")
     await logEvent({ level: "warn", event: "safari-candidate.page-probe.fallback", details: { candidateURL: candidate.url, pageURL: candidate.pageURL, kind: candidate.kind } })
@@ -1020,8 +1109,10 @@ function View() {
       setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
       return
     }
-    if (!envelope.candidates.length && envelope.playerFrameURL) {
-      // 公开播放器链路解析阶段：锁定页面（禁止重复点击/新操作），并展示超时说明与“停止分析”终止键。
+    if (envelope.playerFrameURL) {
+      // 公开播放器链路优先：正片常藏在跨域 iframe 播放器（如 mydaddy.cc fluidplayer 的
+      // 360/720/1080），且来源页 yt-dlp 大多不支持。解析成功则一次到位展示格式；
+      // 失败再回退下方候选列表。锁定页面（禁止重复点击/新操作）并支持「停止分析」。
       analysisBusyRef.current = true
       setAnalysisDraining(false)
       setAnalyzing(true)
@@ -1033,23 +1124,22 @@ function View() {
       const parseGen = analysisGenerationRef.current
       let probe: MediaProbe | null = null
       try {
-        probe = await probeSafariPublicPlayerFrame(envelope.playerFrameURL, envelope.pageTitle)
+        probe = await probeSafariPublicPlayerFrame(envelope.playerFrameURL, envelope.pageTitle, envelope.pageURL)
       } finally {
         analysisBusyRef.current = false
         setAnalysisDraining(false)
         if (parseGen === analysisGenerationRef.current) setAnalyzing(false)
       }
       if (parseGen !== analysisGenerationRef.current) return
-      if (!probe?.choices.length) {
-        setStatus("公开播放器链路未返回可导入媒体；可能需要登录、挑战验证或不公开播放地址。")
+      if (probe?.choices.length) {
+        const frameURL = envelope.playerFrameURL
+        const recovered: SafariMediaCandidate[] = probe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || frameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: frameURL, pageTitle: probe.title || envelope.pageTitle, discoveredAt: envelope.capturedAt, captureSource: "metadata" }))
+        if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0], undefined, true); return }
+        const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
+        if (selected != null && recovered[selected]) { await analyzeSafariCandidate(recovered[selected], undefined, true); return }
         return
       }
-      const frameURL = envelope.playerFrameURL
-      const recovered: SafariMediaCandidate[] = probe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || frameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: frameURL, pageTitle: probe.title || envelope.pageTitle, discoveredAt: envelope.capturedAt, captureSource: "metadata" }))
-      if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0]); return }
-      const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
-      if (selected != null && recovered[selected]) await analyzeSafariCandidate(recovered[selected])
-      return
+      await logEvent({ level: "warn", event: "safari-candidate.frame-probe.empty", details: { frameURL: envelope.playerFrameURL, candidateCount: envelope.candidates.length } })
     }
     for (const candidate of envelope.candidates) {
       rememberMediaCandidate({
@@ -1065,7 +1155,7 @@ function View() {
     }
     setMediaCandidates(listMediaCandidates())
     if (envelope.candidates.length === 1) {
-      await analyzeSafariCandidate(envelope.candidates[0])
+      await analyzeSafariCandidate(envelope.candidates[0], envelope.playerFrameURL)
       return
     }
     const actions = envelope.candidates.map((candidate) => ({ label: safariCandidateSummary(candidate) }))
@@ -1078,7 +1168,7 @@ function View() {
     if (selected == null) return
     const candidate = envelope.candidates[selected]
     if (!candidate) return
-    await analyzeSafariCandidate(candidate)
+    await analyzeSafariCandidate(candidate, envelope.playerFrameURL)
   }
 
   const chooseRecentLink = async () => {
@@ -1194,6 +1284,7 @@ function View() {
     safariCandidateRefererRef.current = null
     safariCandidateMediaKindRef.current = null
        safariCandidateTitleRef.current = null
+       safariCandidateTitleAlignRef.current = false
     setMediaCandidates(rememberMediaCandidate({ source: "manual", url: valid, kind: "page" }))
     await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
     setURL(valid)
@@ -1221,6 +1312,7 @@ function View() {
     safariCandidateRefererRef.current = null
     safariCandidateMediaKindRef.current = null
        safariCandidateTitleRef.current = null
+       safariCandidateTitleAlignRef.current = false
     setMediaCandidates(rememberMediaCandidate({ source: "manual", url: valid, kind: "page" }))
     await logEvent({ level: "info", event: "paste.accepted", details: { sourceURL: valid, platform: detectMediaPlatform(valid) } })
     setURL(valid)
@@ -1945,10 +2037,6 @@ function View() {
       return
     }
     const earlyPlatform = detectMediaPlatform(validURL)
-    if (earlyPlatform !== "douyin" && !availableTools?.ytDlpVersion) {
-      setStatus("请先安装 yt-dlp。")
-      return
-    }
 
     let downloadChoice = automatic?.choice || selectedChoice
     // C: 纯 m3u8 直链常无法 yt-dlp 探测，给合成 choice 走 HLS 管线
@@ -1961,9 +2049,32 @@ function View() {
         container: "mp4",
       }
     }
+    // HLS 原生分片 / 原生直链 / 抖音不依赖 yt-dlp；仅需要 yt-dlp 探测的格式才要求引擎可用。
+    const choiceNeedsYtDlp = !downloadChoice || (downloadChoice.formatExpression !== "direct" && downloadChoice.formatExpression !== "m3u8" && downloadChoice.id !== "m3u8")
+    if (earlyPlatform !== "douyin" && choiceNeedsYtDlp && !availableTools?.ytDlpVersion) {
+      setStatus("请先安装 yt-dlp。")
+      return
+    }
     if (!downloadChoice) {
       setStatus("请先分析链接并选择实际可用格式。")
       return
+    }
+
+    // 重复下载检测：仅手动下载时提示（自动下载/批量不打断），相同 URL 已成功下载且文件可用。
+    if (!automatic) {
+      const existing = await findExistingDownload(validURL)
+      if (existing) {
+        const confirmed = await Dialog.confirm({
+          title: "该链接已下载过",
+          message: `「${existing.title}」已成功下载为 ${existing.fileName}（${formatBytes(existing.fileSizeBytes)}）。\n是否仍要再次下载？`,
+          confirmLabel: "仍要下载",
+          cancelLabel: "取消",
+        })
+        if (!confirmed) {
+          setStatus("已取消：该链接已在记录中。")
+          return
+        }
+      }
     }
 
     setDownloading(true)
@@ -2227,7 +2338,7 @@ function DownloadView() {
           <Button title={`筛选：${mediaCandidateFilter === "all" ? "全部" : mediaCandidateFilter === "recommended" ? "推荐" : mediaCandidateFilter.toUpperCase()}`} systemImage="line.3.horizontal.decrease.circle" action={() => void (async () => { const filters: MediaCandidateFilter[] = ["all", "recommended", "hls", "dash", "video", "audio", "page"]; const selected = await Dialog.actionSheet({ title: "筛选候选", actions: filters.map(filter => ({ label: filter === "all" ? "全部" : filter === "recommended" ? "推荐" : filter.toUpperCase() })), cancelButton: true }); if (selected != null) setMediaCandidateFilter(filters[selected]) })()} disabled={analyzing || downloading} />
           <Button title="读取 Safari 最新采集" systemImage="arrow.clockwise" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
           <Button title="清空候选" systemImage="trash" role="destructive" action={() => void (async () => { if (await Dialog.confirm({ title: "清空最近候选", message: "这不会删除下载记录或文件。", confirmLabel: "清空", cancelLabel: "取消" })) { clearMediaCandidates(); setMediaCandidates([]) } })()} disabled={analyzing || downloading} />
-          {(showAllMediaCandidates ? filterMediaCandidates(mediaCandidates, mediaCandidateFilter) : filterMediaCandidates(mediaCandidates, mediaCandidateFilter).slice(0, 3)).map((candidate) => <Button key={candidate.id} title={`${candidate.source === "safari" ? "Safari" : candidate.source === "discover" ? "发现" : "手动"} · ${candidate.kind || "页面"} · ${candidate.qualityHint || candidate.containerHint || candidate.title || new URL(candidate.url).host}`} systemImage="info.circle" action={() => void (async () => { const safariOnly = candidate.source === "safari"; const confirmed = await Dialog.confirm({ title: candidate.title || new URL(candidate.url).host, message: `类型：${candidate.kind || "未知"}\n采集来源：${candidate.captureSource || (safariOnly ? "未知" : "不适用")}\n质量：${candidateDetailValue(candidate.qualityHint, safariOnly)}\n容器：${candidateDetailValue(candidate.containerHint, safariOnly)}\n编码/音轨/大小：${candidateDetailValue(undefined, safariOnly)}\n\n仅在确认后分析此候选。`, confirmLabel: "导入并分析", cancelLabel: "取消" }); if (!confirmed) return; if (safariOnly && candidate.pageURL && candidate.kind && candidate.kind !== "page") { await analyzeSafariCandidate({ id: candidate.id, url: candidate.url, kind: candidate.kind, pageURL: candidate.pageURL, pageTitle: candidate.title, discoveredAt: candidate.createdAt, captureSource: candidate.captureSource }); return } safariCandidateURLRef.current = safariOnly ? candidate.url : null; safariCandidateRefererRef.current = safariOnly ? safariPageReferer(candidate.pageURL) || null : null; safariCandidateMediaKindRef.current = safariCandidateNeedsTitleAlignment(candidate) ? "video" : null; safariCandidateTitleRef.current = safariCandidateNeedsTitleAlignment(candidate) ? candidate.title || null : null; setURL(candidate.url); setProbe(null); setSelectedChoice(null); setStatus("正在分析候选库项目。"); await analyzeMedia(candidate.url) })()} disabled={analyzing || downloading || batchQueue.running} />)}
+          {(showAllMediaCandidates ? filterMediaCandidates(mediaCandidates, mediaCandidateFilter) : filterMediaCandidates(mediaCandidates, mediaCandidateFilter).slice(0, 3)).map((candidate) => <Button key={candidate.id} title={`${candidate.source === "safari" ? "Safari" : candidate.source === "discover" ? "发现" : "手动"} · ${candidate.kind || "页面"} · ${candidate.qualityHint || candidate.containerHint || candidate.title || new URL(candidate.url).host}`} systemImage="info.circle" action={() => void (async () => { const safariOnly = candidate.source === "safari"; const confirmed = await Dialog.confirm({ title: candidate.title || new URL(candidate.url).host, message: `类型：${candidate.kind || "未知"}\n采集来源：${candidate.captureSource || (safariOnly ? "未知" : "不适用")}\n质量：${candidateDetailValue(candidate.qualityHint, safariOnly)}\n容器：${candidateDetailValue(candidate.containerHint, safariOnly)}\n编码/音轨/大小：${candidateDetailValue(undefined, safariOnly)}\n\n仅在确认后分析此候选。`, confirmLabel: "导入并分析", cancelLabel: "取消" }); if (!confirmed) return; if (safariOnly && candidate.pageURL && candidate.kind) { await analyzeSafariCandidate({ id: candidate.id, url: candidate.url, kind: candidate.kind === "page" ? "inferred" : candidate.kind, pageURL: candidate.pageURL, pageTitle: candidate.title, discoveredAt: candidate.createdAt, captureSource: candidate.captureSource }); return } safariCandidateURLRef.current = safariOnly ? candidate.url : null; safariCandidateRefererRef.current = safariOnly ? safariPageReferer(candidate.pageURL) || null : null; safariCandidateMediaKindRef.current = safariCandidateNeedsTitleAlignment(candidate) ? "video" : null; safariCandidateTitleRef.current = safariCandidateNeedsTitleAlignment(candidate) ? candidate.title || null : null; setURL(candidate.url); setProbe(null); setSelectedChoice(null); setStatus("正在分析候选库项目。"); await analyzeMedia(candidate.url) })()} disabled={analyzing || downloading || batchQueue.running} />)}
            {!showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title={`展开其他 ${filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length - 3} 条`} systemImage="chevron.down" action={() => setShowAllMediaCandidates(true)} disabled={analyzing || downloading} /> : null}
            {showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title="收起较早候选" systemImage="chevron.up" action={() => setShowAllMediaCandidates(false)} disabled={analyzing || downloading} /> : null}
          </Section> : null}
@@ -2247,7 +2358,7 @@ function DownloadView() {
 
         {!downloading ? (
           <Section header={<Text>任务</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
-            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || installing || !selectedChoice || analyzing || batchQueue.running} />
+            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (!tools?.ytDlpVersion && !canDownloadWithoutYtDlp(url, selectedChoice)) || installing || !selectedChoice || analyzing || batchQueue.running} />
             {result && completedSaveMode && completedSaveMode !== "ask" ? <Button title="播放" systemImage="play.circle" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
             {result ? <Button title="分享" systemImage="square.and.arrow.up" action={() => void ShareSheet.present([result.filePath])} /> : null}
           </Section>
@@ -2374,6 +2485,9 @@ return (
               <Text foregroundStyle="secondaryLabel">当前：{historySummary.availableCount} 个文件 · {formatBytes(historySummary.managedBytes)}</Text>
               <Button title={`本地文件上限：${preferences.maxManagedBytes == null ? "不限" : formatBytes(preferences.maxManagedBytes)}`} systemImage="externaldrive" action={() => void chooseManagedBytes()} />
               <Button title={`下载记录上限：${preferences.maxHistoryRecords == null ? "不限" : `${preferences.maxHistoryRecords} 条`}`} systemImage="list.number" action={() => void chooseHistoryLimit()} />
+              <Text foregroundStyle="secondaryLabel">下载缓存：{downloadCacheBytes == null ? "…" : formatBytes(downloadCacheBytes)}（失败/中断任务的临时分片与工作文件）</Text>
+              <Button title={cacheClearing ? "正在清理…" : "清理下载缓存"} systemImage="trash" action={() => void clearDownloadCacheNow()} disabled={downloading || analyzing || cacheClearing} />
+              <Text font="caption" foregroundStyle="secondaryLabel">删除 tmp 下非正在运行任务的临时目录与取消标记，不影响已下载文件；正在下载的任务目录会被跳过。</Text>
             </Section>
             <Section title="工具与登录">
               <HStack spacing={10}>

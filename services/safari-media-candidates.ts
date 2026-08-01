@@ -233,7 +233,8 @@ export function safariCandidateQualityHint(candidate: SafariMediaCandidate): str
   if (candidate.kind === "dash") return "推荐 · 自适应画质"
   if (candidate.kind !== "video") return null
   const pathname = new URL(candidate.url).pathname
-  const match = pathname.match(/(?:^|[\/_-])(\d{3,4})P(?=[_.-]|$)/i)
+  // 兼容公开播放器格式：既有 1080P_1000K.mp4，也有 1080.mp4 / 720.mp4 / 360.mp4。
+  const match = pathname.match(/(?:^|[\/_.-])(\d{3,4})p?(?=[._-]|$)/i)
   return match ? `备用直链 · ${match[1]}P` : "备用直链 · 固定画质"
 }
 
