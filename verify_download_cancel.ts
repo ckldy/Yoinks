@@ -33,16 +33,17 @@ const checks: Array<[string, boolean]> = [
   ["download button uses canDownloadWithoutYtDlp", /canDownloadWithoutYtDlp\(url, selectedChoice\)/.test(FileManager.readAsStringSync(`${Script.directory}/index.tsx`)) && /function canDownloadWithoutYtDlp/.test(FileManager.readAsStringSync(`${Script.directory}/index.tsx`))],
   ["installYtDlp tolerates SSL trust failures via trusted-host", /python3 -m pip install --trusted-host pypi\.org --trusted-host files\.pythonhosted\.org --upgrade yt-dlp/.test(mediaSource)],
   // METHOD=NONE 误判修复：显式无加密应允许原生分片（8xx3 这类清单此前被跳过原生分片落入 ffmpeg）
-  ["encryption check excludes METHOD=NONE", /#EXT-X-KEY:\[\^\\r\\n\]\*METHOD\\s\*=\\s\*\(\?!NONE\\b\)\\S\+/.test(hlsSource)],
+  ["encryption parsed by parseHlsMediaPlaylist", /function parseHlsMediaPlaylist/.test(hlsSource) && /method === "NONE"/.test(hlsSource) && /plan\.method = "aes-128"/.test(hlsSource)],
   ["METHOD=NONE is not treated as encrypted", !KEY_ENCRYPTED.test("#EXT-X-KEY:METHOD=NONE\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nhttps://cdn.example/seg-001.ts")],
   ["legacy KEY_ANY would have rejected METHOD=NONE (root cause)", KEY_ANY.test("#EXT-X-KEY:METHOD=NONE")],
-  ["real encryption still rejected by native path", KEY_ENCRYPTED.test("#EXT-X-KEY:METHOD=AES-128,URI=\"https://cdn.example/key\"") && KEY_ENCRYPTED.test("#EXT-X-KEY:METHOD=SAMPLE-AES")],
+  ["AES-128 now decrypted natively (no longer rejected)", /if \(plan\.method === "aes-128"\)/.test(hlsSource) && /downloadHlsSegmentsEncrypted\(/.test(hlsSource)],
+  ["SAMPLE-AES still falls back via unsupported", /if \(plan\.method === "unsupported"\) return undefined/.test(hlsSource)],
   // fetch-first：原生 NSURLSession（HTTP/2 复用，同预览）优先，curl 分批兜底
   ["native strategy defaults to fetch-first", /const HLS_NATIVE_MODE: \"curl\" \| \"fetch\" = \"fetch\"/.test(hlsSource)],
   ["fetch downloader exists with speed gate", /async function downloadHlsSegmentsFetch/.test(hlsSource) && /const GATE = Math\.min\(24, count\)/.test(hlsSource) && /> 16000\) fetchSlow = true/.test(hlsSource)],
   ["fetch keeps the measured stable concurrency", /const maxConcurrent = 4/.test(hlsSource)],
-  ["slow native download falls back to curl batches", /fetched\.slow\) \{[\s\S]*?downloadHlsSegmentsCurlBatches\(nativeOptions, segments, count\)/.test(hlsSource)],
-  ["failed native download falls back to curl batches", /download\.m3u8\.fetch-fallback[\s\S]{0,260}downloadHlsSegmentsCurlBatches\(nativeOptions, segments, count\)/.test(hlsSource)],
+  ["slow native download falls back to curl batches", /fetched\.slow\) \{[\s\S]*?downloadHlsSegmentsCurlBatches\(downloadOptions, segments, count\)/.test(hlsSource)],
+  ["failed native download falls back to curl batches", /download\.m3u8\.fetch-fallback[\s\S]{0,260}downloadHlsSegmentsCurlBatches\(downloadOptions, segments, count\)/.test(hlsSource)],
   ["curl batches still reuse already-written segments", /const fileExists = \(index: number\)(?:: boolean)? => \{/.test(hlsSource)],
   // 优化 A：curl 兑底只补缺失分片（fetch-first 兜底复用已写 seg_*，避免全量重下）
   ["curl main batch skips already-written segments", /只补缺失分片：fetch-first 兜底时复用已写 seg_\*/.test(hlsSource) && /const pending = Array\.from\(\{ length: end - start \}, \(_, i\) => start \+ i\)\.filter\(\(index\) => !fileExists\(index\)\)/.test(hlsSource)],
