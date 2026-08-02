@@ -1,6 +1,6 @@
 export type MediaCandidateSource = "safari" | "discover" | "manual"
 export type MediaCandidateKind = "hls" | "dash" | "video" | "audio" | "page"
-export type SafariCaptureSource = "dom" | "preload" | "metadata" | "performance"
+export type SafariCaptureSource = "dom" | "preload" | "metadata" | "performance" | "runtime"
 export type MediaCandidate = {
   id: string; source: MediaCandidateSource; url: string; pageURL?: string; title?: string; kind?: MediaCandidateKind
   createdAt: number; expiresAt: number; captureSource?: SafariCaptureSource; qualityHint?: string; containerHint?: string
@@ -12,7 +12,7 @@ export const MEDIA_CANDIDATE_LIMIT = 50
 export const MEDIA_CANDIDATE_TTL_MS = 24 * 60 * 60 * 1000
 const SOURCES = new Set<MediaCandidateSource>(["safari", "discover", "manual"])
 const KINDS = new Set<MediaCandidateKind>(["hls", "dash", "video", "audio", "page"])
-const CAPTURE_SOURCES = new Set<SafariCaptureSource>(["dom", "preload", "metadata", "performance"])
+const CAPTURE_SOURCES = new Set<SafariCaptureSource>(["dom", "preload", "metadata", "performance", "runtime"])
 export function normalizeMediaCandidateURL(value: unknown): string | null { if (typeof value !== "string" || /[\r\n]/.test(value)) return null; try { const url = new URL(value); if (url.protocol !== "http:" && url.protocol !== "https:") return null; url.hash = ""; return url.toString() } catch { return null } }
 function text(value: unknown, max: number): string | undefined { return typeof value === "string" ? value.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, max) || undefined : undefined }
 function valid(value: unknown, now: number): MediaCandidate | null {
