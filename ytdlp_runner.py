@@ -150,6 +150,9 @@ def main():
         })
 
     options["concurrent_fragment_downloads"] = min(8, max(1, int(config.get("concurrent_fragments", 2))))
+    user_agent = config.get("user_agent")
+    if user_agent:
+        options["user_agent"] = user_agent
     options.update({
         "outtmpl": config["output"],
         "paths": {"home": output_directory},
