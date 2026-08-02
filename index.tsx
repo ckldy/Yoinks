@@ -132,6 +132,8 @@ import {
   authPlatformLabel,
   isAuthPlatform,
   isFreshCookieError,
+  isYouTubeBotCheckError,
+  isYouTubeMembersOnlyError,
   supportedAuthPlatforms,
   importCookieFile,
   getImportedCookiePath,
@@ -447,6 +449,8 @@ function View() {
    const safariCandidateTitleRef = useRef<string | null>(null)
    /** 直链路径（hls/dash/inferred）启用页面标题覆盖；不影响传给探测的媒体类型上下文。 */
    const safariCandidateTitleAlignRef = useRef<boolean>(false)
+   /** 采集器运行时代理捕获的 m3u8 清单文本缓存；仅本次下载周期内供清单 403/404 兑底。 */
+   const safariCandidateManifestCacheRef = useRef<Record<string, string> | null>(null)
    const previewPlayerRef = useRef<HLSPlayerService | DashPlayerService | null>(null)
   /** A: 限制进度 UI 刷新，避免 List 高频重绘打断滑动 */
   const progressUiRef = useRef({ lastAt: 0, lastKey: "" })
@@ -690,7 +694,8 @@ function View() {
       return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session?.platform }
     } catch (firstError) {
       const message = firstError instanceof Error ? firstError.message : String(firstError)
-      if (platform === "youtube" && isFreshCookieError(message)) {
+      // YouTube：仅会员专享（members-only）才登录；反机器人风控登录无效，按普通失败处理。
+      if (platform === "youtube" && isYouTubeMembersOnlyError(message)) {
         session = await sessionForPlatform("youtube")
         if (session) return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session.platform }
         throw new Error("该视频需要 YouTube 会员登录；请先通过单链流程登录后再重试")
@@ -744,17 +749,40 @@ function View() {
       } catch (firstError) {
         if (gen !== analysisGenerationRef.current) return
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-        // Douyin never enters the login branch; YouTube reaches it only after anonymous access is denied.
-        if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+        // YouTube 反机器人风控（bot 检测）：登录通常无效，不引导登录，提示稍后重试/换网。
+        if (platform === "youtube" && isYouTubeBotCheckError(firstMessage)) {
+          setProbe(null)
+          await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message: firstMessage, botCheck: true } })
+          setStatus("YouTube 将当前网络判定为可疑流量（反机器人）。请稍后重试或更换网络；会员专享视频才需要登录。")
+          return
+        }
+        // Douyin never enters the login branch; YouTube reaches it only when a members-only video needs an account.
+        if (platform === "youtube" && isYouTubeMembersOnlyError(firstMessage)) {
+          await logEvent({
+            level: "warn",
+            event: "probe.login-required",
+            details: { sourceURL, platform, message: firstMessage, reason: "members-only" },
+          })
+          setStatus("该视频为 YouTube 会员专享，需要登录后重试。")
+          const loggedIn = (await sessionForPlatform("youtube")) || await loginForPlatform(platform)
+          if (gen !== analysisGenerationRef.current) return
+          if (!loggedIn) {
+            setProbe(null)
+            await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message: firstMessage, loginCancelled: true } })
+            setStatus(`探测失败：${firstMessage}`)
+            return
+          }
+          session = loggedIn
+          setStatus("登录完成，正在重新探测……")
+          probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
+        } else if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
           await logEvent({
             level: "warn",
             event: "probe.login-required",
             details: { sourceURL, platform, message: firstMessage },
           })
           setStatus(`${authPlatformLabel(platform)}需要登录后才能继续探测。`)
-          const loggedIn = platform === "youtube"
-            ? (await sessionForPlatform("youtube")) || await loginForPlatform(platform)
-            : await loginForPlatform(platform)
+          const loggedIn = await loginForPlatform(platform)
           if (gen !== analysisGenerationRef.current) return
           if (!loggedIn) {
             setProbe(null)
@@ -1176,6 +1204,7 @@ function View() {
     // 避免「最近候选库」残留上一次页面的链接；公开播放器分支与候选循环都覆盖。
     clearSafariMediaCandidatesFromLibrary()
     setMediaCandidates(listMediaCandidates())
+    safariCandidateManifestCacheRef.current = envelope.manifestCache || null
     if (envelope.playerFrameURL) {
       // 公开播放器链路优先：正片常藏在跨域 iframe 播放器（如 mydaddy.cc fluidplayer 的
       // 360/720/1080），且来源页 yt-dlp 大多不支持。解析成功则一次到位展示格式；
@@ -1817,7 +1846,7 @@ function View() {
             probeResult = await probeWithPlatformSession(item.sourceURL, session)
           } catch (firstError) {
             const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-            if (platform === "youtube" && isFreshCookieError(firstMessage)) {
+            if (platform === "youtube" && isYouTubeMembersOnlyError(firstMessage)) {
               const youtubeSession = await sessionForPlatform("youtube")
               if (youtubeSession) {
                 probeSession = youtubeSession
@@ -2170,6 +2199,7 @@ function View() {
         onCancelPath: (path: string) => setCancelPath(path),
         authorizedPlatform: session?.platform,
         referer: validURL === safariCandidateURLRef.current ? safariCandidateRefererRef.current || undefined : undefined,
+        manifestFallbackText: validURL === safariCandidateURLRef.current ? safariCandidateManifestCacheRef.current?.[validURL] || undefined : undefined,
         outputTitle: automatic?.probeTitle || probe?.title,
       })
       setDownloading(false)
