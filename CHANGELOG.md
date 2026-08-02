@@ -1,5 +1,33 @@
 # 更新日志
 
+## 1.6.9 — 2026-08-02
+
+> 本版为「cat-catch 审计优化」P0+P1 全量落地（加密 HLS 下载管线与 DASH 桥接、采集器运行时代理与清单兑底）+ chinaxmovie/MacCMS 采集修复 + m3u8 分析原生快路径，全部静态/端到端验证与真机验收通过。
+
+### 新功能
+
+- **AES-128 加密 HLS 原生下载**（`services/hls-crypto.ts` 新增）：纯 JS 查表法 AES-CBC 解密（无 WebCrypto 依赖，NIST SP 800-38A 向量验证）；解析 `#EXT-X-KEY`（AES-128/NONE/其它 METHOD）与显式 IV，缺省 IV 按分片序号生成；只走 native fetch（curl 无法解密），并发 2，解密后按 TS(0x47) / fMP4(moof) 分片级校验，KEY/IV 错误立即重试；SAMPLE-AES 等仍回落 yt-dlp。
+- **EXT-X-MAP（CMAF/fMP4）init 段支持与字节级拼接**：init 段先下载后与分片序列直接拼接成合法 MP4（cat-catch 同款，规避 ffmpeg concat 对 fMP4 的 MPEG-TS 误判卡死）；TS 流保持 ffmpeg concat。
+- **DASH MPD → m3u8 桥接**（`services/mpd.ts` 新增）：轻量解析 MPD（SegmentTemplate `$Number$`/`$RepresentationID$`/补零、SegmentList；on-demand/SegmentBase 不支持回落 yt-dlp），视频轨与音频轨分别合成 m3u8 复用 HLS 分片管线，独立音频轨时 ffmpeg 合并（`-c copy`）；`isMPDURL` / `fetchMPDText`（`urn:mpeg:dash:schema:mpd` 特征校验）接入下载分支（Safari 导入失败直接报错，无 referer 回落 ffmpeg 原生读 MPD）。
+- **byteRange 分片下载**：解析 `#EXT-X-BYTERANGE`（含 offset 缺省续接）与 EXT-X-MAP 的 BYTERANGE 属性；fetch / curl / 加密三个下载器均支持 Range 请求与长度校验。
+- **错误分片集中重下**：fetch 与加密下载器第一轮全部跑完后，对失败分片集中重下一轮，仍失败才报错（不再单次重试即整单失败）。
+- **采集器运行时代理（browser 1.2.9 → 1.3.0）**：捕获会话期间包装页面 fetch/XHR（页面主世界），新出现的媒体 URL 直接入候选（`source: "runtime"`）；m3u8 响应文本（`#EXTM3U` ≤512KB、最多 3 条）缓存为 `manifestCache`；会话结束卸载并清空；DASH 识别增强（`.mpd` 中间路径、query `type=dash` 等）；候选收集上限 200 防超长页面爆内存。
+- **清单缓存兑底**：Envelope 新增 `manifestCache`（sanitize 白名单：URL + `#EXTM3U` 开头 + 大小/条数限制）；`downloadHlsSegmentsNative` / `downloadMedia` 新增 `manifestFallbackText`，清单端点 403/404 时用采集器已捕获的清单文本兜底；导入时存 ref、下载时按 URL 匹配传递。
+- **采集器 1.3.1（MacCMS/第三方播放器 iframe 捕获）**：新增 MacCMS `player_aaaa` 配置对象 `url` 键提取（PLAYER_CONFIG_DECL/URL_KEY，兼容 JSON 转义 `\/` 与无分号结尾）、iframe src query 媒体参数提取（`iframeQueryMediaURLs`，覆盖 155jx 等第三方播放器 `url=` 传参模式）与 `maccmsPlayerConfigURLs` 无条件提取（不依赖 video/player 容器门控）；采集已有正片级 HLS/DASH 候选时跳过 30 秒播放监听（修复 chinaxmovie 首次采集卡 30s、需二次采集的问题，一次点击 ~2.6s 出候选）。
+
+### 改进与修复
+
+- 重构：从 `downloadHlsSegmentsNative` 抽出 `downloadHlsMediaPlaylistText` 供 MPD 桥接复用同一分片下载/解密/合成管线；`parseHlsMediaPlaylist` 的 `HlsMediaPlaylistPlan.segments` 改为 `HlsSegment { url, byteRange? }`。
+- **m3u8 分析原生快路径**：`.m3u8` 直链探测不再先跑 yt-dlp generic（Python 冷启动 + extractor 多轮网络 + 失败重试常耗 6-10s+，抓包下 SSL 重试更慢），直接原生 fetch master（Referer + Safari UA，8s 上限）解析变体出格式（实测 2.2s）；master 带 RESOLUTION 时清晰度直接可见，enrich 不再下载 TS 分片重复探测；`sniffHlsManifest` 支持无 Referer（手动粘贴 m3u8 也可原生嗅探）。
+- `verify_browser_publish` 断言随符号更新（PLAYER_CONFIG_DECL/URL_KEY、iframeQueryMediaURLs、maccmsPlayerConfigURLs、监听跳过条件）。
+
+### 验证
+
+- 全项目 TypeScript 0 错误；`scripting-ts project "Yoinks"` 启动回归通过。
+- 新增 e2e / 单测：`verify_hls_byterange_e2e` 6 项、`verify_mpd` 18 项、`verify_mpd_e2e` 6 项、`verify_manifest_fallback` 9 项。
+- 回归全过：`verify_hls_crypto` 20、`verify_hls_aes128_e2e` 6、`verify_hls_fmp4_e2e` 6、`verify_hls_highest_variant` 9、`verify_hls_variant_choices` 21、`verify_download_cancel` 41、`verify_browser_publish` 24。
+- **真机验收通过**：采集器 1.3.1 已发布到 Safari 用户脚本（`userscripts/Yoinks.user.js`，部署产物与源码一致）；chinaxmovie 一次点击 ~2.6s 出候选（不再二次采集）；m3u8 直链分析原生快路径出格式速度符合预期。
+
 ## 1.6.8 — 2026-08-02
 
 ### 改进与修复
