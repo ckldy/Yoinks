@@ -1,9 +1,11 @@
 import { AbortController, Path, Script, fetch } from "scripting"
 import { createTaskId, logEvent } from "./logs"
+import { probeBilibiliDirect } from "./bilibili"
 import { extractPublicPlayerFrameSources, extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
 import type { AuthPlatform } from "./platform-auth"
 import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
 import { cancelBackgroundDownloads, downloadURLToFileWithProgress } from "./background-download"
+import { bilibiliMobileFallbackURL, isBilibiliDiscovery412, isBilibiliHost, isBilibiliShortLink, resolveShortLink } from "./discovery"
 import {
   type HlsManifestSummary,
   downloadHlsSegmentsNative,
@@ -13,6 +15,7 @@ import {
   readHlsManifestSummary,
 } from "./hls"
 import { formatBytes, runCommand } from "./shell-utils"
+import { downloadMpdNative, isMPDURL } from "./mpd"
 
 // HLS 清单解析与变体选择已拆分到 services/hls.ts；
 // 保留 re-export 以兼容既有 import（verify 脚本等）与公开 API。
@@ -346,11 +349,13 @@ export function hlsEndpointChoices(sourceURL: string, master: string): MediaChoi
  * headers, and the body is bounded to 256 KB so a large MP4 is rejected without
  * buffering it. Returns null when the endpoint is not an HLS manifest.
  */
-async function sniffHlsManifest(sourceURL: string, referer: string, userAgent: string): Promise<string | null> {
+async function sniffHlsManifest(sourceURL: string, referer: string | undefined, userAgent: string): Promise<string | null> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 8000)
   try {
-    const response = await fetch(sourceURL, { headers: { Accept: "*/*", Referer: referer, "User-Agent": userAgent }, signal: controller.signal })
+    const headers: Record<string, string> = { Accept: "*/*", "User-Agent": userAgent }
+    if (referer) headers.Referer = referer
+    const response = await fetch(sourceURL, { headers, signal: controller.signal })
     if (!response.ok) return null
     const contentLength = Number(response.headers.get("content-length") || 0)
     if (Number.isFinite(contentLength) && contentLength > 262144) return null
@@ -707,7 +712,7 @@ function isAllowedURL(value: string): boolean {
   }
 }
 
-export type MediaPlatform = "douyin" | "xiaohongshu" | "youtube" | "generic"
+export type MediaPlatform = "douyin" | "xiaohongshu" | "youtube" | "bilibili" | "generic"
 
 const XIAOHONGSHU_URL_PATTERNS = [
   /https?:\/\/(?:www\.)?(?:xiaohongshu|rednote)\.com\/(?:explore|discovery\/item|search_result|user\/profile\/[a-z0-9]+)\/[a-z0-9]+(?:\?[^\s"'<>，。！？；：、]*)?/i,
@@ -725,6 +730,26 @@ const YOUTUBE_URL_PATTERNS = [
   /https?:\/\/(?:music|gaming)\.youtube\.com\//i,
 ]
 
+/**
+ * B 站链接归一化：剥离分享短链携带的追踪参数（App 分享到剪贴板时附加），
+ * 让 yt-dlp 以干净 URL 命中 Bilibili 专用 extractor；b23.tv 等短链本身
+ * 需要网络解析，在探测流程（probeMediaCore）中先行 resolveShortLink。
+ */
+export function normalizeBilibiliURL(value: string): string {
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase()
+    if (!(host === "bilibili.com" || host.endsWith(".bilibili.com") || host === "m.bilibili.com" || host === "b23.tv" || host.endsWith(".bili22.cn") || host.endsWith(".bili23.cn") || host.endsWith(".bili33.cn"))) return value
+    if (!/^\/(?:video|bangumi\/play)\//i.test(url.pathname)) return value
+    for (const key of ["buvid", "is_story_h5", "mid", "plat_id", "share_from", "share_medium", "share_plat", "share_source", "share_tag", "timestamp", "unique_k", "up_id"]) {
+      url.searchParams.delete(key)
+    }
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
 function sanitizeExtractedURL(value: string): string {
   return value
     .replace(/[^\x00-\x7F]+$/, "")
@@ -736,6 +761,7 @@ export function detectMediaPlatform(value: string | null | undefined): MediaPlat
   if (DOUYIN_URL_PATTERNS.some((pattern) => pattern.test(value))) return "douyin"
   if (XIAOHONGSHU_URL_PATTERNS.some((pattern) => pattern.test(value))) return "xiaohongshu"
   if (YOUTUBE_URL_PATTERNS.some((pattern) => pattern.test(value))) return "youtube"
+  if (isBilibiliHost(value)) return "bilibili"
   return "generic"
 }
 
@@ -743,6 +769,7 @@ export function mediaPlatformLabel(value: string | null | undefined): string | n
   switch (detectMediaPlatform(value)) {
     case "douyin": return "抖音"
     case "xiaohongshu": return "小红书"
+    case "bilibili": return "B站"
     default: return null
   }
 }
@@ -1420,6 +1447,163 @@ function isDouyinDirectChoice(choice: MediaChoice | null | undefined): boolean {
   return Boolean(choice && (choice.formatExpression === DOUYIN_DIRECT_FORMAT || choice.id.startsWith("douyin-")))
 }
 
+/**
+ * YouTube muxed（progressive MP4，如 itag 18/22）判断：单文件音视频合流，无 mergeAudioFormat。
+ * MITM 环境下 googlevideo 的 Range 分段读取易中断，而完整 GET 稳定 200，因此这类格式
+ * 改走原生网络栈下载（绕开 yt-dlp 的 SSL 首败与分片重试）。
+ */
+function isYouTubeMuxedChoice(url: string, choice: MediaChoice | null | undefined): boolean {
+  if (!choice || choice.kind !== "video") return false
+  if (detectMediaPlatform(url) !== "youtube") return false
+  if (choice.mergeAudioFormat || choice.hlsVariantURI) return false
+  if (!/^\d+$/.test(choice.formatExpression || "")) return false
+  return /googlevideo\.com|videoplayback/i.test(choice.previewURL || choice.sourceURL || "")
+}
+
+/** YouTube 视频流使用的浏览器 UA（googlevideo 对 Python urllib 指纹可能限速/拒流）。 */
+const YOUTUBE_DOWNLOAD_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+
+/** B站 playurl durl（progressive MP4）choice：已实测 MITM 下单连接受限 ~0.9MiB/s，并发 Range 分段可线性提速。 */
+function isBilibiliDurlChoice(choice: MediaChoice | null | undefined): boolean {
+  return Boolean(choice && choice.id.startsWith("bilibili-direct"))
+}
+
+/**
+ * 直链并发分段下载（Range 多连接）：适用于支持 Range 且单连接受限的 CDN（B站 durl 实测 4 连接 ≈ 3.5× 单连接）。
+ * 返回 false 表示服务器不支持分段（非 206 或文件过小），调用方应回退单连接下载。
+ * 参考 hls.ts 的 fetch + dataStream + appendData 模式。
+ */
+async function downloadDirectSegmented(options: {
+  url: string
+  destination: string
+  headers: Record<string, string>
+  concurrentFragments: number
+  start: number
+  end: number
+  stage: string
+  onProgress?: (value: { fraction: number; stage: string; downloadedBytes?: number; totalBytes?: number; speed?: number }) => void
+  isCancelFlagSet: () => boolean
+}): Promise<boolean> {
+  if (options.isCancelFlagSet()) throw new Error("下载已取消")
+  // 1) 探测总大小（Range bytes=0-0 只取头，不下载 body）。
+  let total = 0
+  try {
+    const probeResponse = await fetch(options.url, {
+      headers: { ...options.headers, Range: "bytes=0-0" },
+    })
+    if (probeResponse.status !== 206) return false
+    const contentRange = probeResponse.headers.get("content-range") || ""
+    const match = /bytes\s+\d+-\d+\/(\d+)/.exec(contentRange)
+    if (!match) return false
+    total = Number(match[1])
+    probeResponse.dataStream?.getReader()?.cancel().catch(() => {})
+    if (!total || total < 4 * 1024 * 1024) return false
+  } catch {
+    return false
+  }
+
+  const count = Math.min(Math.max(options.concurrentFragments, 2), 8)
+  const chunk = Math.ceil(total / count)
+  const workDirectory = Path.dirname(options.destination)
+  let downloaded = 0
+  let lastReportAt = Date.now()
+  const startedAt = Date.now()
+  const bytesText = (value: number) => value >= 1048576 ? `${(value / 1048576).toFixed(1)}MB` : `${Math.round(value / 1024)}KB`
+  const report = (force: boolean) => {
+    const now = Date.now()
+    if (!force && now - lastReportAt < 300) return
+    lastReportAt = now
+    const elapsed = (now - startedAt) / 1000
+    const speed = elapsed > 0 ? downloaded / elapsed : 0
+    const inner = total > 0 ? Math.max(0, Math.min(1, downloaded / total)) : 0
+    options.onProgress?.({
+      fraction: options.start + (options.end - options.start) * inner,
+      stage: `${options.stage} · ${bytesText(downloaded)} / ${bytesText(total)}`,
+      downloadedBytes: downloaded,
+      totalBytes: total,
+      speed: speed || undefined,
+    })
+  }
+
+  const downloadOne = async (index: number): Promise<boolean> => {
+    if (options.isCancelFlagSet()) return false
+    const start = index * chunk
+    const end = Math.min(start + chunk - 1, total - 1)
+    const partPath = Path.join(workDirectory, `seg_${String(index).padStart(4, "0")}.part`)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (options.isCancelFlagSet()) return false
+      try {
+        if (FileManager.existsSync(partPath)) FileManager.removeSync(partPath)
+      } catch {}
+      try {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 60_000)
+        try {
+          const response = await fetch(options.url, {
+            headers: { ...options.headers, Range: `bytes=${start}-${end}` },
+            signal: controller.signal,
+          })
+          if (response.status !== 206) throw new Error(`HTTP ${response.status}`)
+          const reader = response.dataStream.getReader()
+          let size = 0
+          try {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (value) {
+                await FileManager.appendData(partPath, value)
+                size += value.size
+                downloaded += value.size
+                report(false)
+              }
+            }
+          } finally {
+            try { reader.releaseLock() } catch {}
+          }
+          if (size !== end - start + 1) throw new Error(`段长不符（期望 ${end - start + 1}，实际 ${size}）`)
+          return true
+        } finally {
+          clearTimeout(timeout)
+        }
+      } catch (error) {
+        if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 300 * (attempt + 1)))
+      }
+    }
+    return false
+  }
+
+  // 2) 并发下载各段（worker 池按段号领取，避免重复下载）。
+  const segmentResults: boolean[] = await (async () => {
+    const assigned = Array.from({ length: count }, (_, index) => index)
+    const outcomes = new Array<boolean>(count).fill(false)
+    await Promise.all(
+      Array.from({ length: count }, async () => {
+        while (assigned.length > 0) {
+          const index = assigned.shift()!
+          if (options.isCancelFlagSet()) return
+          outcomes[index] = await downloadOne(index)
+        }
+      }),
+    )
+    return outcomes
+  })()
+  if (options.isCancelFlagSet()) throw new Error("下载已取消")
+  if (segmentResults.some((ok) => !ok)) throw new Error("分段下载失败")
+
+  // 3) 按序拼接分片。
+  if (FileManager.existsSync(options.destination)) FileManager.removeSync(options.destination)
+  for (let index = 0; index < count; index += 1) {
+    const partPath = Path.join(workDirectory, `seg_${String(index).padStart(4, "0")}.part`)
+    const data = FileManager.readAsDataSync(partPath)
+    if (data) await FileManager.appendData(options.destination, data)
+    try { FileManager.removeSync(partPath) } catch {}
+  }
+  if (!FileManager.existsSync(options.destination)) throw new Error("分段拼接失败")
+  report(true)
+  return true
+}
+
 function douyinChoiceFromExtracted(extracted: ExtractedInfo, sourceURL: string): { probe: MediaProbe; extracted: ExtractedInfo } {
   const imageURLs = extractImageURLs(extracted)
   const inlineRoot = extractInlineDetailRoot(extracted)
@@ -1654,6 +1838,31 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
     return probeDouyinDirect(sourceURL)
   }
   const taskId = createTaskId()
+  // B 站短链（b23.tv 等）先解析成完整 URL：generic extractor 直接吃短链会在
+  // 302 到桌面页后被 B 站 412 风控拦截，且 yt-dlp 无法命中 Bilibili 专用 extractor。
+  let probeURL = sourceURL
+  if (isBilibiliShortLink(sourceURL)) {
+    const resolved = await resolveShortLink(sourceURL)
+    if (resolved && resolved !== sourceURL) {
+      probeURL = resolved
+      await logEvent({ level: "info", event: "probe.bilibili.shortlink-resolved", taskId, details: { sourceURL, resolvedURL: resolved } })
+    }
+  }
+  const normalizedBili = normalizeBilibiliURL(probeURL)
+  if (normalizedBili !== probeURL) {
+    probeURL = normalizedBili
+    await logEvent({ level: "info", event: "probe.bilibili.normalized", taskId, details: { sourceURL, normalizedURL: probeURL } })
+  }
+  // B 站：优先原生页面+API 探测（yt-dlp 在当前网络/抓包环境下被 412 风控拦截，
+  // 浏览器式 fetch + 真实 UA 可稳定拿到直链）；失败时回退 yt-dlp（完整 URL 命中
+  // Bilibili extractor，412 时 m 站回退兜底）。
+  if (detectMediaPlatform(probeURL) === "bilibili") {
+    const bilibiliProbe = await probeBilibiliDirect(probeURL)
+    if (bilibiliProbe) {
+      await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: bilibiliProbe.title, choiceCount: bilibiliProbe.choices.length, formatCount: bilibiliProbe.choices.length, webpageURL: bilibiliProbe.webpageURL, origin: "bilibili-native" } })
+      return bilibiliProbe
+    }
+  }
   const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
   const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
   await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
@@ -1664,6 +1873,24 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
   const deadline = startedAt + PROBE_TOTAL_TIMEOUT_SECONDS * 1000
   let attemptCount = 0
   const timeoutError = () => new Error(`媒体分析超时（${PROBE_TOTAL_TIMEOUT_SECONDS} 秒）。请检查网络后重试。`)
+  // —— HLS 直链原生快路径 ——
+  // .m3u8 URL 不必走 yt-dlp generic：Python 冷启动 + extractor 多轮网络探测常耗 5-20s，
+  // 且 CDN 常断开 Python 连接（Cloudflare/反爬）后还要在 catch 分支再 sniff 一次。直接原生
+  // fetch master（Referer + Safari UA，8s 上限）解析变体，秒级返回；嗅探失败再回退 yt-dlp。
+  // master 带 RESOLUTION 时 hlsEndpointChoices 已含清晰度，enrich 不再下载分片重复探测。
+  if (/\.m3u8(?:$|[?#])/i.test(sourceURL)) {
+    const sniffedMaster = await sniffHlsManifest(sourceURL, referer, safariUserAgent || MOBILE_SAFARI_UA)
+    if (sniffedMaster) {
+      const hlsChoices = hlsEndpointChoices(sourceURL, sniffedMaster).map((hlsChoice) => {
+        if (referer) { hlsChoice.previewReferer = referer; hlsChoice.previewHeaders = { Referer: referer, "User-Agent": safariUserAgent || MOBILE_SAFARI_UA } }
+        return hlsChoice
+      })
+      if (hlsChoices.length) {
+        await logEvent({ level: "info", event: "probe.hls.native-fast-path", taskId, details: { sourceURL, variantCount: hlsChoices.filter((c) => c.hlsVariantURI).length, heightHint: hlsChoices[0]?.height || null, refererApplied: Boolean(referer), elapsedMilliseconds: Date.now() - startedAt } })
+        return { title: "HLS 视频", webpageURL: sourceURL, choices: hlsChoices }
+      }
+    }
+  }
   const tryPublicPlayerFallback = async (message: string): Promise<MediaProbe | null> => {
     if (options.skipPublicPlayerFallback) return null
     // 放宽触发条件：除“无格式/超时”外，Safari 页面候选（带 referer 或显式媒体类型）
@@ -1679,7 +1906,7 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
     if (remainingMilliseconds <= 0) throw timeoutError()
     attemptCount += 1
     const result = await runCommand(
-      `python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""}${refererArgument}${userAgentArgument} ${quote(sourceURL)}${cookieArgument}`,
+      `python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""}${refererArgument}${userAgentArgument} ${quote(probeURL)}${cookieArgument}`,
       Math.max(1, Math.ceil(remainingMilliseconds / 1000)),
     )
     if (Date.now() >= deadline) {
@@ -1927,6 +2154,20 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
       if (resolvedChoice) {
         await logEvent({ level: "info", event: "probe.vid.redirect-resolved", taskId, details: { sourceURL, finalURL: resolvedChoice.sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
         return { title: "Safari 视频直链", webpageURL: sourceURL, choices: [resolvedChoice] }
+      }
+    }
+    // B 站桌面页对匿名访问返回 412 风控：仅一次改用同 BV/AV 的 m.bilibili.com 重探。
+    // （对齐发现页 discover 的 m 站回退；bilibiliMobileFallbackURL 对 m 站返回 null，天然防递归。）
+    if (isBilibiliDiscovery412(message) || isBilibiliDiscovery412(rawOutput)) {
+      const mobileURL = bilibiliMobileFallbackURL(probeURL)
+      if (mobileURL) {
+        await logEvent({ level: "warn", event: "probe.bilibili.mobile-fallback", taskId, details: { sourceURL: probeURL, mobileURL, reason: "http-412" } })
+        try {
+          return await probeMediaCore(mobileURL, options)
+        } catch (fallbackError) {
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+          await logEvent({ level: "error", event: "probe.bilibili.mobile-fallback.failed", taskId, details: { mobileURL, message: fallbackMessage } })
+        }
       }
     }
     const extracted = await tryPublicPlayerFallback(message)
@@ -2284,6 +2525,8 @@ export async function downloadMedia(options: {
   authorizedPlatform?: AuthPlatform
   /** Public Safari page URL, used only for this download as Referer. */
   referer?: string
+  /** 采集器运行时代理捕获的 m3u8 清单文本：清单端点 403/404 时兑底。 */
+  manifestFallbackText?: string
   /** Preferred final filename stem from probe or discovery metadata. */
   outputTitle?: string
   onProgress: (value: DownloadProgress) => void
@@ -2322,26 +2565,88 @@ export async function downloadMedia(options: {
   const isCancelFlagSet = () => FileManager.existsSync(cancelPath)
   const hlsOrigin = isM3U8URL(sourceURL)
   const hlsManifest = hlsOrigin ? await readHlsManifestSummary(sourceURL, referer, safariUserAgent) : undefined
-  if (options.choice.formatExpression === "direct") {
-    const extension = extensionOf(sourceURL) || (options.choice.container ? `.${options.choice.container}` : ".mp4")
-    const workPath = Path.join(workDirectory, `direct_${Date.now()}${extension}`)
+
+  // YouTube muxed（progressive MP4）native 下载：完整 GET 流 URL 稳定 200（MITM 下
+  // yt-dlp 分片 Range 易中断、首试 SSL 必失败）。native 失败（403 等）回退下方 yt-dlp。
+  if (isYouTubeMuxedChoice(sourceURL, options.choice) && options.choice.previewURL) {
+    const streamURL = options.choice.previewURL
+    const nativeExtension = extensionOf(streamURL) || ".mp4"
+    const nativePath = Path.join(workDirectory, `native_${Date.now()}${nativeExtension}`)
     options.onCancelPath(cancelPath)
-    await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "direct", safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
+    await logEvent({
+      level: "info",
+      event: "download.started",
+      taskId,
+      details: { sourceURL: streamURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "direct-native", concurrentFragments: 1, tlsInsecure: false, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: false, safariUserAgentApplied: false, outputDirectory: DOWNLOAD_DIR },
+    })
     try {
       await downloadURLToFileWithProgress({
-        url: sourceURL,
-        destination: workPath,
-        headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+        url: streamURL,
+        destination: nativePath,
+        headers: { "User-Agent": YOUTUBE_DOWNLOAD_UA, Accept: "*/*" },
         start: 0.02,
         end: 0.95,
-        stage: "正在下载直接媒体资源",
+        stage: "正在下载 YouTube 视频（原生直连）",
         onProgress: options.onProgress,
         isCancelFlagSet,
       })
       if (isCancelFlagSet()) throw new Error("下载已取消")
+      const filePath = await verifyAndPublishMediaFile({ workPath: nativePath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
+      tracker.emit(1, "YouTube 视频下载并验证完成")
+      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct-native" } })
+      return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message === "下载已取消" || isCancelFlagSet()) throw error
+      try { if (FileManager.existsSync(nativePath)) FileManager.removeSync(nativePath) } catch {}
+      await logEvent({ level: "warn", event: "download.youtube.native-fallback", taskId, details: { message, streamURL } })
+      // 回退：继续走下方 yt-dlp 下载分支。
+    }
+  }
+
+  if (options.choice.formatExpression === "direct") {
+    const extension = extensionOf(sourceURL) || (options.choice.container ? `.${options.choice.container}` : ".mp4")
+    const workPath = Path.join(workDirectory, `direct_${Date.now()}${extension}`)
+    options.onCancelPath(cancelPath)
+    await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "direct", concurrentFragments: options.concurrentFragments, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
+    try {
+      // B站 durl：单连接受限（实测 ~0.9MiB/s），并发设置 >1 时优先 Range 分段多线程下载；失败回退单连接。
+      let segmented = false
+      if (isBilibiliDurlChoice(options.choice) && options.concurrentFragments > 1) {
+        try {
+          segmented = await downloadDirectSegmented({
+            url: sourceURL,
+            destination: workPath,
+            headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+            concurrentFragments: options.concurrentFragments,
+            start: 0.02,
+            end: 0.95,
+            stage: "正在并发分段下载（多线程）",
+            onProgress: options.onProgress,
+            isCancelFlagSet,
+          })
+        } catch (segError) {
+          if (isCancelFlagSet() || (segError instanceof Error && segError.message === "下载已取消")) throw segError
+          segmented = false
+          await logEvent({ level: "warn", event: "download.direct.segmented-fallback", taskId, details: { message: segError instanceof Error ? segError.message : String(segError) } })
+        }
+      }
+      if (!segmented) {
+        await downloadURLToFileWithProgress({
+          url: sourceURL,
+          destination: workPath,
+          headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+          start: 0.02,
+          end: 0.95,
+          stage: "正在下载直接媒体资源",
+          onProgress: options.onProgress,
+          isCancelFlagSet,
+        })
+      }
+      if (isCancelFlagSet()) throw new Error("下载已取消")
       const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
       tracker.emit(1, "直接媒体下载并验证完成")
-      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct" } })
+      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct", segmented: segmented || undefined } })
       return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
     } catch (error) {
       await logEvent({ level: "error", event: "download.failed", taskId, details: { message: error instanceof Error ? error.message : String(error), kind: "direct" } })
@@ -2355,6 +2660,65 @@ export async function downloadMedia(options: {
   }
   if (hlsOrigin) {
     await logEvent({ level: "info", event: "download.hls-origin.detected", taskId, details: { segmentCount: hlsManifest?.segmentCount || null, durationSeconds: hlsManifest?.durationSeconds || null, endList: hlsManifest?.endList || null } })
+  }
+
+  // C0: DASH MPD — MPD→m3u8 桥接：视频轨/音频轨合成 m3u8 走原生分片管线，音视频分离时 ffmpeg 合并。
+  // 不支持（on-demand/无分片）时：Safari 导入（有 referer）直接报错；无 referer 直链落入下方
+  // ffmpeg 兑底（ffmpeg 原生可读 MPD，但进程无法被 JS kill，取消只能等其完成/超时）。
+  if (isMPDURL(sourceURL) || options.choice.id === "public-dash") {
+    options.onCancelPath(cancelPath)
+    await logEvent({ level: "info", event: "download.mpd.started", taskId, details: { sourceURL, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
+    tracker.emit(0.05, "正在准备 DASH 下载")
+    const workPath = Path.join(workDirectory, `dash_${Date.now()}.mp4`)
+    let dashCompleted = false
+    let dashManifest: HlsManifestSummary | undefined
+    let dashError: string | null = null
+    try {
+      tracker.emit(0.08, "正在解析 DASH 清单")
+      try {
+        dashManifest = await downloadMpdNative({
+          sourceURL,
+          destination: workPath,
+          workDirectory,
+          referer,
+          userAgent: safariUserAgent,
+          onProgress: (value) => tracker.emit(value.fraction, value.stage, { downloadedBytes: value.downloadedBytes, totalBytes: value.totalBytes, speed: value.speed }),
+          isCancelFlagSet,
+        })
+      } catch (error) {
+        dashError = error instanceof Error ? error.message : String(error)
+      }
+      if (dashManifest) {
+        dashCompleted = true
+        await logEvent({ level: "warn", event: "download.mpd.native-segments", taskId, details: { segmentCount: dashManifest.segmentCount, durationSeconds: Math.round(dashManifest.durationSeconds), safariRefererApplied: Boolean(referer), cookieTransfer: false } })
+        const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin, hlsManifest: hlsManifest || dashManifest, outputTitle: options.outputTitle })
+        tracker.emit(1, "DASH 下载并验证完成")
+        await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "mpd" } })
+        return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+      }
+      if (dashError) {
+        if (dashError === "下载已取消" || isCancelFlagSet()) {
+          dashCompleted = true
+          throw new Error("下载已取消")
+        }
+        // Safari 导入（有 referer）：DASH 原生失败直接报错，避免落入 ffmpeg 网络 TLS 常失败的死胡同。
+        if (referer) {
+          dashCompleted = true
+          await logEvent({ level: "error", event: "download.mpd.native-segments.failed", taskId, details: { reason: dashError, safariRefererApplied: true, cookieTransfer: false } })
+          throw new Error(dashError)
+        }
+        await logEvent({ level: "warn", event: "download.mpd.native-skipped", taskId, details: { reason: dashError.slice(0, 200), safariRefererApplied: false, cookieTransfer: false } })
+      }
+    } finally {
+      if (dashCompleted) {
+        cancelBackgroundDownloads()
+        try {
+          if (FileManager.existsSync(taskDirectory)) FileManager.removeSync(taskDirectory)
+        } catch {}
+      }
+    }
+    await logEvent({ level: "info", event: "download.mpd.manifest.checked", taskId, details: {} })
+    // 无 referer 直链且原生不支持：落入下方 ffmpeg 兑底（ffmpeg 原生读 MPD）。
   }
 
   // C: direct m3u8 / HLS — 原生分片优先（fetch HTTP/2，快、可取消），ffmpeg 仅作
@@ -2380,6 +2744,7 @@ export async function downloadMedia(options: {
           referer,
           userAgent: safariUserAgent,
           variantURI: options.choice.hlsVariantURI,
+          manifestFallbackText: options.manifestFallbackText,
           onProgress: (value) => tracker.emit(value.fraction, value.stage, { downloadedBytes: value.downloadedBytes, totalBytes: value.totalBytes, speed: value.speed }),
           isCancelFlagSet,
         })
@@ -2474,6 +2839,7 @@ export async function downloadMedia(options: {
           referer,
           userAgent: safariUserAgent,
           variantURI: options.choice.hlsVariantURI,
+          manifestFallbackText: options.manifestFallbackText,
           onProgress: (value) => tracker.emit(value.fraction, value.stage, { downloadedBytes: value.downloadedBytes, totalBytes: value.totalBytes, speed: value.speed }),
           isCancelFlagSet,
         }).catch((error) => {
@@ -2534,6 +2900,11 @@ export async function downloadMedia(options: {
     }
   }
 
+  // YouTube DASH/分片在 MITM/代理环境下受单连接限速：实测 4 并发分片显著快于 2
+  // （峰值 ~6 MiB/s vs ~3 MiB/s），8 并发无额外收益。用户设置低于 4 时强制 4。
+  const effectiveConcurrency = detectMediaPlatform(sourceURL) === "youtube"
+    ? (Math.max(options.concurrentFragments, 4) as ConcurrentDownloads)
+    : options.concurrentFragments
   const config = {
     url: sourceURL,
     format: options.choice.formatExpression,
@@ -2542,15 +2913,15 @@ export async function downloadMedia(options: {
     paths: workDirectory,
     progress_path: progressPath,
     cancel_flag: cancelPath,
-    concurrent_fragments: options.concurrentFragments,
+    concurrent_fragments: effectiveConcurrency,
     no_check_certificates: Boolean(options.insecureTLS),
     cookiefile: taskCookiePath,
     referer,
-    user_agent: safariUserAgent,
+    user_agent: safariUserAgent || (detectMediaPlatform(sourceURL) === "youtube" ? YOUTUBE_DOWNLOAD_UA : undefined),
     extract_audio: false,
   }
   await FileManager.writeAsString(configPath, JSON.stringify(config))
-  await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: options.choice.formatExpression, concurrentFragments: options.concurrentFragments, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
+  await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: options.choice.formatExpression, concurrentFragments: effectiveConcurrency, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
   options.onCancelPath(cancelPath)
 
   try {
