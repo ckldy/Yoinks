@@ -120,7 +120,7 @@ function isBilibiliSpaceURL(value: string): boolean {
   }
 }
 
-function isBilibiliHost(value: string): boolean {
+export function isBilibiliHost(value: string): boolean {
   try {
     const host = new URL(value).hostname.toLowerCase()
     return (
@@ -174,7 +174,7 @@ function canonicalBilibiliVideoURL(value: string): string {
   }
 }
 
-function isBilibiliShortLink(value: string): boolean {
+export function isBilibiliShortLink(value: string): boolean {
   try {
     const host = new URL(value).hostname.toLowerCase()
     return host === "b23.tv" || host.endsWith(".bili22.cn") || host.endsWith(".bili23.cn") || host.endsWith(".bili33.cn")
@@ -183,7 +183,7 @@ function isBilibiliShortLink(value: string): boolean {
   }
 }
 
-async function resolveShortLink(url: string): Promise<string> {
+export async function resolveShortLink(url: string): Promise<string> {
   try {
     const response = await fetch(url, { method: "HEAD" })
     return response.url || url
