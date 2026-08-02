@@ -2,7 +2,7 @@ import { redactURL } from "./logs"
 
 export type SafariMediaCandidateKind = "hls" | "dash" | "video" | "audio" | "inferred"
 
-export type SafariCaptureSource = "dom" | "preload" | "metadata" | "performance"
+export type SafariCaptureSource = "dom" | "preload" | "metadata" | "performance" | "runtime"
 
 export type SafariMediaCandidate = {
   id: string
@@ -21,6 +21,8 @@ export type SafariMediaCandidateEnvelope = {
   capturedAt: number
   candidates: SafariMediaCandidate[]
   playerFrameURL?: string
+  /** 采集器运行时代理捕获的 m3u8 清单文本缓存（URL→文本，≤3 条 × 512KB），下载时清单端点 403/404 兑底。 */
+  manifestCache?: Record<string, string>
 }
 
 export type SafariFrameCandidateReport = {
@@ -54,7 +56,9 @@ export const SAFARI_MEDIA_CANDIDATE_FILE = "Yoinks.json"
 export const MAX_SAFARI_MEDIA_CANDIDATES = 50
 
 const MEDIA_KINDS = new Set<SafariMediaCandidateKind>(["hls", "dash", "video", "audio", "inferred"])
-const CAPTURE_SOURCES = new Set<SafariCaptureSource>(["dom", "preload", "metadata", "performance"])
+const CAPTURE_SOURCES = new Set<SafariCaptureSource>(["dom", "preload", "metadata", "performance", "runtime"])
+const MAX_MANIFEST_CACHE_ENTRIES = 3
+const MAX_MANIFEST_TEXT_BYTES = 512 * 1024
 
 function safeTitle(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined
@@ -155,8 +159,20 @@ export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandid
     })
   }
   const playerFrameURL = safariPageReferer(raw.playerFrameURL)
-  if (!candidates.length && !playerFrameURL) return null
-  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates), ...(playerFrameURL ? { playerFrameURL } : {}) }
+  const manifestCache: Record<string, string> = {}
+  if (raw.manifestCache && typeof raw.manifestCache === "object" && !Array.isArray(raw.manifestCache)) {
+    for (const [cacheURL, cacheText] of Object.entries(raw.manifestCache as Record<string, unknown>)) {
+      if (Object.keys(manifestCache).length >= MAX_MANIFEST_CACHE_ENTRIES) break
+      const normalizedCacheURL = normalizeSafariCandidateURL(cacheURL)
+      if (!normalizedCacheURL || !isHTTPURL(cacheURL) || /[\r\n\x00-\x1f\x7f]/.test(cacheURL)) continue
+      if (typeof cacheText !== "string" || !cacheText.trim() || cacheText.length > MAX_MANIFEST_TEXT_BYTES) continue
+      // 仅接受真实 m3u8 清单文本（#EXTM3U 开头），避免把任意页面数据带入下载器。
+      if (!/^\s*#EXTM3U/.test(cacheText)) continue
+      manifestCache[normalizedCacheURL] = cacheText
+    }
+  }
+  if (!candidates.length && !playerFrameURL && !Object.keys(manifestCache).length) return null
+  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates), ...(playerFrameURL ? { playerFrameURL } : {}), ...(Object.keys(manifestCache).length ? { manifestCache } : {}) }
 }
 
 /**
