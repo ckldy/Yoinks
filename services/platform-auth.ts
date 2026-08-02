@@ -2,7 +2,7 @@ import { Path, Script, type Cookie } from "scripting"
 import { createTaskId } from "./logs"
 import type { MediaPlatform } from "./media"
 
-export type AuthPlatform = "xiaohongshu" | "youtube"
+export type AuthPlatform = "xiaohongshu" | "youtube" | "bilibili"
 export type LoginRetention = "temporary" | "persistent"
 
 export type PlatformAuthSession = {
@@ -26,6 +26,11 @@ const PLATFORM_CONFIG: Record<AuthPlatform, { label: string; loginURL: string; d
     label: "YouTube",
     loginURL: "https://www.youtube.com/",
     domains: ["youtube.com", "googlevideo.com", "youtu.be"],
+  },
+  bilibili: {
+    label: "B站",
+    loginURL: "https://www.bilibili.com/",
+    domains: ["bilibili.com", "b23.tv", "bilivideo.com", "bilivideo.cn", "bili22.cn", "bili23.cn", "bili33.cn"],
   },
 }
 
@@ -89,7 +94,7 @@ export function supportedAuthPlatforms(): AuthPlatform[] {
 }
 
 export function isAuthPlatform(platform: MediaPlatform): platform is AuthPlatform {
-  return platform === "xiaohongshu" || platform === "youtube"
+  return platform === "xiaohongshu" || platform === "youtube" || platform === "bilibili"
 }
 
 export function authPlatformLabel(platform: AuthPlatform): string {
@@ -98,6 +103,19 @@ export function authPlatformLabel(platform: AuthPlatform): string {
 
 export function isFreshCookieError(message: string): boolean {
   return /fresh cookies|cookies? (?:are|is) needed|login required|sign in|required to login|not logged in|members-only|join this channel/i.test(message)
+}
+
+/**
+ * YouTube 会员专享（members-only）错误：唯一需要触发登录的场景（已入会账号 cookie 可下载）。
+ * 与反机器人风控（isYouTubeBotCheckError）区分——bot 检测登录无效，不应引导登录。
+ */
+export function isYouTubeMembersOnlyError(message: string): boolean {
+  return /members-only|join this channel|成为此频道的会员|会员专享/i.test(message)
+}
+
+/** YouTube 反机器人风控（"Sign in to confirm you're not a bot"）：登录通常无效，应提示稍后重试/换网。 */
+export function isYouTubeBotCheckError(message: string): boolean {
+  return /sign in to confirm you['’]?re not a bot/i.test(message)
 }
 
 export async function beginPlatformLogin(platform: AuthPlatform, retention: LoginRetention): Promise<PlatformAuthSession> {
