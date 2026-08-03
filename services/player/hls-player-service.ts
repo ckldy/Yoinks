@@ -124,6 +124,15 @@ audio{display:none}
 .menu-item{color:#fff;font:13px -apple-system;padding:8px 14px;cursor:pointer;-webkit-tap-highlight-color:transparent;white-space:nowrap;text-align:center}
 .menu-item:active{background:rgba(255,255,255,0.15)}
 .menu-item.active{color:#4ad6ff}
+.tap-layer{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;display:none}
+.bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:10px;padding:12px 14px 20px;background:linear-gradient(transparent,rgba(0,0,0,0.75));z-index:15;opacity:0;transition:opacity .25s;pointer-events:none}
+.bar.show{opacity:1;pointer-events:auto}
+.bar-btn{background:rgba(255,255,255,0.18);color:#fff;border:none;border-radius:50%;width:40px;height:40px;font:700 15px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent;flex:none}
+.bar-btn:active{background:rgba(255,255,255,0.3)}
+.bar-track{flex:1;height:32px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+.bar-rail{width:100%;height:4px;border-radius:2px;background:rgba(255,255,255,0.3);position:relative}
+.bar-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#4ad6ff;border-radius:2px}
+.bar-time{color:#fff;font:12px -apple-system;min-width:96px;text-align:right;flex:none}
 </style>
 </head>
 <body>
@@ -131,6 +140,12 @@ audio{display:none}
 <video id="video" controls {{PLAYS_INLINE}} {{MUTED}} {{AUTOPLAY}} preload="{{PRELOAD}}"></video>
 <audio id="audio" preload="auto"></audio>
 <div class="error" id="error" style="display:none"></div>
+<div class="tap-layer" id="tapLayer"></div>
+<div class="bar" id="bar">
+  <button class="bar-btn" id="playBtn">▶</button>
+  <div class="bar-track" id="track"><div class="bar-rail"><div class="bar-fill" id="fill"></div></div></div>
+  <span class="bar-time" id="timeText">0:00 / 0:00</span>
+</div>
 <div class="ctrl-wrap">
   <div class="ctrl-host" id="qualityHost" style="display:none">
     <button class="pill" id="qualityBtn">画质</button>
@@ -464,6 +479,8 @@ function play(src, audioSrc) {
 
     hls.loadSource(src);
     hls.attachMedia(video);
+    // MSE 播放：用自绘控制条替代 iOS 原生 controls（原生对 MSE 流会闪烁/调不出）。
+    enableCustomControls();
 
     hls.on(Hls.Events.MANIFEST_PARSED, function() {
       loading.style.display = 'none';
@@ -656,6 +673,86 @@ document.addEventListener('click', function(e) {
   speedMenu.classList.remove('open');
   qualityMenu.classList.remove('open');
 });
+
+// --- 自绘控制条（MSE 播放时替代 iOS 原生 controls——原生 controls 对 MSE 流会闪烁/调不出） ---
+var customControlsEnabled = false;
+var tapLayer = document.getElementById('tapLayer');
+var bar = document.getElementById('bar');
+var playBtn = document.getElementById('playBtn');
+var track = document.getElementById('track');
+var fill = document.getElementById('fill');
+var timeText = document.getElementById('timeText');
+var barHideTimer = null;
+var seeking = false;
+
+function formatTime(t) {
+  t = Math.max(0, isNaN(t) ? 0 : Math.floor(t));
+  var m = Math.floor(t / 60);
+  var s = t % 60;
+  return m + ':' + (s < 10 ? '0' + s : String(s));
+}
+function updateBar() {
+  var dur = video.duration || 0;
+  var cur = video.currentTime || 0;
+  playBtn.textContent = video.paused ? '▶' : '❚❚';
+  fill.style.width = (dur > 0 ? Math.min(100, (cur / dur) * 100) : 0) + '%';
+  timeText.textContent = formatTime(cur) + ' / ' + formatTime(dur);
+}
+function showBar() {
+  bar.classList.add('show');
+  updateBar();
+  if (barHideTimer) clearTimeout(barHideTimer);
+  barHideTimer = setTimeout(function() { bar.classList.remove('show'); }, 3000);
+}
+function hideBar() {
+  if (barHideTimer) clearTimeout(barHideTimer);
+  barHideTimer = null;
+  bar.classList.remove('show');
+}
+function enableCustomControls() {
+  if (customControlsEnabled) return;
+  customControlsEnabled = true;
+  try { video.removeAttribute('controls'); } catch (e) {}
+  tapLayer.style.display = 'block';
+  tapLayer.addEventListener('click', function() {
+    if (bar.classList.contains('show')) {
+      // 已唤出控制条：再次点击切换播放/暂停（贴近原生点按习惯）。
+      if (video.paused) { video.play().catch(function() {}); } else { video.pause(); }
+      showBar();
+    } else {
+      showBar();
+    }
+  });
+  playBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    if (video.paused) { video.play().catch(function() {}); } else { video.pause(); }
+    showBar();
+  });
+  track.addEventListener('pointerdown', function(e) {
+    e.stopPropagation();
+    seeking = true;
+    seekFromEvent(e);
+  });
+  track.addEventListener('pointermove', function(e) {
+    if (seeking) seekFromEvent(e);
+  });
+  ['pointerup', 'pointercancel'].forEach(function(type) {
+    track.addEventListener(type, function() { seeking = false; });
+  });
+  function seekFromEvent(e) {
+    var rect = track.getBoundingClientRect();
+    var ratio = rect.width > 0 ? Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)) : 0;
+    var t = ratio * (video.duration || 0);
+    try { video.currentTime = t; } catch (err) {}
+    updateBar();
+  }
+  video.addEventListener('timeupdate', updateBar);
+  video.addEventListener('play', updateBar);
+  video.addEventListener('pause', updateBar);
+  video.addEventListener('durationchange', updateBar);
+  video.addEventListener('ended', function() { updateBar(); showBar(); });
+  updateBar();
+}
 
 buildSpeedMenu();
 </script>

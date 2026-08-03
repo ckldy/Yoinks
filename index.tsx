@@ -5,6 +5,7 @@ import {
   List,
   Navigation,
   NavigationStack,
+  Path,
   ProgressView,
   Script,
   Section,
@@ -49,6 +50,8 @@ import {
   mediaPlatformLabel,
   probeMedia,
   probeSafariPublicPlayerFrame,
+  previewYouTubeUMPClip,
+  TEMP_DIR,
   resolveAutomaticChoice,
   resolveInitialMediaChoice,
   saveResult,
@@ -423,6 +426,16 @@ function View() {
   )
   const batchQueueRef = useRef<BatchQueueState>(batchQueue)
   const batchCancelPathRef = useRef<string | null>(null)
+  // UMP 预览兜底运行期取消：任何新操作（分析/下载/关闭脚本）写入该文件，驱动 ~1s 内退出
+  const umpPreviewCancelPathRef = useRef<string | null>(null)
+  const umpPreviewCancelledRef = useRef(false)
+  const cancelStaleUmpPreview = async () => {
+    const path = umpPreviewCancelPathRef.current
+    if (!path) return
+    if (FileManager.existsSync(path)) return
+    await logEvent({ level: "info", event: "preview.youtube.ump-cancel-requested", details: { cancelPath: path } })
+    await FileManager.writeAsString(path, String(Date.now()))
+  }
   const [platformSessions, setPlatformSessions] = useState<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
   const loggedInSessions = Object.values(platformSessions).filter((session): session is PlatformAuthSession => session != null)
   const platformSessionsRef = useRef<Partial<Record<AuthPlatform, PlatformAuthSession>>>({})
@@ -457,6 +470,10 @@ function View() {
 
   const isCertificateError = (message: string): boolean => {
     return /certificate|SSL|TLS|untrusted|verify.*cert|self.signed|expired|hostname.*mismatch/i.test(message)
+  }
+
+  const isRecoverableYouTubePreviewFailure = (message: string): boolean => {
+    return /DASH 初始化失败|Network error|无法解析 \.m4s 初始化段|HTTP (?:401|403)|加载超时|请求超时/i.test(message)
   }
 
   const applyProgressUi = (p: DownloadProgress, force = false) => {
@@ -708,6 +725,8 @@ function View() {
   }
 
   const analyzeMedia = async (nextURL?: string, autoDownloadRequested = false, skipPublicPlayerFallback = false): Promise<boolean | undefined> => {
+    // 新操作开始时取消仍在运行的 UMP 预览兜底，确保其 python 进程退出、Shell 队列释放
+    await cancelStaleUmpPreview()
     let analysisCompleted = false
     const gen = ++analysisGenerationRef.current
     const sourceURL = extractFirstURL(nextURL || url)
@@ -753,7 +772,7 @@ function View() {
         if (platform === "youtube" && isYouTubeBotCheckError(firstMessage)) {
           setProbe(null)
           await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message: firstMessage, botCheck: true } })
-          setStatus("YouTube 将当前网络判定为可疑流量（反机器人）。请稍后重试或更换网络；会员专享视频才需要登录。")
+          setStatus("YouTube 将当前网络判定为可疑流量（反机器人风控），无法获取格式。请等待 15 分钟至数小时再试，或切换 Wi‑Fi/蜂窝网络更换 IP；频繁重试可能延长封禁。会员专享视频才需要登录。")
           return
         }
         // Douyin never enters the login branch; YouTube reaches it only when a members-only video needs an account.
@@ -1094,6 +1113,8 @@ function View() {
 
   const closeYoinks = () => {
     closingRef.current = true
+    // 关闭脚本前取消 UMP 预览兜底（若有），驱动 ~1s 内退出，避免残留进程占串行队列
+    void cancelStaleUmpPreview()
     const current = extractFirstURL(url)
     if (current) rememberSkippedClipboardURL(current)
     clearCurrentLink()
@@ -1198,6 +1219,14 @@ function View() {
       if (diagnostic) await logEvent({ level: "warn", event: "safari-candidate.empty", details: { candidateCount: diagnostic.candidateCount, topLevelCandidateCount: diagnostic.topLevelCandidateCount, frameReportCount: diagnostic.frameReportCount, frameCandidateCount: diagnostic.frameCandidateCount, mediaLikeResourceCount: diagnostic.mediaLikeResourceCount, iframeCount: diagnostic.iframeCount, waitMs: diagnostic.waitMs, errorKind: diagnostic.errorKind || null } })
       const summary = diagnostic ? `最近采集：候选 ${diagnostic.candidateCount}，媒体类资源 ${diagnostic.mediaLikeResourceCount}，iframe ${diagnostic.iframeCount}，frame 报告 ${diagnostic.frameReportCount}。` : ""
       setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
+      return
+    }
+    // VIP 专享页（dsd.com.se 等 MacCMS）：服务端对匿名/普通账号不下发播放器配置，
+    // 采集 0 候选属预期行为。给出明确提示，而不是清空候选库后弹空列表。
+    if (envelope.gate?.kind === "vip" && envelope.candidates.length === 0) {
+      const gateTitle = envelope.gate.title ? `（${envelope.gate.title}）` : ""
+      await logEvent({ level: "warn", event: "safari-candidate.vip-gated", details: { pageURL: envelope.pageURL, gate: envelope.gate } })
+      setStatus(`该视频为 VIP 会员专享${gateTitle}，未登录无法获取播放链接。请先在 Safari 登录该站点的 VIP 账号，再重新采集。`)
       return
     }
     // 每次导入新捕获前先清掉旧的 safari 来源候选（保留发现/手动来源），
@@ -2120,6 +2149,97 @@ function View() {
 
     // failed
     setStatus("在线预览无法打开")
+    // YouTube DASH 的签名 URL/节点可能瞬时失效；先重新探测并用同一 itag 重试一次，再进入昂贵的 UMP 本地片段兜底。
+    if (detectMediaPlatform(probe.webpageURL || url) === "youtube" && isRecoverableYouTubePreviewFailure(result.message)) {
+      await logEvent({ level: "info", event: "preview.youtube.refresh-retry.started", details: { choiceId: selectedChoice.id, message: result.message } })
+      setStatus("播放连接失败，正在刷新 YouTube 播放地址…")
+      try {
+        const previewSession = probeAuthorizedPlatformRef.current === "youtube" ? await sessionForPlatform("youtube") : null
+        const refreshedProbe = await probeWithPlatformSession(probe.webpageURL || url, previewSession)
+        const videoItag = selectedChoice.youtubeVideoItag
+        const refreshedChoice = refreshedProbe.choices.find((choice: MediaChoice) =>
+          videoItag ? choice.youtubeVideoItag === videoItag : choice.id === selectedChoice.id,
+        )
+        if (refreshedChoice?.previewURL) {
+          const retryResult = await openOnlinePreview({
+            url: refreshedChoice.previewURL,
+            title: refreshedProbe.title,
+            autoplayMode: preferences.previewAutoplayMode,
+            webpageURL: refreshedProbe.webpageURL,
+            previewReferer: refreshedChoice.previewReferer,
+            previewHeaders: refreshedChoice.previewHeaders,
+            audioUrl: refreshedChoice.previewAudioURL,
+            duration: refreshedProbe.duration,
+            videoCodec: refreshedChoice.previewVideoCodec,
+            audioCodec: refreshedChoice.previewAudioCodec,
+          })
+          if (retryResult.status === "presented") {
+            setProbe(refreshedProbe)
+            setSelectedChoice(refreshedChoice)
+            await logEvent({ level: "info", event: "preview.youtube.refresh-retry.completed", details: { choiceId: refreshedChoice.id } })
+            return
+          }
+          result.message = retryResult.message
+        }
+        await logEvent({ level: "warn", event: "preview.youtube.refresh-retry.failed", details: { choiceId: selectedChoice.id, message: result.message } })
+      } catch (error) {
+        await logEvent({ level: "warn", event: "preview.youtube.refresh-retry.failed", details: { choiceId: selectedChoice.id, message: error instanceof Error ? error.message : String(error) } })
+      }
+    }
+    // 预览会话已结束：先复位 previewing，避免 UMP 兜底（python 下载可能耗时）期间 UI 一直显示「正在打开视频」
+    setPreviewing(false)
+    // 刷新 URL 后仍失败时，尝试 UMP 官方通道本地片段预览
+    const umpClip = await (async () => {
+      const umpItag = selectedChoice?.youtubeVideoItag
+      const umpAudioItag = selectedChoice?.youtubeAudioItag
+      await logEvent({
+        level: "info",
+        event: "preview.youtube.ump-entry",
+        details: {
+          choiceId: selectedChoice?.id || null,
+          choiceLabel: selectedChoice?.label || null,
+          youtubeVideoItag: umpItag ?? null,
+          youtubeAudioItag: umpAudioItag ?? null,
+          hasProbe: Boolean(probe),
+          probeWebpageURL: probe?.webpageURL || null,
+          resultMessage: result.message || null,
+        },
+      })
+      if (!umpItag || !probe) return null
+      // 兜底运行期可取消：任何新操作（分析/下载/关闭脚本）写入该文件后驱动 ~1s 内退出
+      const umpCancelPath = Path.join(TEMP_DIR, `ump-preview-${Date.now()}.cancel`)
+      try { if (FileManager.existsSync(umpCancelPath)) FileManager.removeSync(umpCancelPath) } catch {}
+      umpPreviewCancelPathRef.current = umpCancelPath
+      try {
+        // 注意：必须传可解析 videoId 的页面 URL（youtube.com/youtu.be）；sourceURL 是 googlevideo 直链，parseYouTubeVideoID 解析不出会静默跳过兜底
+        const clip = await previewYouTubeUMPClip({
+          url: probe.webpageURL || selectedChoice!.sourceURL || url,
+          choice: selectedChoice!,
+          maxSeconds: 45,
+          cancelPath: umpCancelPath,
+          isCancelFlagSet: () => FileManager.existsSync(umpCancelPath),
+          onProgress: (stage: string) => setStatus(stage),
+        })
+        if (clip === null && FileManager.existsSync(umpCancelPath)) umpPreviewCancelledRef.current = true
+        return clip
+      } catch (error) {
+        await logEvent({ level: "warn", event: "preview.youtube.ump-caught", details: { message: error instanceof Error ? error.message : String(error) } })
+        return null
+      } finally {
+        try { if (FileManager.existsSync(umpCancelPath)) FileManager.removeSync(umpCancelPath) } catch {}
+        umpPreviewCancelPathRef.current = null
+      }
+    })()
+    if (umpClip) {
+      await logEvent({ level: "info", event: "preview.youtube.ump-clip-ok", details: { title: probe?.title, filePath: umpClip } })
+      await QuickLook.previewURLs([umpClip], true)
+      return
+    }
+    // 用户主动取消（新操作触发）时静默返回，不弹“预览失败”框
+    if (umpPreviewCancelledRef.current) {
+      umpPreviewCancelledRef.current = false
+      return
+    }
     await Dialog.alert({ title: "在线预览失败", message: result.message })
     } finally {
       previewPlayerRef.current = null
@@ -2128,6 +2248,8 @@ function View() {
   }
 
       const startDownload = async (insecureTLS = false, automatic?: { sourceURL: string; choice: MediaChoice; probeTitle: string; toolStatus: ToolStatus | null }, retriedTransientAccess = false) => {
+    // 新下载开始时取消仍在运行的 UMP 预览兜底（下载/合并会排队等它释放）
+    await cancelStaleUmpPreview()
     const availableTools = automatic?.toolStatus || tools
     const validURL = extractFirstURL(automatic?.sourceURL || url)
     if (!validURL) {
@@ -2558,6 +2680,8 @@ return (
               <Button title={`在线预览：${PREVIEW_AUTOPLAY_LABELS[preferences.previewAutoplayMode]}`} systemImage="play.circle" action={() => void choosePreviewAutoplayMode()} disabled={downloading || analyzing} />
               <Toggle title="显示最近候选库" systemImage="clock.arrow.circlepath" value={preferences.showRecentCandidates} onChanged={(value) => updatePreferences({ ...preferences, showRecentCandidates: value })} />
               <Text font="caption" foregroundStyle="secondaryLabel">关闭后下载页不再展示最近候选库区域，减少占用；仍可随时重新打开。</Text>
+              <Toggle title="YouTube UMP 优先下载" systemImage="bolt.horizontal.circle" value={preferences.umpFirst} onChanged={(value) => updatePreferences({ ...preferences, umpFirst: value })} />
+              <Text font="caption" foregroundStyle="secondaryLabel">测试版：YouTube 视频先走 UMP 官方通道（60 秒预算），失败/超时自动回退 yt-dlp 下载。关闭后直接走 yt-dlp。</Text>
             </Section>
             <Section title="自动下载">
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />

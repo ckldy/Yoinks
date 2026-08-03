@@ -20,6 +20,8 @@ export type YoinksPreferences = {
   experimentalDiscoveryEnabled: boolean
   /** 下载页是否显示“最近候选库”区域（默认显示，可在设置中关闭）。 */
   showRecentCandidates: boolean
+  /** YouTube UMP 优先下载（测试版）：DASH 先走 UMP 官方通道，60s 预算，失败/超时回退 yt-dlp。 */
+  umpFirst: boolean
 }
 
 export const DEFAULT_PREFERENCES: YoinksPreferences = {
@@ -34,6 +36,7 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   maxHistoryRecords: 100,
   experimentalDiscoveryEnabled: false,
   showRecentCandidates: true,
+  umpFirst: true,
 }
 
 function isSaveMode(value: unknown): value is SaveMode {
@@ -78,6 +81,7 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     maxHistoryRecords: source.maxHistoryRecords === null ? null : isLimit(source.maxHistoryRecords) ? Math.floor(source.maxHistoryRecords) : DEFAULT_PREFERENCES.maxHistoryRecords,
     experimentalDiscoveryEnabled: isBoolean(source.experimentalDiscoveryEnabled) ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
     showRecentCandidates: isBoolean(source.showRecentCandidates) ? source.showRecentCandidates : DEFAULT_PREFERENCES.showRecentCandidates,
+    umpFirst: isBoolean(source.umpFirst) ? source.umpFirst : DEFAULT_PREFERENCES.umpFirst,
   }
 }
 

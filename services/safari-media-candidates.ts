@@ -20,10 +20,14 @@ export type SafariMediaCandidateEnvelope = {
   pageTitle?: string
   capturedAt: number
   candidates: SafariMediaCandidate[]
+  /** 采集器检测到的页面付费门（MacCMS VIP 专享等）：服务端不下发播放器配置，采集 0 候选时用于给出明确提示。 */
+  gate?: SafariPageGate
   playerFrameURL?: string
   /** 采集器运行时代理捕获的 m3u8 清单文本缓存（URL→文本，≤3 条 × 512KB），下载时清单端点 403/404 兑底。 */
   manifestCache?: Record<string, string>
 }
+
+export type SafariPageGate = { kind: "vip"; title?: string; posterURL?: string }
 
 export type SafariFrameCandidateReport = {
   sessionId: string
@@ -159,6 +163,13 @@ export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandid
     })
   }
   const playerFrameURL = safariPageReferer(raw.playerFrameURL)
+  let gate: SafariPageGate | undefined
+  if (raw.gate && typeof raw.gate === "object" && (raw.gate as Record<string, unknown>).kind === "vip") {
+    const rawGate = raw.gate as Record<string, unknown>
+    const title = typeof rawGate.title === "string" ? safeTitle(rawGate.title) : undefined
+    const posterURL = typeof rawGate.posterURL === "string" ? safariPageReferer(rawGate.posterURL) : undefined
+    gate = { kind: "vip", ...(title ? { title } : {}), ...(posterURL ? { posterURL } : {}) }
+  }
   const manifestCache: Record<string, string> = {}
   if (raw.manifestCache && typeof raw.manifestCache === "object" && !Array.isArray(raw.manifestCache)) {
     for (const [cacheURL, cacheText] of Object.entries(raw.manifestCache as Record<string, unknown>)) {
@@ -171,8 +182,8 @@ export function sanitizeSafariMediaCandidates(value: unknown): SafariMediaCandid
       manifestCache[normalizedCacheURL] = cacheText
     }
   }
-  if (!candidates.length && !playerFrameURL && !Object.keys(manifestCache).length) return null
-  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates), ...(playerFrameURL ? { playerFrameURL } : {}), ...(Object.keys(manifestCache).length ? { manifestCache } : {}) }
+  if (!candidates.length && !playerFrameURL && !Object.keys(manifestCache).length && !gate) return null
+  return { version: 1, pageURL, pageTitle: safeTitle(raw.pageTitle), capturedAt, candidates: sortSafariMediaCandidates(candidates), ...(gate ? { gate } : {}), ...(playerFrameURL ? { playerFrameURL } : {}), ...(Object.keys(manifestCache).length ? { manifestCache } : {}) }
 }
 
 /**

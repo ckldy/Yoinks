@@ -41,6 +41,7 @@ const checks: Array<[string, boolean]> = [
   ["PLAYER_CONFIG_URL_KEY_PATTERN preserved", /PLAYER_CONFIG_URL_KEY_PATTERN/.test(js)],
   ["iframeQueryMediaURLs preserved", /function iframeQueryMediaURLs\(\)/.test(js)],
   ["maccmsPlayerConfigURLs preserved", /function maccmsPlayerConfigURLs\(\)/.test(js)],
+  ["detectPageGate preserved", /function detectPageGate\(\)/.test(js)],
   ["listen skip hls/dash condition", /\!candidates\.some\(c => c\.kind === "hls" \|\| c\.kind === "dash"\)/.test(js)],
   ["PLAYER_MEDIA_DEFINITION_PATTERN preserved", /PLAYER_MEDIA_DEFINITION_PATTERN/.test(js)],
   ["resolvePHMediaEndpoint preserved", /function resolvePHMediaEndpoint\(endpoint\)/.test(js)],
@@ -50,9 +51,24 @@ const checks: Array<[string, boolean]> = [
   ["reload menu command preserved", /重新加载页面以应用插件更新/.test(js)],
   ["no floating version label (version shown in Scripting management only)", !/yoinks-plugin-version/.test(js)],
   ["diagnostic browserVersion preserved", /browserVersion: String\(GM_info/.test(js)],
+  // v1.3.4：Video Sniffer 内容嗅探（无扩展名 HLS 端点补捕获）
+  ["HLS_CONTENT_TYPE_RE preserved", /HLS_CONTENT_TYPE_RE/.test(js)],
+  ["isHlsBodyText preserved", /function isHlsBodyText\(/.test(js)],
+  ["cacheManifestText preserved", /function cacheManifestText\(/.test(js)],
+  ["XHR hls load hook added", /__vsHlsHooked/.test(js)],
+  // v1.3.4：界面（候选计数徽章 + 加载脉冲 + 状态色 + 轻量面板 + 剪贴板）
+  ["candidate badge markup present", /yoinks-media-candidate-badge/.test(js)],
+  ["capture panel markup present", /Yoinks 捕获候选/.test(js)],
+  ["copyText helper present", /function copyText\(/.test(js)],
+  ["setCaptureState helper present", /setCaptureState/.test(js)],
+  ["kindSummary helper present", /kindSummary/.test(js)],
   // 回归：firstPublicFrameURL 的 bestScore 必须保留（转换器曾把 `let best: string | undefined,
   // bestScore = -1` 错误吞成 `let best = -1`，导致 ReferenceError 采集失败）
   ["firstPublicFrameURL bestScore declared", /let bestScore = -1/.test(js)],
+  // 回归：对象类型返回注解的联合后缀必须一并剥离（转换器曾把
+  // `function detectPageGate(): { ... } | null {` 残留成 `function detectPageGate() | null {`，
+  // 导致 Safari 注入时报 Unexpected token '|'）
+  ["no union suffix after object return type", !/\bfunction\s+\w+\([^)]*\)\s*\|\s*(?:null|undefined|string|number|boolean|\w+)\s*\{/.test(js)],
   // 逻辑等价：关键行数接近（类型剥离最多删 ~40 行）
   ["output length plausible", js.split("\n").length >= source.split("\n").length - 60 && js.split("\n").length <= source.split("\n").length + 10],
 ]

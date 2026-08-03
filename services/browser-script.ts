@@ -96,8 +96,12 @@ export function stripBrowserTypeScript(source: string): string {
   // 3) 泛型实例化：new Set<string>() -> new Set() 等
   out = out.replace(/\bnew\s+(Set|Map|Promise)\s*<[^>]*>/g, "new $1")
   // 4) 内联对象返回类型：): Promise<{...}> / ): {...}  ->  )
-  out = out.replace(/\)\s*:\s*Promise<\{[^}]*\}>/g, ")")
-  out = out.replace(/\)\s*:\s*\{[^}]*\}/g, ")")
+  //    对象类型可能带联合后缀（如 `): { ... } | null {`），必须一并剥掉：
+  //    否则 `function detectPageGate(): { kind: "vip"; ... } | null {` 会残留
+  //    `function detectPageGate() | null {`，导致 Safari 注入时报
+  //    "Unexpected token '|'. Expected an opening '{' at the start of a function body."
+  out = out.replace(/\)\s*:\s*Promise<\{[^}]*\}>(?:\s*\|\s*[^{}=\n;]+)?/g, ")")
+  out = out.replace(/\)\s*:\s*\{[^}]*\}(?:\s*\|\s*[^{}=\n;]+)?/g, ")")
   // 5) 函数声明签名：function name(params): RET {  ->  function name(strippedParams) {
   out = out.replace(/function\s+\w+\s*\([^)]*\)\s*:\s*[^{]+\{/g, (match: string) => {
     const open = match.indexOf("(")

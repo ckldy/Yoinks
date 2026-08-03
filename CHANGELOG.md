@@ -1,5 +1,31 @@
 # 更新日志
 
+## 1.6.10 — 2026-08-03
+
+> 本版为 **YouTube UMP 官方通道下载闭环**（yt-dlp-ytse 插件方案 A）+ **DASH 播放器稳定性两轮优化**（含 MSE 自绘控制条），全部静态/端到端验证与真机验收通过。
+
+### 新功能
+
+- **YouTube UMP 官方通道优先下载（yt-dlp-ytse 插件）**：接入 yt-dlp-ytse（UMP-wrapped GET 协议），下载优先走 UMP（`extractor_args youtube.formats=ump` + `format_sort proto:ump`），规避 googlevideo GET 403；`toUMPFormatExpression` 给数字 itag 自动加 `-ump` 后缀（如 `137+140 → 137-ump+140-ump`）；**每流失败（非取消）自动回退普通 yt-dlp 重跑一次**（60s 预算 + 设置开关，清残留后重试）；UMP 副本 format_id 稳定后缀修复（yt-dlp 去重后缀 `-0/-1` 顺序不稳定会匹配到 https 版）；**日志协议标记**：下载完成后输出 `MEDIA_DOWNLOADER_PROTOCOL ump|https`，`command.completed` 的 `details.protocol` 直接可见实际协议。
+- **预览 UMP 本地片段兜底**：在线预览失败（YouTube 可恢复类错误）→ 自动刷新播放地址重试一次 → 仍失败则走 UMP 官方通道下载前 45s 片段本地播放；运行期可取消（新操作写入 cancel 文件，~1s 内退出）。
+- **YouTube 冷启动 PoToken（08-02 晚）**：纯 Python（bgutils）生成 PoToken，避免冷启动 GET 全 403（ion44 出口 IP 实测 GET 全 403 而 UMP POST 全 200）；POST 下载 60s 超时 + 异常续传 + SSL 级联降级。
+- **YouTube IOS 原生探测优化**：itag 137/H.264 优先健康检查、progressive/adaptive 分离、H.264 优先 M4A、结构化状态日志。
+
+### 改进与修复
+
+- **UMP 取消确保进程退出**：驱动加检查点（fetch_media 每轮查 cancel）+ 短 socket 超时（5s/8s）+ ffmpeg_run SIGKILL 包装；取消/关闭预览不再残留后台进程。
+- **UMP --insecure TLS 绕开**：参照 yt-dlp，仅对 SSL 错误自动降级重试；`ytdlp_runner.py` 顶部清除 `yt_dlp*` sys.modules 缓存强制重扫插件（改插件无需重启 App）。
+- **DASH 播放器稳定性（第一轮，日志驱动）**：修复模板字符串 `\b` 退格转义 bug（`/\b403\b/` 编译成退格字符正则，403 判定从未生效，B站 mirror fallback 逻辑是死的）；初始化探测 2MB 截断时自动扩大 16MB 重试（4K moov 超限不再报「无法解析 .m4s 初始化段」）；视频/音频独立探测，音频失败（403/超时）降级**仅视频静音播放**（不再全盘失败）；403 纳入 0/300/900ms 重试链；dash.js CDN 失败自动切 unpkg 兑底 + 4s 无反应主动切换；未知时长 MPD 1h 兑底。
+- **DASH/HLS 播放界面：MSE 自绘控制条（第二轮，真机反馈）**：iOS WKWebView 对 MSE（hls.js/dash.js）流的原生 `<video controls>` 会闪烁/调不出（平台已知行为）；MSE 模式改自绘控制条（点击画面唤出/播放暂停、底部播放按钮、可拖动进度条、时间显示、3s 自动隐藏），native-fallback / 直链模式保留原生 controls。
+- 顺手修复：`mergeYouTubeUMPTracks` 旧参数名 bug（`isCancelFlagSet`）。
+
+### 验证
+
+- 全项目 TypeScript 诊断通过（模板字符串内嵌 JS 由 verify 做语法检查）。
+- 新增：`verify_dash_player_stability` 24 项（模板 JS 语法 + 探测扩大/403 重试/音频降级/CDN 兑底/时长兑底/自绘控制条断言）、`verify_ump_first` 8 项、`verify_ump_cancel_fast` 8 项、`verify_ump_cancellation`、`verify_ump_insecure`。
+- 回归全过：`verify_online_preview`、`verify_player_controls` 15、`verify_mpd` 18、`verify_mpd_e2e` 6、`verify_ump_cancel_fast` 8、`verify_ump_first` 8。
+- **真机验收通过**：UMP 下载闭环（13:37 `proto=["ump"]` 日志实锤：720p 136-ump+140-ump 48.34MiB 24s ≈2.0MiB/s + 音频 8.75MiB 8s，无回退，合并→验证→相册全通）；DASH 播放器稳定性 + 自绘控制条（14:07 用户确认符合预期）。
+
 ## 1.6.9 — 2026-08-02
 
 > 本版为「cat-catch 审计优化」P0+P1 全量落地（加密 HLS 下载管线与 DASH 桥接、采集器运行时代理与清单兑底）+ chinaxmovie/MacCMS 采集修复 + m3u8 分析原生快路径，全部静态/端到端验证与真机验收通过。

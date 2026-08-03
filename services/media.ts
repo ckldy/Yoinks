@@ -1,8 +1,10 @@
 import { AbortController, Path, Script, fetch } from "scripting"
 import { createTaskId, logEvent } from "./logs"
 import { probeBilibiliDirect } from "./bilibili"
+import { probeYouTubeDirect, parseYouTubeVideoID } from "./youtube"
 import { extractPublicPlayerFrameSources, extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
 import type { AuthPlatform } from "./platform-auth"
+import { getPreferences } from "./preferences"
 import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
 import { cancelBackgroundDownloads, downloadURLToFileWithProgress } from "./background-download"
 import { bilibiliMobileFallbackURL, isBilibiliDiscovery412, isBilibiliHost, isBilibiliShortLink, resolveShortLink } from "./discovery"
@@ -80,6 +82,10 @@ export type MediaChoice = {
   previewVideoCodec?: string
   /** Actual audio codec string (e.g. mp4a.40.2) for DASH MPD. */
   previewAudioCodec?: string
+  /** YouTube UMP/SABR 视频轨 itag；原生 IOS 探测保留，避免从展示 ID 反推。 */
+  youtubeVideoItag?: number
+  /** YouTube UMP/SABR 音频轨 itag；DASH 合并格式必填。 */
+  youtubeAudioItag?: number
 }
 
 export type MediaProbe = {
@@ -118,7 +124,7 @@ type RawFormat = {
 
 const ROOT_DIR = Path.join(FileManager.documentsDirectory, "Yoinks")
 const DOWNLOAD_DIR = Path.join(ROOT_DIR, "Downloads")
-const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
+export const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
 /** One end-to-end probe, including automatic retries, may use at most this many seconds. */
@@ -363,6 +369,57 @@ async function sniffHlsManifest(sourceURL: string, referer: string | undefined, 
     return text.length <= 262144 && /^\s*#EXTM3U/m.test(text || "") ? text : null
   } catch { return null } finally { clearTimeout(timeout) }
 }
+
+// MacCMS（苹果 CMS）vplayer 播放器（dsd.com.se 等）：真实 m3u8 带服务端签名
+// （?sign=...，短时效约几分钟），无签名直链一律 403（Cloudflare “Access Denied: 签名已过期”）。
+// 签名由同源 /addons/vplayer/?url=<path> 播放器页生成并内嵌在 AAEncode 混淆脚本里。
+// 用 ephemeral WebView 加载该页、让 JS 运行后读取 <video> 的 currentSrc，即可拿到
+// 签名地址（不依赖混淆算法、不传 Cookie；实测签名 URL 无需 Referer/Cookie 即可 200）。
+const DESKTOP_SAFARI_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
+
+function isMaccmsVPlayerCandidate(sourceURL: string, referer?: string): boolean {
+  if (!referer || !/\.m3u8(?:$|[?#])/i.test(sourceURL)) return false
+  try {
+    const sourceHost = new URL(sourceURL).hostname
+    const refererURL = new URL(referer)
+    if (refererURL.hostname !== sourceHost) return false
+    return /(?:vodplay|vod\/play|index\.php\/vod\/play|\/play\/)/i.test(refererURL.pathname)
+  } catch {
+    return false
+  }
+}
+
+async function resolveMaccmsVPlayerSignedURL(sourceURL: string, referer: string, taskId: string): Promise<string | null> {
+  try {
+    const url = new URL(sourceURL)
+    const vplayerURL = `${url.origin}/addons/vplayer/?url=${encodeURIComponent(url.pathname + url.search)}&jump=`
+    await logEvent({ level: "info", event: "probe.safari-hls.vplayer.resolve", taskId, details: { sourceURL, vplayerURL, referer } })
+    const webView = new WebViewController({ ephemeral: true })
+    try {
+      webView.setCustomUserAgent(DESKTOP_SAFARI_UA)
+      await webView.loadURL(vplayerURL)
+      const loadPromise = webView.waitForLoad().then(() => true).catch(() => true)
+      await Promise.race([loadPromise, new Promise<void>((resolve) => setTimeout(resolve, 8000))])
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline) {
+        try {
+          const src = await webView.evaluateJavaScript<string>(`(function(){ const v = document.querySelector('video'); return (v && (v.currentSrc || v.src)) || '' })()`)
+          if (typeof src === "string" && /^https?:\/\//i.test(src) && /\.m3u8/i.test(src)) {
+            await logEvent({ level: "info", event: "probe.safari-hls.vplayer-resolved", taskId, details: { sourceURL, signedURL: src } })
+            return src
+          }
+        } catch {}
+        await new Promise<void>((resolve) => setTimeout(resolve, 600))
+      }
+      return null
+    } finally {
+      try { webView.dispose() } catch {}
+    }
+  } catch {
+    return null
+  }
+}
+
 
 function isVidURL(value: string): boolean {
   try { return /\.vid(?:$|[?#])/i.test(new URL(value).pathname) } catch { return false }
@@ -1464,6 +1521,364 @@ function isYouTubeMuxedChoice(url: string, choice: MediaChoice | null | undefine
 const YOUTUBE_DOWNLOAD_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
+/** 是否为可交给 UMP/SABR 处理的 YouTube 视频格式。 */
+function isYouTubeUMPChoice(url: string, choice: MediaChoice | null | undefined): boolean {
+  if (!choice || choice.kind !== "video" || detectMediaPlatform(url) !== "youtube") return false
+  const { videoItag, audioItag } = parseYouTubeItags(choice)
+  return Boolean(videoItag && (!choice.mergeAudioFormat || audioItag))
+}
+
+/**
+ * 从 choice 显式元数据或历史 ID 提取 UMP itag。
+ * 历史 yt-dlp choice 沿用 `video-<height>-<videoItag>-with-<audioItag>`，
+ * 原生 IOS DASH choice 则使用明确元数据，不再依赖显示 ID。
+ */
+function isDownloadSessionLost(output: string): boolean {
+  return /message channel not found|no callback found|JSContext or message channel not found/i.test(output)
+}
+
+function parseYouTubeItags(choice: MediaChoice): { videoItag?: number; audioItag?: number } {
+  if (choice.youtubeVideoItag) {
+    return { videoItag: choice.youtubeVideoItag, audioItag: choice.youtubeAudioItag }
+  }
+  const dash = /^youtube-dash-(\d+)$/.exec(choice.id)
+  if (dash) return { videoItag: Number(dash[1]) }
+  const withAudio = /^video-.*?-(\d+)-with-(\d+)$/.exec(choice.id)
+  if (withAudio) return { videoItag: Number(withAudio[1]), audioItag: Number(withAudio[2]) }
+  return {}
+}
+
+/**
+ * UMP/SABR 下载兜底：googlevideo GET Range 被 YouTube 限流（403/0 字节）时，改用官方 App 的
+ * POST UMP 协议（Python pytubefix/sabr 驱动，纯 stdlib）下载视频+音频轨。无 potoken 时每轮
+ * ~5MB 自动 reload 续传（真机已验证 53MB+ 有效 H.264 720p）。返回下载好的两轨路径。
+ */
+async function downloadYouTubeUMPFallback(options: {
+  url: string
+  choice: MediaChoice
+  taskId: string
+  workDirectory: string
+  cancelPath: string
+  isCancelFlagSet: () => boolean
+  insecureTLS?: boolean
+  /** UMP 优先测试：总时间预算（ms）。超时写独立 cancel 文件，驱动秒级退出后返回 null 回退；缺省 = 原兜底长超时。 */
+  fallbackAfterMs?: number
+  onProgress?: (value: { fraction: number; stage: string; downloadedBytes?: number; totalBytes?: number; speed?: number }) => void
+}): Promise<{ videoPath: string; audioPath?: string } | null> {
+  const videoId = parseYouTubeVideoID(options.url)
+  if (!videoId) return null
+  const { videoItag, audioItag } = parseYouTubeItags(options.choice)
+  if (!videoItag) return null
+
+  const driverV2 = Path.join(Script.directory, "python", "yt_sabr_download_v2.py")
+  const legacyDriver = Path.join(Script.directory, "python", "yt_sabr_download.py")
+  // 优先 v2（cold start token + SSL 级联）；不存在时回退旧驱动
+  const driver = FileManager.existsSync(driverV2) ? driverV2 : (FileManager.existsSync(legacyDriver) ? legacyDriver : null)
+  if (!driver) return null
+
+  // UMP 优先：超时后写独立 cancel 文件 → 驱动检查点秒级退出（不会残留占 Shell 串行队列）
+  const timeoutCancelPath = options.fallbackAfterMs ? Path.join(TEMP_DIR, `${options.taskId}-ump-timeout.cancel`) : undefined
+  if (timeoutCancelPath) { try { if (FileManager.existsSync(timeoutCancelPath)) FileManager.removeSync(timeoutCancelPath) } catch {} }
+  const runWithTimeoutBudget = async (cmd: string, hardTimeoutMs: number): Promise<{ exitCode: number; output: string }> => {
+    if (!options.fallbackAfterMs || !timeoutCancelPath) return runCommand(cmd, hardTimeoutMs)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { FileManager.writeAsString(timeoutCancelPath, String(Date.now())) } catch {}
+    }, options.fallbackAfterMs)
+    try {
+      const result = await runCommand(cmd, options.fallbackAfterMs + 30000)
+      // 仅在非取消（用户取消 exit 130 / cancel 文件）时记超时；取消导致的迟到 timer 不误报
+      if (timedOut && result.exitCode !== 130 && !options.isCancelFlagSet()) {
+        await logEvent({ level: "warn", event: "download.direct.ump-timeout", taskId: options.taskId, details: { message: `UMP 优先 ${options.fallbackAfterMs}ms 超时，已终止驱动进程并回退` } })
+      }
+      return result
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  const umpTimedOut = () => Boolean(timeoutCancelPath && FileManager.existsSync(timeoutCancelPath))
+
+  const videoPath = Path.join(options.workDirectory, `ump_video_${Date.now()}.mp4`)
+  try {
+    options.onProgress?.({ fraction: 0.02, stage: "正在尝试 UMP 协议下载（官方 App 通道）" })
+    if (options.isCancelFlagSet()) throw new Error("下载已取消")
+    const cancelArg = driver === driverV2 ? ` --cancel-file ${quote(options.cancelPath)}` : ""
+    // 对齐 yt-dlp --insecure：上层 TLS 兼容重试（insecureTLS=true）时直通不验证证书
+    const tlsArg = options.insecureTLS ? " --insecure" : ""
+    // 进程内自计时预算（驱动 --max-run-sec）：JS timer / Shell.run 超时在阻塞期间不可靠，
+    // 由驱动每轮检查点自行终止并标记 TIME_BUDGET，TS 侧识别后回退 yt-dlp。
+    const runBudgetArg = options.fallbackAfterMs ? ` --max-run-sec ${Math.max(10, Math.ceil(options.fallbackAfterMs / 1000))}` : ""
+    const v = await runWithTimeoutBudget(`python3 ${quote(driver)} ${quote(videoId)} ${videoItag} ${quote(videoPath)} video${cancelArg}${tlsArg}${runBudgetArg}`, 2700)
+    if (umpTimedOut() && v.exitCode !== 130 && !options.isCancelFlagSet()) {
+      try { FileManager.removeSync(videoPath) } catch {}
+      try { FileManager.removeSync(timeoutCancelPath!) } catch {}
+      return null
+    }
+    if (options.isCancelFlagSet() || v.exitCode === 130) throw new Error("下载已取消")
+    // 驱动内时间预算耗尽（主机制）：exit 3 + TIME_BUDGET → 回退 yt-dlp
+    if (v.exitCode === 3 || String(v.output || "").includes("TIME_BUDGET")) {
+      await logEvent({ level: "warn", event: "download.direct.ump-time-budget", taskId: options.taskId, details: { message: "UMP 优先时间预算耗尽（驱动自计时），回退 yt-dlp" } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      try { FileManager.removeSync(timeoutCancelPath!) } catch {}
+      return null
+    }
+    if (isDownloadSessionLost(String(v.output || ""))) throw new Error("下载任务会话已失效，请重新打开 Yoinks 后重试")
+    if (v.exitCode !== 0 || !String(v.output || "").includes("OK ") || (await fileSizeBytes(videoPath)) === 0) {
+      await logEvent({ level: "warn", event: "download.direct.ump-video-failed", taskId: options.taskId, details: { message: String(v.output || "").slice(0, 1500) } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      return null
+    }
+
+    let audioPath: string | undefined
+    if (options.choice.mergeAudioFormat) {
+      if (!audioItag) {
+        await logEvent({ level: "warn", event: "download.direct.ump-audio-failed", taskId: options.taskId, details: { message: "UMP 格式缺少音频 itag" } })
+        try { FileManager.removeSync(videoPath) } catch {}
+        return null
+      }
+      audioPath = Path.join(options.workDirectory, `ump_audio_${Date.now()}.m4a`)
+      if (options.isCancelFlagSet()) throw new Error("下载已取消")
+      const a = await runWithTimeoutBudget(`python3 ${quote(driver)} ${quote(videoId)} ${audioItag} ${quote(audioPath)} audio${cancelArg}${tlsArg}${runBudgetArg}`, 1500)
+      if (umpTimedOut() && a.exitCode !== 130 && !options.isCancelFlagSet()) {
+        try { FileManager.removeSync(videoPath) } catch {}
+        try { FileManager.removeSync(audioPath) } catch {}
+        try { FileManager.removeSync(timeoutCancelPath!) } catch {}
+        return null
+      }
+      if (options.isCancelFlagSet() || a.exitCode === 130) throw new Error("下载已取消")
+      if (a.exitCode === 3 || String(a.output || "").includes("TIME_BUDGET")) {
+        await logEvent({ level: "warn", event: "download.direct.ump-time-budget", taskId: options.taskId, details: { message: "UMP 优先时间预算耗尽（音频，驱动自计时），回退 yt-dlp" } })
+        try { FileManager.removeSync(videoPath) } catch {}
+        try { FileManager.removeSync(audioPath) } catch {}
+        try { FileManager.removeSync(timeoutCancelPath!) } catch {}
+        return null
+      }
+      if (isDownloadSessionLost(String(a.output || ""))) throw new Error("下载任务会话已失效，请重新打开 Yoinks 后重试")
+      if (a.exitCode !== 0 || !String(a.output || "").includes("OK ") || (await fileSizeBytes(audioPath)) === 0) {
+        await logEvent({ level: "warn", event: "download.direct.ump-audio-failed", taskId: options.taskId, details: { message: String(a.output || "").slice(0, 1500) } })
+        try { FileManager.removeSync(videoPath) } catch {}
+        try { FileManager.removeSync(audioPath) } catch {}
+        return null
+      }
+    }
+    try { if (timeoutCancelPath && FileManager.existsSync(timeoutCancelPath)) FileManager.removeSync(timeoutCancelPath) } catch {}
+    return { videoPath, audioPath }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    await logEvent({ level: "warn", event: "download.direct.ump-fallback-error", taskId: options.taskId, details: { message } })
+    try { FileManager.removeSync(videoPath) } catch {}
+    if (message === "下载已取消" || message.startsWith("下载任务会话已失效")) throw e
+    return null
+  }
+}
+
+/**
+ * 仅下载 YouTube 音频轨（UMP/SABR POST 通道）。
+ * 用于完整 GET 被出口配额锁定（403/0 字节）时绕过 googlevideo GET 限流；
+ * 音频通常 4-8MB，UMP 下约 20-60s，远快于 1MB 分段 + 每段重新探测的 refresh 循环。
+ */
+async function downloadYouTubeUMPAudio(options: {
+  url: string
+  choice: MediaChoice
+  taskId: string
+  destination: string
+  cancelPath: string
+  isCancelFlagSet: () => boolean
+  insecureTLS?: boolean
+  onProgress?: (value: { fraction: number; stage: string }) => void
+}): Promise<boolean> {
+  const videoId = parseYouTubeVideoID(options.url)
+  if (!videoId) return false
+  const { audioItag } = parseYouTubeItags(options.choice)
+  if (!audioItag) return false
+  const driverV2 = Path.join(Script.directory, "python", "yt_sabr_download_v2.py")
+  const legacyDriver = Path.join(Script.directory, "python", "yt_sabr_download.py")
+  const driver = FileManager.existsSync(driverV2) ? driverV2 : (FileManager.existsSync(legacyDriver) ? legacyDriver : null)
+  if (!driver) return false
+  try {
+    if (options.isCancelFlagSet()) return false
+    options.onProgress?.({ fraction: 0.95, stage: "正在下载音频流（UMP 官方通道）" })
+    const cancelArg = driver === driverV2 ? ` --cancel-file ${quote(options.cancelPath)}` : ""
+    const tlsArg = options.insecureTLS ? " --insecure" : ""
+    const a = await runCommand(`python3 ${quote(driver)} ${quote(videoId)} ${audioItag} ${quote(options.destination)} audio${cancelArg}${tlsArg}`, 1500)
+    if (options.isCancelFlagSet() || a.exitCode === 130) throw new Error("下载已取消")
+    if (isDownloadSessionLost(String(a.output || ""))) throw new Error("下载任务会话已失效，请重新打开 Yoinks 后重试")
+    if (a.exitCode !== 0 || !String(a.output || "").includes("OK ") || (await fileSizeBytes(options.destination)) === 0) {
+      await logEvent({ level: "warn", event: "download.direct.ump-audio-failed", taskId: options.taskId, details: { message: String(a.output || "").slice(0, 1500) } })
+      return false
+    }
+    await logEvent({ level: "info", event: "download.direct.ump-audio-ok", taskId: options.taskId, details: { message: "UMP 音频下载成功" } })
+    return true
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    await logEvent({ level: "warn", event: "download.direct.ump-audio-error", taskId: options.taskId, details: { message } })
+    if (message === "下载已取消" || message.startsWith("下载任务会话已失效")) throw e
+    return false
+  }
+}
+
+async function mergeYouTubeUMPTracks(options: {
+  tracks: { videoPath: string; audioPath?: string }
+  choice: MediaChoice
+  taskId: string
+  cancelPath?: string
+  isCancelFlagSet?: () => boolean
+}): Promise<string> {
+  if (!options.tracks.audioPath) return options.tracks.videoPath
+  const hardCodec = isDeviceHardVideoChoice(options.choice)
+  const extension = hardCodec ? "mkv" : options.choice.mergeExtension || "mp4"
+  const finalPath = options.tracks.videoPath.replace(/\.[^.]+$/, "") + `_merged.${extension}`
+  const fastStart = extension === "mp4" ? " -movflags +faststart" : ""
+  // ffmpeg 无取消 API：用 python 包装轮询 cancel 文件，取消时 SIGKILL ffmpeg 子进程（Shell 无中断 API 的替代）
+  const ffmpegRun = Path.join(Script.directory, "python", "ffmpeg_run.py")
+  const cancelWrap = options.cancelPath && FileManager.existsSync(ffmpegRun)
+    ? `python3 ${quote(ffmpegRun)} --cancel-file ${quote(options.cancelPath)} -- `
+    : ""
+  const merge = await runCommand(`${cancelWrap}ffmpeg -y -i ${quote(options.tracks.videoPath)} -i ${quote(options.tracks.audioPath)} -map 0:v:0 -map 1:a:0 -c copy${fastStart} ${quote(finalPath)}`, 900)
+  await logEvent({
+    level: merge.exitCode === 0 ? "info" : "error",
+    event: "merge.ffmpeg.ump.completed",
+    taskId: options.taskId,
+    details: { exitCode: merge.exitCode, output: merge.output, videoPath: options.tracks.videoPath, audioPath: options.tracks.audioPath, workPath: finalPath, container: extension },
+  })
+  if (merge.exitCode === 130 || (options.isCancelFlagSet?.() ?? false)) throw new Error("下载已取消")
+  if (merge.exitCode === 0 && FileManager.existsSync(finalPath)) return finalPath
+  if (hardCodec) throw new Error(compactMessage(merge.output || "UMP 视频流合成 MKV 失败"))
+
+  const mp4Path = finalPath.replace(/\.[^.]+$/, ".mp4")
+  const transcode = await runCommand(
+    `${cancelWrap}ffmpeg -y -i ${quote(options.tracks.videoPath)} -i ${quote(options.tracks.audioPath)} -map 0:v:0 -map 1:a:0 -c:v h264_videotoolbox -c:a aac -movflags +faststart ${quote(mp4Path)}`,
+    7200,
+  )
+  await logEvent({ level: transcode.exitCode === 0 ? "info" : "error", event: "merge.ffmpeg.ump.transcode.completed", taskId: options.taskId, details: { exitCode: transcode.exitCode, output: transcode.output } })
+  if (transcode.exitCode === 130 || (options.isCancelFlagSet?.() ?? false)) throw new Error("下载已取消")
+  if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) throw new Error(compactMessage(merge.output || transcode.output || "UMP 音视频合成失败"))
+  return mp4Path
+}
+
+/**
+ * YouTube 预览兜底：GET 直链被 googlevideo 限流（403）时，用 UMP 协议下载前 N 秒
+ * 视频+音频片段（clean fragment 边界），ffmpeg 合流后返回本地可播放文件。
+ * 失败返回 null（调用方展示原失败原因）。
+ */
+export async function previewYouTubeUMPClip(options: {
+  url: string
+  choice: MediaChoice
+  taskId?: string
+  workDirectory?: string
+  maxSeconds?: number
+  cancelPath?: string
+  isCancelFlagSet?: () => boolean
+  onProgress?: (stage: string) => void
+}): Promise<string | null> {
+  const taskId = options.taskId || createTaskId()
+  const videoId = parseYouTubeVideoID(options.url)
+  if (!videoId) {
+    await logEvent({ level: "warn", event: "preview.youtube.ump-skip", taskId, details: { url: options.url, reason: "parse-video-id" } })
+    return null
+  }
+  const { videoItag, audioItag } = parseYouTubeItags(options.choice)
+  if (!videoItag) {
+    await logEvent({ level: "warn", event: "preview.youtube.ump-skip", taskId, details: { choiceId: options.choice.id, reason: "no-video-itag" } })
+    return null
+  }
+  const maxSeconds = options.maxSeconds || 45
+  const workDirectory =
+    options.workDirectory ||
+    // 注意：不能写 Script.directory（iCloud 脚本目录）——python 对 iCloud 新目录有陈旧视图，
+    // FileManager 刚创建的目录 python open 会 FileNotFoundError；用 app 容器 TEMP_DIR（下载同款，已证实可写）。
+    Path.join(TEMP_DIR, `ump-preview-${Date.now()}`)
+  try { FileManager.createDirectory(workDirectory, { intermediateDirectories: true }) } catch {}
+  const driverV2 = Path.join(Script.directory, "python", "yt_sabr_download_v2.py")
+  const driver = FileManager.existsSync(driverV2)
+    ? driverV2
+    : Path.join(Script.directory, "python", "yt_sabr_download.py")
+  if (!FileManager.existsSync(driver)) {
+    await logEvent({ level: "warn", event: "preview.youtube.ump-skip", taskId, details: { driverV2, legacy: Path.join(Script.directory, "python", "yt_sabr_download.py"), reason: "no-driver" } })
+    return null
+  }
+  await logEvent({ level: "info", event: "preview.youtube.ump-start", taskId, details: { videoId, videoItag, audioItag: audioItag ?? null, driver, maxSeconds, workDirectory, sourceURL: options.url } })
+
+  const isCancel = options.isCancelFlagSet || (() => Boolean(options.cancelPath && FileManager.existsSync(options.cancelPath!)))
+  if (isCancel()) {
+    await logEvent({ level: "info", event: "preview.youtube.ump-cancelled", taskId, details: { stage: "before-start" } })
+    return null
+  }
+  // 驱动支持 --cancel-file + SIGALRM 秒级中断：取消/关闭预览时确保 python 进程 ~1s 内退出
+  const cancelArg = options.cancelPath ? ` --cancel-file ${quote(options.cancelPath)}` : ""
+
+  const videoPath = Path.join(workDirectory, `ump_preview_video_${Date.now()}.mp4`)
+  const audioPath = Path.join(workDirectory, `ump_preview_audio_${Date.now()}.m4a`)
+  try {
+    options.onProgress?.(`正在通过 UMP 通道下载预览片段（约 ${maxSeconds} 秒）`)
+    // 预览片段小（45s），90s 内应完成；超时快速失败，避免阻塞 UI / 残留后台进程（此前 900s 超时会导致预览状态卡 12 分钟）
+    const v = await runCommand(`python3 ${quote(driver)} ${quote(videoId)} ${videoItag} ${quote(videoPath)} video --max-duration-sec ${maxSeconds}${cancelArg}`, 90)
+    if (isCancel() || v.exitCode === 130) {
+      await logEvent({ level: "info", event: "preview.youtube.ump-cancelled", taskId, details: { stage: "video" } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      return null
+    }
+    if (v.exitCode !== 0 || !String(v.output || "").includes("OK ") || (await fileSizeBytes(videoPath)) === 0) {
+      await logEvent({ level: "warn", event: "preview.youtube.ump-video-failed", taskId, details: { message: String(v.output || "").slice(0, 1500) } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      return null
+    }
+    if (!audioItag) return videoPath
+    const a = await runCommand(`python3 ${quote(driver)} ${quote(videoId)} ${audioItag} ${quote(audioPath)} audio --max-duration-sec ${maxSeconds}${cancelArg}`, 90)
+    if (isCancel() || a.exitCode === 130) {
+      await logEvent({ level: "info", event: "preview.youtube.ump-cancelled", taskId, details: { stage: "audio" } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      try { FileManager.removeSync(audioPath) } catch {}
+      return null
+    }
+    if (a.exitCode !== 0 || !String(a.output || "").includes("OK ") || (await fileSizeBytes(audioPath)) === 0) {
+      await logEvent({ level: "warn", event: "preview.youtube.ump-audio-failed", taskId, details: { message: String(a.output || "").slice(0, 1500) } })
+      try { FileManager.removeSync(videoPath) } catch {}
+      try { FileManager.removeSync(audioPath) } catch {}
+      return null
+    }
+    return await mergeYouTubeUMPTracks({ tracks: { videoPath, audioPath }, choice: options.choice, taskId, cancelPath: options.cancelPath, isCancelFlagSet: isCancel })
+  } catch (e) {
+    await logEvent({ level: "warn", event: "preview.youtube.ump-error", taskId, details: { message: e instanceof Error ? e.message : String(e) } })
+    try { FileManager.removeSync(videoPath) } catch {}
+    try { FileManager.removeSync(audioPath) } catch {}
+    return null
+  }
+}
+
+/**
+ * YouTube googlevideo 直链可用性验证。
+ * 实测（代理出口）：IOS client URL 的 Range 0-0 返回 206（能连）但 16MB Range 403（~15MB 后限流），
+ * 而 android_vr（yt-dlp）URL 的 16MB Range 206（全量可用）。因此必须用 16MB Range 探测区分，
+ * 0-0 会误判 IOS URL 可用导致下载中途失败。只取响应头即 cancel，不下载 body。
+ */
+type YouTubeURLCheckResult = {
+  usable: boolean
+  status?: number
+  reason: "ok" | "http" | "timeout" | "network"
+}
+
+async function checkYouTubeURL(url: string): Promise<YouTubeURLCheckResult> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10_000)
+  try {
+    const response = await fetch(url, {
+      headers: { Range: "bytes=0-16777215", "User-Agent": YOUTUBE_DOWNLOAD_UA, Accept: "*/*" },
+      signal: controller.signal,
+    })
+    response.dataStream?.getReader()?.cancel().catch(() => {})
+    return response.status === 206
+      ? { usable: true, status: response.status, reason: "ok" }
+      : { usable: false, status: response.status, reason: "http" }
+  } catch (error) {
+    const message = error instanceof Error ? `${error.name} ${error.message}` : String(error)
+    return { usable: false, reason: /AbortError|aborted|timeout/i.test(message) ? "timeout" : "network" }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 /** B站 playurl durl（progressive MP4）choice：已实测 MITM 下单连接受限 ~0.9MiB/s，并发 Range 分段可线性提速。 */
 function isBilibiliDurlChoice(choice: MediaChoice | null | undefined): boolean {
   return Boolean(choice && choice.id.startsWith("bilibili-direct"))
@@ -1474,11 +1889,15 @@ function isBilibiliDurlChoice(choice: MediaChoice | null | undefined): boolean {
  * 返回 false 表示服务器不支持分段（非 206 或文件过小），调用方应回退单连接下载。
  * 参考 hls.ts 的 fetch + dataStream + appendData 模式。
  */
-async function downloadDirectSegmented(options: {
+export async function downloadDirectSegmented(options: {
   url: string
   destination: string
   headers: Record<string, string>
   concurrentFragments: number
+  /** 单段字节上限（如 YouTube googlevideo 单请求 >~1MB 的 Range 会被 403）。0 = 不限。 */
+  maxSegmentBytes?: number
+  /** 单 URL 数据配额耗尽（403）时重新获取直链（YouTube googlevideo ~13MB/URL）。返回 null 表示无法刷新。 */
+  refreshURL?: () => Promise<string | null>
   start: number
   end: number
   stage: string
@@ -1503,8 +1922,14 @@ async function downloadDirectSegmented(options: {
     return false
   }
 
-  const count = Math.min(Math.max(options.concurrentFragments, 2), 8)
-  const chunk = Math.ceil(total / count)
+  // 段数与段大小：默认按并发数均分；maxSegmentBytes 时按上限切段（段数可变，worker 池仍并发领取）。
+  const requestedCount = Math.min(Math.max(options.concurrentFragments, 2), 8)
+  let count = requestedCount
+  let chunk = Math.ceil(total / count)
+  if (options.maxSegmentBytes && chunk > options.maxSegmentBytes) {
+    count = Math.min(Math.ceil(total / options.maxSegmentBytes), 512)
+    chunk = Math.ceil(total / count)
+  }
   const workDirectory = Path.dirname(options.destination)
   let downloaded = 0
   let lastReportAt = Date.now()
@@ -1526,6 +1951,33 @@ async function downloadDirectSegmented(options: {
     })
   }
 
+  // refreshURL 共享 + 退避：多段同时 403 只探测一次（并发共享 in-flight）；刷新失败后 30s 内
+  // 不再重复探测；整个下载最多刷新 8 次——防 N 段 403 触发 N 次并发探测刷爆 player API。
+  let refreshInFlight: Promise<string | null> | null = null
+  let refreshFailedAt = 0
+  let refreshCount = 0
+  const MAX_REFRESH_COUNT = 8
+  const callRefresh = (): Promise<string | null> => {
+    if (refreshCount >= MAX_REFRESH_COUNT) return Promise.resolve(null)
+    if (refreshFailedAt && Date.now() - refreshFailedAt < 30_000) return Promise.resolve(null)
+    if (!refreshInFlight) {
+      refreshInFlight = (async () => {
+        refreshCount += 1
+        try {
+          const url = await options.refreshURL?.()
+          if (!url) refreshFailedAt = Date.now()
+          return url || null
+        } catch {
+          refreshFailedAt = Date.now()
+          return null
+        } finally {
+          refreshInFlight = null
+        }
+      })()
+    }
+    return refreshInFlight
+  }
+
   const downloadOne = async (index: number): Promise<boolean> => {
     if (options.isCancelFlagSet()) return false
     const start = index * chunk
@@ -1538,18 +1990,40 @@ async function downloadDirectSegmented(options: {
       } catch {}
       try {
         const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 60_000)
+        // 动态超时：小段（≤1MB）15s 足够，大段按 2s/MB 线性放，上限 120s；避免卡段拖满固定 60s×3。
+        const segmentBytes = end - start + 1
+        const timeoutMs = Math.min(120_000, Math.max(15_000, Math.ceil((segmentBytes / 1048576) * 2000)))
+        const timeout = setTimeout(() => controller.abort(), timeoutMs)
         try {
-          const response = await fetch(options.url, {
+          let response = await fetch(options.url, {
             headers: { ...options.headers, Range: `bytes=${start}-${end}` },
             signal: controller.signal,
           })
+          // YouTube googlevideo 对单视频+出口 IP 有数据配额（实测 ~15MB），超限后该视频所有 Range 全 403；
+          // 尝试换新 URL（重新探测，配额重置）续传；共享探测 + 退避防止探测风暴。
+          if (response.status === 403 && options.refreshURL) {
+            const refreshedURL = await callRefresh()
+            if (refreshedURL) {
+              options.url = refreshedURL
+              response = await fetch(options.url, {
+                headers: { ...options.headers, Range: `bytes=${start}-${end}` },
+                signal: controller.signal,
+              })
+            } else {
+              throw new Error("HTTP 403（视频受限或网络出口被 YouTube 限流）")
+            }
+          }
           if (response.status !== 206) throw new Error(`HTTP ${response.status}`)
           const reader = response.dataStream.getReader()
           let size = 0
           try {
             while (true) {
-              const { done, value } = await reader.read()
+              // googlevideo 偶发返回 206 后数据流挂起（header 到了但 body 不推，abort 无效）；
+              // 15s 无数据视为该段失败，走外层重试（重新 fetch 该段）。
+              const { done, value } = await Promise.race([
+                reader.read(),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error("段数据读取超时")), 15_000)),
+              ])
               if (done) break
               if (value) {
                 await FileManager.appendData(partPath, value)
@@ -1558,6 +2032,9 @@ async function downloadDirectSegmented(options: {
                 report(false)
               }
             }
+          } catch (error) {
+            try { await reader.cancel().catch(() => {}) } catch {}
+            throw error
           } finally {
             try { reader.releaseLock() } catch {}
           }
@@ -1863,6 +2340,55 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
       return bilibiliProbe
     }
   }
+  // YouTube：优先 IOS client innertube 原生探测（实测 ~1.7s 直出签名 URL，无需 potoken/nsig，
+  // 绕开 yt-dlp 在 MITM 环境下的 SSL 首败与 bot 风控）；失败/受限（会员/年龄限制）返回 null
+  // 回退 yt-dlp（含登录链路），原生探测不作为唯一路径。
+  if (detectMediaPlatform(probeURL) === "youtube") {
+    const youtubeProbe = await probeYouTubeDirect(probeURL)
+    if (youtubeProbe && youtubeProbe.choices.length) {
+      // 优先验证用户最常选的 H.264/MP4 路径；单条 VP9 URL 失败不能代表整套 IOS 结果。
+      // 最多检查两条视频和一条代表音频，避免探测流量与等待时间失控。
+      const videoCandidates = youtubeProbe.choices
+        .filter((choice) => choice.kind === "video" && choice.sourceURL)
+        .sort((a, b) => Number(b.youtubeVideoItag === 137) - Number(a.youtubeVideoItag === 137)
+          || Number(b.videoCodec === "h264") - Number(a.videoCodec === "h264")
+          || Number(Boolean(b.youtubeVideoItag)) - Number(Boolean(a.youtubeVideoItag))
+          || (b.height || 0) - (a.height || 0))
+        .slice(0, 2)
+      const failedVideoChoiceIds = new Set<string>()
+      let usableVideoChoice: MediaChoice | undefined
+      for (const choice of videoCandidates) {
+        const result = await checkYouTubeURL(choice.sourceURL!)
+        let host = ""
+        try { host = new URL(choice.sourceURL!).hostname } catch {}
+        await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "video", itag: choice.youtubeVideoItag || null, codec: choice.videoCodec || null, host, status: result.status || null, reason: result.reason } })
+        if (result.usable) {
+          usableVideoChoice = choice
+          break
+        }
+        failedVideoChoiceIds.add(choice.id)
+      }
+      if (usableVideoChoice) {
+        let audioUsable = true
+        if (usableVideoChoice.previewAudioURL) {
+          const result = await checkYouTubeURL(usableVideoChoice.previewAudioURL)
+          let host = ""
+          try { host = new URL(usableVideoChoice.previewAudioURL).hostname } catch {}
+          await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "audio", itag: usableVideoChoice.youtubeAudioItag || null, codec: usableVideoChoice.previewAudioCodec || null, host, status: result.status || null, reason: result.reason } })
+          audioUsable = result.usable
+        }
+        const availableChoices = youtubeProbe.choices.filter((choice) =>
+          !failedVideoChoiceIds.has(choice.id) && (audioUsable || !choice.previewAudioURL),
+        )
+        if (availableChoices.length) {
+          const availableProbe = { ...youtubeProbe, choices: availableChoices }
+          await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: availableProbe.title, choiceCount: availableChoices.length, formatCount: availableChoices.length, webpageURL: availableProbe.webpageURL, origin: "youtube-native" } })
+          return availableProbe
+        }
+      }
+      await logEvent({ level: "warn", event: "probe.youtube.direct.url-blocked", taskId, details: { message: "IOS client 代表性音视频直链不可用，回退 yt-dlp", choiceCount: youtubeProbe.choices.length, checkedVideoCount: videoCandidates.length } })
+    }
+  }
   const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
   const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
   await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })
@@ -1888,6 +2414,23 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
       if (hlsChoices.length) {
         await logEvent({ level: "info", event: "probe.hls.native-fast-path", taskId, details: { sourceURL, variantCount: hlsChoices.filter((c) => c.hlsVariantURI).length, heightHint: hlsChoices[0]?.height || null, refererApplied: Boolean(referer), elapsedMilliseconds: Date.now() - startedAt } })
         return { title: "HLS 视频", webpageURL: sourceURL, choices: hlsChoices }
+      }
+    } else if (referer && isMaccmsVPlayerCandidate(sourceURL, referer)) {
+      // dsd.com.se 等 MacCMS vplayer：直链 m3u8 无 sign 签名会 403，原生 sniff 与 yt-dlp
+      // 都拿不到清单；通过同源 /addons/vplayer/ 播放器页取服务端生成的签名地址再嗅探。
+      const signedURL = await resolveMaccmsVPlayerSignedURL(sourceURL, referer, taskId)
+      if (signedURL) {
+        const signedMaster = await sniffHlsManifest(signedURL, undefined, safariUserAgent || MOBILE_SAFARI_UA)
+        if (signedMaster) {
+          const hlsChoices = hlsEndpointChoices(signedURL, signedMaster).map((hlsChoice) => {
+            hlsChoice.previewHeaders = { "User-Agent": safariUserAgent || MOBILE_SAFARI_UA }
+            return hlsChoice
+          })
+          if (hlsChoices.length) {
+            await logEvent({ level: "info", event: "probe.hls.vplayer-native-fast-path", taskId, details: { sourceURL, variantCount: hlsChoices.filter((c) => c.hlsVariantURI).length, elapsedMilliseconds: Date.now() - startedAt } })
+            return { title: "HLS 视频", webpageURL: signedURL, choices: hlsChoices }
+          }
+        }
       }
     }
   }
@@ -2150,6 +2693,24 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
         return { title: "Safari HLS 视频", webpageURL: sourceURL, choices: hlsChoices }
       }
       // 无扩展名端点（非 .vid）也可能是 302→media 的直链：跟随重定向解析最终 URL。
+      if (isMaccmsVPlayerCandidate(sourceURL, referer)) {
+        // MacCMS vplayer 签名清单兑底：直链/yt-dlp 均被 403（dsd.com.se 等），
+        // 通过同源 /addons/vplayer/ 播放器页取服务端生成的签名地址。
+        const signedURL = await resolveMaccmsVPlayerSignedURL(sourceURL, referer, taskId)
+        if (signedURL) {
+          const signedMaster = await sniffHlsManifest(signedURL, undefined, safariUserAgent || "Mozilla/5.0")
+          if (signedMaster) {
+            const hlsChoices = hlsEndpointChoices(signedURL, signedMaster).map((hlsChoice) => {
+              hlsChoice.previewHeaders = { "User-Agent": safariUserAgent || "Mozilla/5.0" }
+              return hlsChoice
+            })
+            if (hlsChoices.length) {
+              await logEvent({ level: "warn", event: "probe.safari-hls.vplayer-fallback", taskId, details: { sourceURL, variantCount: hlsChoices.filter((c) => c.hlsVariantURI).length, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
+              return { title: "Safari HLS 视频", webpageURL: signedURL, choices: hlsChoices }
+            }
+          }
+        }
+      }
       const resolvedChoice = await resolveRedirectedDirectMedia(sourceURL, referer, safariUserAgent || MOBILE_SAFARI_UA, options.safariMediaKind)
       if (resolvedChoice) {
         await logEvent({ level: "info", event: "probe.vid.redirect-resolved", taskId, details: { sourceURL, finalURL: resolvedChoice.sourceURL, safariRefererApplied: true, safariUserAgentApplied: Boolean(safariUserAgent), cookieTransfer: false } })
@@ -2301,6 +2862,37 @@ export function parseOutputPaths(output: string): string[] {
 }
 
 /** Prefer stage-tagged files (`.video.` / `.audio.`) then any media under work dir. */
+// yt-dlp-ytse UMP 副本格式：普通 https 格式复制为 protocol=ump，且 format_id 打稳定后缀 -ump
+// （补丁 ytse.py：UMP 副本 format_id = {原id}-ump；yt-dlp 去重后缀 -0/-1 顺序不稳定，
+// 曾导致 -0 匹配到 https 版、UMP 未生效）。UMP 优先 = itag 加 -ump 后缀 + extractor_args youtube.formats=ump。
+function toUMPFormatExpression(expr: string): string {
+  return expr.replace(/(^|[+_,\s])(\d+)(?=$|[+_,\s])/g, "$1$2-ump")
+}
+
+// 清理 UMP 尝试失败后的部分下载残留（.part/.ytdl 等），避免普通重跑被残留续传污染。
+function removeDownloadResiduals(directory: string, nameHint: string): void {
+  try {
+    if (!directory || !FileManager.existsSync(directory)) return
+    for (const name of FileManager.readDirectorySync(directory)) {
+      if (!name.includes(nameHint)) continue
+      const lower = name.toLowerCase()
+      if (!(lower.endsWith(".part") || lower.endsWith(".ytdl") || lower.endsWith(".part-frag") || lower.endsWith(".temp") || lower.endsWith(".frag"))) continue
+      const full = Path.join(directory, name)
+      try { if (FileManager.existsSync(full)) FileManager.removeSync(full) } catch {}
+    }
+  } catch {}
+}
+
+// 从 runner 输出提取实际下载协议（MEDIA_DOWNLOADER_PROTOCOL ump|https）。
+// ump = yt-dlp-ytse UMP 通道（URL 含 ump=1&srfvp=1，POST 单连接流式）；https = 普通直连。
+function runnerProtocols(output: string): string[] {
+  const found: string[] = []
+  for (const match of (output || "").matchAll(/MEDIA_DOWNLOADER_PROTOCOL\s+(\S+)/g)) {
+    if (match[1] && !found.includes(match[1])) found.push(match[1])
+  }
+  return found
+}
+
 export function listWorkMediaFiles(directory: string, nameHint?: string): string[] {
   try {
     if (!directory || !FileManager.existsSync(directory)) return []
@@ -2451,7 +3043,15 @@ async function verifyMediaFile(filePath: string, choice: MediaChoice, taskId: st
     }
     throw new Error(`下载文件验证失败：缺少${expected === "audio" ? "音频" : "视频"}流`)
   }
-  if (choice.mergeAudioFormat && !types.includes("audio")) throw new Error("下载文件验证失败：合并结果缺少音频流")
+  if (choice.mergeAudioFormat && !types.includes("audio")) {
+    // 此 LGPL ffprobe 在 `-v error -show_entries stream=codec_type` 下会偶发漏报 DASH fMP4
+    // 的 AAC 音频流（默认详细度能看到 Stream #0:1: Audio: aac），导致已合并音视频被误判为
+    // “缺少音频”。二次用默认详细度（Stream #... Audio: 摘要行）复核后再判定。
+    const fallback = await runCommand(`ffprobe -hide_banner -i ${quote(filePath)}`, 60)
+    const fallbackTypes = extractProbeStreamTypes(String(fallback.output || ""))
+    if (!fallbackTypes.includes("audio")) throw new Error("下载文件验证失败：合并结果缺少音频流")
+    await logEvent({ level: "warn", event: "verify.audio.fallback-confirmed", taskId, details: { filePath, strictTypes: types, fallbackTypes } })
+  }
   await logEvent({ level: "info", event: "verify.completed", taskId, details: { filePath, streamTypes: types, expected } })
 }
 
@@ -2604,21 +3204,50 @@ export async function downloadMedia(options: {
     }
   }
 
+  // ⚠️ UMP 优先（测试版，设置开关 umpFirst）：YouTube DASH 优先 yt-dlp UMP 通道。
+  // 方案 A（2026-08-03）：改用 yt-dlp-ytse 的 UMP 下载器（UMP-wrapped GET：普通 URL + ump=1&srfvp=1 POST），
+  // 社区验证（yt-dlp 官方维护者 coletdjnz）比自研 SABR 会话可靠——SABR 需服务器签发 serverAbrStreamingUrl
+  // 且 2026.07 起选择性 POT 强制（实测 PENDING 空转）。下方 yt-dlp 分支先以 [protocol=ump] + formats=ump 跑，
+  // 失败自动回退普通 yt-dlp 双轨下载（每流各自回退一次）。自研驱动 downloadYouTubeUMPFallback 本轮停用。
+  let umpFirstAttempted = false
+  if (getPreferences().umpFirst && options.choice && isYouTubeUMPChoice(sourceURL, options.choice) && (options.choice.mergeAudioFormat || Boolean(options.choice.previewAudioURL)) && !isCancelFlagSet()) {
+    umpFirstAttempted = true
+    options.onCancelPath(cancelPath)
+    await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "ump-first", concurrentFragments: 1, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: false, safariUserAgentApplied: false, outputDirectory: DOWNLOAD_DIR } })
+  }
+
   if (options.choice.formatExpression === "direct") {
     const extension = extensionOf(sourceURL) || (options.choice.container ? `.${options.choice.container}` : ".mp4")
-    const workPath = Path.join(workDirectory, `direct_${Date.now()}${extension}`)
+    let workPath = Path.join(workDirectory, `direct_${Date.now()}${extension}`)
     options.onCancelPath(cancelPath)
     await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "direct", concurrentFragments: options.concurrentFragments, safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })
     try {
-      // B站 durl：单连接受限（实测 ~0.9MiB/s），并发设置 >1 时优先 Range 分段多线程下载；失败回退单连接。
+      // B站 durl / YouTube 直链：单连接受限（B站实测 ~0.9MiB/s），并发设置 >1 时优先 Range 分段多线程下载；失败回退单连接。
+      // YouTube googlevideo 单 URL 数据配额（实测 ~13MB）：分段遇 403 时重新探测换新 URL 续传。
+      const refreshYouTubeURL = options.choice.id.startsWith("youtube-")
+        ? async (): Promise<string | null> => {
+            const refreshed = await probeYouTubeDirect(options.url)
+            const match = refreshed?.choices.find((c) => c.id === options.choice.id)
+            return match?.sourceURL || null
+          }
+        : undefined
+      const refreshYouTubeAudioURL = options.choice.id.startsWith("youtube-")
+        ? async (): Promise<string | null> => {
+            const refreshed = await probeYouTubeDirect(options.url)
+            const match = refreshed?.choices.find((c) => c.id === options.choice.id)
+            return match?.previewAudioURL || null
+          }
+        : undefined
       let segmented = false
-      if (isBilibiliDurlChoice(options.choice) && options.concurrentFragments > 1) {
+      if ((isBilibiliDurlChoice(options.choice) || options.choice.id.startsWith("youtube-")) && options.concurrentFragments > 1) {
         try {
           segmented = await downloadDirectSegmented({
             url: sourceURL,
             destination: workPath,
-            headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+            headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(options.choice.previewHeaders || {}), ...(referer ? { Referer: referer } : {}) },
             concurrentFragments: options.concurrentFragments,
+            maxSegmentBytes: options.choice.id.startsWith("youtube-") ? 1048576 : undefined,
+            refreshURL: refreshYouTubeURL,
             start: 0.02,
             end: 0.95,
             stage: "正在并发分段下载（多线程）",
@@ -2635,7 +3264,7 @@ export async function downloadMedia(options: {
         await downloadURLToFileWithProgress({
           url: sourceURL,
           destination: workPath,
-          headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(referer ? { Referer: referer } : {}) },
+          headers: { "User-Agent": safariUserAgent || "Mozilla/5.0", Accept: "*/*", ...(options.choice.previewHeaders || {}), ...(referer ? { Referer: referer } : {}) },
           start: 0.02,
           end: 0.95,
           stage: "正在下载直接媒体资源",
@@ -2644,9 +3273,133 @@ export async function downloadMedia(options: {
         })
       }
       if (isCancelFlagSet()) throw new Error("下载已取消")
-      const filePath = await verifyAndPublishMediaFile({ workPath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
+      // YouTube 大文件完整 GET 会被服务器拒绝（0 字节）：分段失败后完整 GET 也必 0 字节，
+      // 先试 UMP 协议兜底（官方 App 通道，POST 绕过 GET 限流），成功则用 UMP 下载的视频轨继续。
+      let umpTracks: { videoPath: string; audioPath?: string } | null = null
+      if (isYouTubeUMPChoice(options.url, options.choice) && (await fileSizeBytes(workPath)) === 0) {
+        // 兜底也给 2 分钟预算：UMP 慢速下载无预算时用户只能手动取消（实测卡 20 分钟）
+        umpTracks = await downloadYouTubeUMPFallback({ url: options.url, choice: options.choice, taskId, workDirectory, cancelPath, isCancelFlagSet, insecureTLS: options.insecureTLS, fallbackAfterMs: 120000, onProgress: options.onProgress })
+        if (umpTracks) {
+          workPath = umpTracks.videoPath
+          await logEvent({ level: "info", event: "download.direct.ump-fallback-ok", taskId, details: { message: "UMP 协议下载成功，绕过 GET 限流" } })
+        } else {
+          throw new Error("YouTube 下载被限制：当前网络出口（代理/VPN/抓包）常被 YouTube 限流（约 15MB/视频）。请关闭代理后重试，或更换代理节点。")
+        }
+      }
+      // 原生音视频分离下载 + ffmpeg 合并（YouTube DASH / B站 DASH 直链）：视频轨已下到
+      // workPath，音频轨（choice.previewAudioURL，native fetch）再下载，然后流拷贝/转码合成。
+      let publishPath = workPath
+      if (options.choice.mergeAudioFormat && (options.choice.previewAudioURL || umpTracks?.audioPath)) {
+        const previewAudioURL = options.choice.previewAudioURL
+        const audioExt = extensionOf(previewAudioURL || "") || ".m4a"
+        const audioPath = umpTracks?.audioPath || Path.join(workDirectory, `audio_${Date.now()}${audioExt}`)
+        // UMP 已下载音频轨时跳过 direct 音频下载；否则 YouTube 音频 >1MB 完整 GET 会被拒（403），
+        // 先 1MB 分段 + 刷新 URL，失败回退完整 GET。
+        let audioDownloaded = Boolean(umpTracks?.audioPath)
+        if (!audioDownloaded && options.choice.id.startsWith("youtube-") && options.concurrentFragments > 1) {
+          // 音频轨 1MB 分段 + refresh（用户并发设置）；失败再 UMP POST 绕 GET 配额（取消时提前返回），最后完整 GET 兑底。
+          try {
+            audioDownloaded = await downloadDirectSegmented({
+              url: previewAudioURL!,
+              destination: audioPath,
+              headers: { "User-Agent": YOUTUBE_DOWNLOAD_UA, Accept: "*/*", ...(options.choice.previewHeaders || {}) },
+              concurrentFragments: Math.max(options.concurrentFragments, 2),
+              maxSegmentBytes: 1048576,
+              refreshURL: refreshYouTubeAudioURL,
+              start: 0.95,
+              end: 0.99,
+              stage: "正在下载音频流（原生分段）",
+              onProgress: options.onProgress,
+              isCancelFlagSet,
+            })
+          } catch (audioSegError) {
+            audioDownloaded = false
+            await logEvent({ level: "warn", event: "download.direct.audio-segmented-fallback", taskId, details: { message: audioSegError instanceof Error ? audioSegError.message : String(audioSegError) } })
+          }
+          if (!audioDownloaded && !isCancelFlagSet()) {
+            audioDownloaded = await downloadYouTubeUMPAudio({
+              url: options.url,
+              choice: options.choice,
+              taskId,
+              destination: audioPath,
+              cancelPath,
+              isCancelFlagSet,
+              insecureTLS: options.insecureTLS,
+              onProgress: options.onProgress,
+            })
+          }
+        }
+        if (!audioDownloaded) {
+          await downloadURLToFileWithProgress({
+            url: previewAudioURL!,
+            destination: audioPath,
+            headers: { "User-Agent": YOUTUBE_DOWNLOAD_UA, Accept: "*/*", ...(options.choice.previewHeaders || {}) },
+            start: 0.95,
+            end: 0.99,
+            stage: "正在下载音频流（原生）",
+            onProgress: options.onProgress,
+            isCancelFlagSet,
+          })
+        }
+        if (isCancelFlagSet()) throw new Error("下载已取消")
+        if ((await fileSizeBytes(audioPath)) === 0) {
+          throw new Error("音频流下载失败：服务器拒绝了请求（YouTube 网络出口限流）。请关闭代理后重试，或更换代理节点。")
+        }
+        const hardCodec = isDeviceHardVideoChoice(options.choice)
+        const mergeExt = hardCodec ? "mkv" : options.choice.mergeExtension || "mkv"
+        const finalPath = workPath.replace(/\.[^.]+$/, "") + `_merged.${mergeExt}`
+        tracker.emit(0.99, hardCodec ? "正在合成 MKV（无损，供外部播放器）" : "正在使用内置 FFmpeg 合并")
+        const fastStart = mergeExt === "mp4" ? " -movflags +faststart" : ""
+        const mergeResult = await runCommand(`ffmpeg -y -i ${quote(workPath)} -i ${quote(audioPath)} -map 0:v:0 -map 1:a:0 -c copy${fastStart} ${quote(finalPath)}`, 900)
+        await logEvent({
+          level: mergeResult.exitCode === 0 ? "info" : "error",
+          event: "merge.ffmpeg.completed",
+          taskId,
+          details: {
+            exitCode: mergeResult.exitCode,
+            output: mergeResult.output,
+            videoPath: workPath,
+            audioPath,
+            workPath: finalPath,
+            container: mergeExt,
+            sourceVideoCodec: options.choice.videoCodec || null,
+            streamCopyOnly: hardCodec || undefined,
+          },
+        })
+        if (mergeResult.exitCode !== 0 || !FileManager.existsSync(finalPath)) {
+          if (hardCodec) {
+            throw new Error(compactMessage(mergeResult.output || "HEVC/AV1/VP9 流拷贝合成 MKV 失败。请改选 H.264，或检查下载完整性后重试。"))
+          }
+          tracker.emit(0.99, "无损合并失败，正在转码为兼容 MP4")
+          await FileManager.remove(finalPath).catch(() => {})
+          const mp4Path = finalPath.replace(/\.[^.]+$/, ".mp4")
+          const transcode = await runCommand(
+            `ffmpeg -y -i ${quote(workPath)} -i ${quote(audioPath)} -map 0:v:0 -map 1:a:0 -c:v h264_videotoolbox -c:a aac -movflags +faststart ${quote(mp4Path)}`,
+            7200,
+          )
+          await logEvent({
+            level: transcode.exitCode === 0 ? "info" : "error",
+            event: "merge.ffmpeg.transcode.completed",
+            taskId,
+            details: {
+              exitCode: transcode.exitCode,
+              output: transcode.output,
+              reason: "stream-copy-failed",
+              sourceVideoCodec: options.choice.videoCodec || null,
+            },
+          })
+          if (transcode.exitCode !== 0 || !FileManager.existsSync(mp4Path)) {
+            throw new Error(compactMessage(transcode.output || "无损合并失败且转码失败，请改选 H.264 后重试。"))
+          }
+          publishPath = mp4Path
+        } else {
+          publishPath = finalPath
+        }
+        try { if (FileManager.existsSync(audioPath)) FileManager.removeSync(audioPath) } catch {}
+      }
+      const filePath = await verifyAndPublishMediaFile({ workPath: publishPath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
       tracker.emit(1, "直接媒体下载并验证完成")
-      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct", segmented: segmented || undefined } })
+      await logEvent({ level: "info", event: "download.completed", taskId, details: { filePath, choiceId: options.choice.id, kind: "direct", segmented: segmented || undefined, merged: publishPath !== workPath || undefined } })
       return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
     } catch (error) {
       await logEvent({ level: "error", event: "download.failed", taskId, details: { message: error instanceof Error ? error.message : String(error), kind: "direct" } })
@@ -2928,16 +3681,25 @@ export async function downloadMedia(options: {
     if (mergeAudioFormat) {
       const videoConfigPath = Path.join(taskDirectory, "video.json")
       const audioConfigPath = Path.join(taskDirectory, "audio.json")
-      const videoConfig = { ...config, output: "%(title).120B [%(id)s].video.%(ext)s" }
-      const audioConfig = { ...config, format: mergeAudioFormat, output: "%(title).120B [%(id)s].audio.%(ext)s" }
-      await FileManager.writeAsString(videoConfigPath, JSON.stringify(videoConfig))
-      await FileManager.writeAsString(audioConfigPath, JSON.stringify(audioConfig))
+      // UMP 优先：先以 UMP 参数跑（itag -0 后缀选 UMP 副本 + formats=ump），每流失败回退普通参数重跑一次。
+      let umpYtDlpMode = umpFirstAttempted
+      const buildStreamConfig = (formatExpr: string, outputTpl: string) => {
+        const streamConfig: Record<string, unknown> = { ...config, format: formatExpr, output: outputTpl }
+        if (umpYtDlpMode) {
+          streamConfig.format = toUMPFormatExpression(formatExpr)
+          streamConfig.extractor_args = { youtube: { formats: ["ump"] } }
+          streamConfig.format_sort = ["proto:ump"]
+        }
+        return streamConfig
+      }
+      const videoConfig0 = buildStreamConfig(config.format, "%(title).120B [%(id)s].video.%(ext)s")
+      await FileManager.writeAsString(videoConfigPath, JSON.stringify(videoConfig0))
 
       // video 2%→50%，audio 50%→90%，merge 90%→99%
       clearProgressFile(progressPath)
       tracker.emit(0.02, "正在下载视频流")
       const stopVideoPoll = tracker.startPolling(progressPath, 0.02, 0.5, "下载视频流")
-      const videoResult = await runYtdlpWithHostNoiseRetry({
+      let videoResult = await runYtdlpWithHostNoiseRetry({
         command: `python3 ${quote(RUNNER_PATH)} ${quote(videoConfigPath)}`,
         timeout: 7200,
         taskId,
@@ -2946,13 +3708,68 @@ export async function downloadMedia(options: {
       })
       stopVideoPoll()
       clearProgressFile(progressPath)
-      await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output, workFiles: listWorkMediaFiles(workDirectory) } })
+      await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output, protocol: runnerProtocols(videoResult.output), workFiles: listWorkMediaFiles(workDirectory) } })
       if (videoResult.exitCode === 130) throw new Error("下载已取消")
       if (videoResult.exitCode !== 0) {
+        // 首次证书校验失败必须先交给上层以 insecureTLS=true 重试；否则会被 UMP 兜底吞掉，跳过已有兼容路径。
+        if (!options.insecureTLS && isCertificateVerifyFailure(videoResult.output || "")) {
+          await logEvent({ level: "warn", event: "download.tls-retry.requested", taskId, details: { stage: "video", choiceId: options.choice.id } })
+          throw new Error(compactMessage(videoResult.output || "证书校验失败"))
+        }
+        // UMP 优先失败（非取消）：清理残留 → 普通参数重跑视频流一次。
+        if (umpYtDlpMode && !isCancelFlagSet()) {
+          const message = compactMessage(videoResult.output || "yt-dlp UMP 视频流下载失败")
+          await logEvent({ level: "warn", event: "download.youtube.ump-ytdlp-fallback", taskId, details: { stage: "video", choiceId: options.choice.id, message } })
+          removeDownloadResiduals(workDirectory, ".video.")
+          umpYtDlpMode = false
+          await FileManager.writeAsString(videoConfigPath, JSON.stringify(buildStreamConfig(config.format, "%(title).120B [%(id)s].video.%(ext)s")))
+          videoResult = await runYtdlpWithHostNoiseRetry({
+            command: `python3 ${quote(RUNNER_PATH)} ${quote(videoConfigPath)}`,
+            timeout: 7200,
+            taskId,
+            stage: "video",
+            isCancelFlagSet,
+          })
+          await logEvent({ level: videoResult.exitCode === 0 ? "info" : "error", event: "download.video.command.completed", taskId, details: { exitCode: videoResult.exitCode, output: videoResult.output, retriedAfterUMP: true, protocol: runnerProtocols(videoResult.output), workFiles: listWorkMediaFiles(workDirectory) } })
+          if (videoResult.exitCode === 130) throw new Error("下载已取消")
+        }
+        if (videoResult.exitCode !== 0) {
+        if (isYouTubeUMPChoice(sourceURL, options.choice)) {
+          if (umpFirstAttempted) {
+            // UMP 优先已尝试（60s 预算耗尽回退）：yt-dlp 直连失败时不再二次 UMP 兜底，
+            // 否则无预算长超时会让用户误以为卡死（实测需手动取消）。直接明确报错。
+            await logEvent({ level: "warn", event: "download.youtube.ump-second-skipped", taskId, details: { choiceId: options.choice.id, message: compactMessage(videoResult.output || "yt-dlp 视频流下载失败") } })
+            throw new Error("YouTube 直链被限流（403）且 UMP 官方通道不可用。请稍后重试或更换网络；也可关闭「UMP 优先下载」开关使用原链路。")
+          }
+          await logEvent({ level: "warn", event: "download.youtube.ump-fallback.started", taskId, details: { choiceId: options.choice.id, message: compactMessage(videoResult.output || "yt-dlp 视频流下载失败") } })
+          const umpTracks = await downloadYouTubeUMPFallback({
+            url: options.url,
+            choice: options.choice,
+            taskId,
+            workDirectory,
+            cancelPath,
+            isCancelFlagSet,
+            insecureTLS: options.insecureTLS,
+            // 兜底也给 2 分钟预算：UMP 慢速下载无预算时用户只能手动取消（实测卡 20 分钟）
+            fallbackAfterMs: 120000,
+            onProgress: (progress) => tracker.emit(0.5 + progress.fraction * 0.43, progress.stage),
+          })
+          if (isCancelFlagSet()) throw new Error("下载已取消")
+          if (umpTracks) {
+            tracker.emit(0.94, "正在合成 UMP 音视频")
+            const umpWorkPath = await mergeYouTubeUMPTracks({ tracks: umpTracks, choice: options.choice, taskId, cancelPath, isCancelFlagSet })
+            const filePath = await verifyAndPublishMediaFile({ workPath: umpWorkPath, choice: options.choice, taskId, hlsOrigin: false, hlsManifest: undefined, outputTitle: options.outputTitle })
+            tracker.emit(1, "UMP 下载、合并并验证完成")
+            await logEvent({ level: "info", event: "download.youtube.ump-fallback.completed", taskId, details: { filePath, choiceId: options.choice.id } })
+            return { filePath, fileName: Path.basename(filePath), sourceURL, choice: options.choice, taskId, fileSizeBytes: await fileSizeBytes(filePath) }
+          }
+          await logEvent({ level: "warn", event: "download.youtube.ump-fallback.failed", taskId, details: { choiceId: options.choice.id } })
+        }
         if (isBilibiliPremiumMissing(videoResult.output || "")) {
           throw new Error("当前清晰度需 B 站大会员或登录 Cookie 才能下载。请改选较低清晰度（优先 H.264）或先登录后再试。")
         }
         throw new Error(compactMessage(videoResult.output || "视频流下载失败"))
+        }
       }
       const videoFromOutput = parseOutputPaths(videoResult.output).some((path) => FileManager.existsSync(path))
       const videoPath = resolveDownloadedMediaPath({ output: videoResult.output, workDirectory, nameHint: ".video." })
@@ -2967,8 +3784,9 @@ export async function downloadMedia(options: {
       }
 
       tracker.emit(0.5, "正在下载音频流")
+      await FileManager.writeAsString(audioConfigPath, JSON.stringify(buildStreamConfig(mergeAudioFormat, "%(title).120B [%(id)s].audio.%(ext)s")))
       const stopAudioPoll = tracker.startPolling(progressPath, 0.5, 0.9, "下载音频流")
-      const audioResult = await runYtdlpWithHostNoiseRetry({
+      let audioResult = await runYtdlpWithHostNoiseRetry({
         command: `python3 ${quote(RUNNER_PATH)} ${quote(audioConfigPath)}`,
         timeout: 7200,
         taskId,
@@ -2977,9 +3795,28 @@ export async function downloadMedia(options: {
       })
       stopAudioPoll()
       clearProgressFile(progressPath)
-      await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output, workFiles: listWorkMediaFiles(workDirectory) } })
+      await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output, protocol: runnerProtocols(audioResult.output), workFiles: listWorkMediaFiles(workDirectory) } })
       if (audioResult.exitCode === 130) throw new Error("下载已取消")
-      if (audioResult.exitCode !== 0) throw new Error(compactMessage(audioResult.output || "音频流下载失败"))
+      if (audioResult.exitCode !== 0) {
+        // UMP 优先失败（非取消）：清理残留 → 普通参数重跑音频流一次。
+        if (umpYtDlpMode && !isCancelFlagSet()) {
+          const message = compactMessage(audioResult.output || "yt-dlp UMP 音频流下载失败")
+          await logEvent({ level: "warn", event: "download.youtube.ump-ytdlp-fallback", taskId, details: { stage: "audio", choiceId: options.choice.id, message } })
+          removeDownloadResiduals(workDirectory, ".audio.")
+          umpYtDlpMode = false
+          await FileManager.writeAsString(audioConfigPath, JSON.stringify(buildStreamConfig(mergeAudioFormat, "%(title).120B [%(id)s].audio.%(ext)s")))
+          audioResult = await runYtdlpWithHostNoiseRetry({
+            command: `python3 ${quote(RUNNER_PATH)} ${quote(audioConfigPath)}`,
+            timeout: 7200,
+            taskId,
+            stage: "audio",
+            isCancelFlagSet,
+          })
+          await logEvent({ level: audioResult.exitCode === 0 ? "info" : "error", event: "download.audio.command.completed", taskId, details: { exitCode: audioResult.exitCode, output: audioResult.output, retriedAfterUMP: true, protocol: runnerProtocols(audioResult.output), workFiles: listWorkMediaFiles(workDirectory) } })
+          if (audioResult.exitCode === 130) throw new Error("下载已取消")
+        }
+        if (audioResult.exitCode !== 0) throw new Error(compactMessage(audioResult.output || "音频流下载失败"))
+      }
       const audioFromOutput = parseOutputPaths(audioResult.output).some((path) => FileManager.existsSync(path))
       const audioPath = resolveDownloadedMediaPath({ output: audioResult.output, workDirectory, nameHint: ".audio.", excludePaths: [videoPath] })
       if (!audioPath) throw new Error("音频流下载完成但未找到输出文件")
@@ -3072,7 +3909,7 @@ export async function downloadMedia(options: {
     })
     stopPoll()
     clearProgressFile(progressPath)
-    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "download.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output, workFiles: listWorkMediaFiles(workDirectory) } })
+    await logEvent({ level: result.exitCode === 0 ? "info" : "error", event: "download.command.completed", taskId, details: { exitCode: result.exitCode, output: result.output, protocol: runnerProtocols(result.output), workFiles: listWorkMediaFiles(workDirectory) } })
     if (result.exitCode === 130) throw new Error("下载已取消")
     if (result.exitCode !== 0) throw new Error(compactMessage(result.output || "yt-dlp 下载失败"))
     const singleFromOutput = parseOutputPaths(result.output).some((path) => FileManager.existsSync(path))

@@ -5,6 +5,13 @@ import threading
 import time
 from urllib.parse import urlparse
 
+# ios_system 常驻 python 进程跨命令缓存 sys.modules，且 yt-dlp 的插件发现
+# （all_plugins_loaded）只在首次加载时执行——改插件（如 yt-dlp-ytse 补丁）后
+# 不清理缓存会继续用旧字节码。每次运行前清掉 yt_dlp 全家，强制重新扫描插件。
+for _m in list(sys.modules):
+    if _m.startswith('yt_dlp'):
+        del sys.modules[_m]
+
 from yt_dlp import YoutubeDL
 
 
@@ -113,6 +120,20 @@ def main():
         if filename:
             finished_paths.append(os.path.abspath(filename))
 
+    # YouTube web player client requires a JS runtime (deno) to decrypt nsig.
+    # This device has no JS runtime; prefer android_vr so downloads also work.
+    extractor_args = {"youtube": {"player_client": ["android_vr"]}}
+
+    # 合并调用方传入的 extractor_args（如 yt-dlp-ytse 的 youtube.formats=ump），
+    # 保留默认 player_client=android_vr 不覆盖。
+    extra_args = config.get("extractor_args")
+    if isinstance(extra_args, dict):
+        for client, args in extra_args.items():
+            if isinstance(args, dict):
+                extractor_args.setdefault(client, {}).update(args)
+            else:
+                extractor_args[client] = args
+
     options = {
         "format": config["format"],
         "format_sort": config.get("format_sort") or [],
@@ -127,9 +148,7 @@ def main():
         "retries": 3,
         "fragment_retries": 3,
         "overwrites": False,
-        # YouTube web player client requires a JS runtime (deno) to decrypt nsig.
-        # This device has no JS runtime; prefer android_vr so downloads also work.
-        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+        "extractor_args": extractor_args,
     }
 
     cookiefile = config.get("cookiefile")
@@ -172,6 +191,12 @@ def main():
         raise
 
     print_metadata(info, source_url)
+
+    # 输出实际下载协议（ump = yt-dlp-ytse UMP 通道；https = 普通直连），供 media.ts 日志标记。
+    for item in info.get("requested_downloads") or []:
+        proto = item.get("protocol")
+        if proto:
+            print(f"MEDIA_DOWNLOADER_PROTOCOL {proto}")
 
     with YoutubeDL(options) as ydl:
         for item in info.get("requested_downloads") or []:

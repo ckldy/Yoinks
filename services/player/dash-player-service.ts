@@ -37,12 +37,27 @@ video{width:100%;height:100%;object-fit:contain;display:block}
 .menu-item{color:#fff;font:13px -apple-system;padding:8px 14px;cursor:pointer;-webkit-tap-highlight-color:transparent;white-space:nowrap;text-align:center}
 .menu-item:active{background:rgba(255,255,255,0.15)}
 .menu-item.active{color:#4ad6ff}
+.tap-layer{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;display:none}
+.bar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:10px;padding:12px 14px 20px;background:linear-gradient(transparent,rgba(0,0,0,0.75));z-index:15;opacity:0;transition:opacity .25s;pointer-events:none}
+.bar.show{opacity:1;pointer-events:auto}
+.bar-btn{background:rgba(255,255,255,0.18);color:#fff;border:none;border-radius:50%;width:40px;height:40px;font:700 15px -apple-system;cursor:pointer;-webkit-tap-highlight-color:transparent;flex:none}
+.bar-btn:active{background:rgba(255,255,255,0.3)}
+.bar-track{flex:1;height:32px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+.bar-rail{width:100%;height:4px;border-radius:2px;background:rgba(255,255,255,0.3);position:relative}
+.bar-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#4ad6ff;border-radius:2px}
+.bar-time{color:#fff;font:12px -apple-system;min-width:96px;text-align:right;flex:none}
 </style>
 </head>
 <body>
 <div class="loading" id="loading">加载中...</div>
 <video id="video" controls {{PLAYS_INLINE}} {{MUTED}} {{AUTOPLAY}} preload="auto"></video>
 <div class="error" id="error"></div>
+<div class="tap-layer" id="tapLayer"></div>
+<div class="bar" id="bar">
+  <button class="bar-btn" id="playBtn">▶</button>
+  <div class="bar-track" id="track"><div class="bar-rail"><div class="bar-fill" id="fill"></div></div></div>
+  <span class="bar-time" id="timeText">0:00 / 0:00</span>
+</div>
 <div class="ctrl-wrap">
   <div class="ctrl-host" id="speedHost">
     <button class="pill" id="speedBtn">1.0x</button>
@@ -50,7 +65,7 @@ video{width:100%;height:100%;object-fit:contain;display:block}
   </div>
 </div>
 
-<script src="{{DASH_JS_URL}}"></script>
+<script src="{{DASH_JS_URL}}" onerror="loadFallbackDashJs()"></script>
 <script>
 var video = document.getElementById('video');
 var loading = document.getElementById('loading');
@@ -63,6 +78,27 @@ var activeXhrs = [];
 var retryTimers = [];
 
 var config = {{DASH_CONFIG}};
+
+// dash.js CDN 兜底：jsdelivr 加载失败/超时 → unpkg；仍失败则明确报错。
+var pendingStart = false;
+function loadFallbackDashJs() {
+  var s = document.createElement('script');
+  s.src = 'https://unpkg.com/dashjs@4.7.4/dist/dash.all.min.js';
+  s.onload = function() {
+    if (pendingStart && window.dashjs && window.dashjs.MediaPlayer) {
+      pendingStart = false;
+      startDashPlayback();
+    }
+  };
+  s.onerror = function() {
+    showError('DASH 播放器加载失败（CDN 不可达）', true);
+  };
+  document.head.appendChild(s);
+}
+// 主 CDN 4 秒无反应（既不加载也不报错）时主动切 fallback。
+setTimeout(function() {
+  if (!window.dashjs) loadFallbackDashJs();
+}, 4000);
 
 function reportError(message, fatal) {
   try {
@@ -144,7 +180,7 @@ function findInitAndIndexRanges(buffer) {
   };
 }
 
-function fetchArrayBufferOnce(url, headers) {
+function fetchArrayBufferOnce(url, headers, maxBytes) {
   return new Promise(function(resolve, reject) {
     if (destroyed) { reject(new Error('Preview dismissed')); return; }
     var xhr = new XMLHttpRequest();
@@ -160,8 +196,9 @@ function fetchArrayBufferOnce(url, headers) {
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
     xhr.timeout = 10000;
-    // 2 MB is enough for large YouTube moov/sidx boxes while still being a small probe.
-    xhr.setRequestHeader('Range', 'bytes=0-2097151');
+    // 默认 2 MB 足够小文件 moov/sidx；大文件（如 4K）moov 可能超出 → 调用方检测截断后传入更大 maxBytes。
+    var limit = maxBytes || 2 * 1024 * 1024;
+    xhr.setRequestHeader('Range', 'bytes=0-' + (limit - 1));
     Object.entries(headers || {}).forEach(function(entry) {
       try { xhr.setRequestHeader(entry[0], entry[1]); } catch (e) {}
     });
@@ -169,7 +206,7 @@ function fetchArrayBufferOnce(url, headers) {
       if (destroyed) { finish(reject, new Error('Preview dismissed')); return; }
       if (xhr.status >= 200 && xhr.status < 300) {
         var contentLength = Number(xhr.getResponseHeader('Content-Length') || 0);
-        if (contentLength > 3 * 1024 * 1024) { finish(reject, new Error('初始化响应过大')); return; }
+        if (contentLength > limit + 1024 * 1024) { finish(reject, new Error('初始化响应过大')); return; }
         finish(resolve, xhr.response);
       } else {
         finish(reject, new Error('HTTP ' + xhr.status));
@@ -193,9 +230,9 @@ function sleep(milliseconds) {
   });
 }
 
-async function fetchArrayBuffer(url, headers, streamKind) {
+async function fetchArrayBuffer(url, headers, streamKind, maxBytes) {
   // Googlevideo initial Range requests can intermittently fail in WKWebView.
-  // Retry only transport failures; HTTP responses remain actionable immediately.
+  // Retry transport failures and transient 403s (WAF/limit); other HTTP responses remain actionable immediately.
   var delays = [0, 300, 900];
   var lastError = null;
   for (var attempt = 0; attempt < delays.length; attempt++) {
@@ -203,13 +240,14 @@ async function fetchArrayBuffer(url, headers, streamKind) {
     if (delays[attempt]) await sleep(delays[attempt]);
     if (destroyed) throw new Error('Preview dismissed');
     try {
-      var buffer = await fetchArrayBufferOnce(url, headers);
+      var buffer = await fetchArrayBufferOnce(url, headers, maxBytes);
       if (attempt > 0) reportDiagnostic('dash.init.retry.success', { stream: streamKind, attempt: attempt + 1 });
       return buffer;
     } catch (err) {
       lastError = err;
       var message = String(err && err.message ? err.message : err);
-      if (!/Network error/i.test(message) || attempt === delays.length - 1) {
+      var recoverable = /Network error/i.test(message) || /\\b403\\b/.test(message);
+      if (!recoverable || attempt === delays.length - 1) {
         reportDiagnostic('dash.init.request.failed', { stream: streamKind, attempt: attempt + 1, message: message });
         throw err;
       }
@@ -220,10 +258,12 @@ async function fetchArrayBuffer(url, headers, streamKind) {
 }
 function isForbiddenStatus(err) {
   var msg = String(err && err.message ? err.message : err);
-  return /\b403\b/.test(msg);
+  return /\\b403\\b/.test(msg);
 }
 
 function buildMpd(videoUrl, videoRanges, audioUrl, audioRanges, duration, videoCodec, audioCodec) {
+  // duration 未知/非法时给 1h 兜底，避免 dash.js 因 PT0S 拒绝 manifest。
+  var effectiveDuration = (typeof duration === 'number' && duration > 0) ? duration : 3600;
   function segBase(ranges, url) {
     var sb = '<SegmentBase indexRangeExact="false"';
     if (ranges.sidxStart >= 0 && ranges.sidxEnd > ranges.sidxStart) {
@@ -244,8 +284,8 @@ function buildMpd(videoUrl, videoRanges, audioUrl, audioRanges, duration, videoC
     return 'PT' + seconds + 'S';
   }
   var mpd = '<?xml version="1.0" encoding="UTF-8"?>';
-  mpd += '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="' + pts(duration) + '" minBufferTime="PT2S">';
-  mpd += '<Period duration="' + pts(duration) + '">';
+  mpd += '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="' + pts(effectiveDuration) + '" minBufferTime="PT2S">';
+  mpd += '<Period duration="' + pts(effectiveDuration) + '">';
   // Video adaptation set
   var videoCodecAttr = videoCodec ? ' codecs="' + escapeXml(videoCodec) + '"' : '';
   mpd += '<AdaptationSet mimeType="video/mp4" contentType="video" segmentAlignment="true" subsegmentAlignment="true" startWithSAP="1">';
@@ -253,13 +293,15 @@ function buildMpd(videoUrl, videoRanges, audioUrl, audioRanges, duration, videoC
   mpd += '<BaseURL>' + escapeXml(videoUrl) + '</BaseURL>';
   mpd += segBase(videoRanges, videoUrl);
   mpd += '</Representation></AdaptationSet>';
-  // Audio adaptation set
-  var audioCodecAttr = audioCodec ? ' codecs="' + escapeXml(audioCodec) + '"' : '';
-  mpd += '<AdaptationSet mimeType="audio/mp4" contentType="audio" segmentAlignment="true" subsegmentAlignment="true" startWithSAP="1">';
-  mpd += '<Representation id="a1" bandwidth="128000"' + audioCodecAttr + '>';
-  mpd += '<BaseURL>' + escapeXml(audioUrl) + '</BaseURL>';
-  mpd += segBase(audioRanges, audioUrl);
-  mpd += '</Representation></AdaptationSet>';
+  // Audio adaptation set（音频不可用时省略：仅视频静音播放）
+  if (audioUrl && audioRanges) {
+    var audioCodecAttr = audioCodec ? ' codecs="' + escapeXml(audioCodec) + '"' : '';
+    mpd += '<AdaptationSet mimeType="audio/mp4" contentType="audio" segmentAlignment="true" subsegmentAlignment="true" startWithSAP="1">';
+    mpd += '<Representation id="a1" bandwidth="128000"' + audioCodecAttr + '>';
+    mpd += '<BaseURL>' + escapeXml(audioUrl) + '</BaseURL>';
+    mpd += segBase(audioRanges, audioUrl);
+    mpd += '</Representation></AdaptationSet>';
+  }
   mpd += '</Period></MPD>';
   return 'data:application/dash+xml;charset=utf-8;base64,' + btoa(unescape(encodeURIComponent(mpd)));
 }
@@ -268,6 +310,12 @@ async function probeRangesForUrl(url, fallbackUrl, headers, streamKind) {
   try {
     var buf = await fetchArrayBuffer(url, headers, streamKind);
     var ranges = findInitAndIndexRanges(buf);
+    // 头部被截断（buffer 恰好满 2MB）且未解析出 moov：moov/sidx 可能超出默认探测 Range，扩大重试。
+    if (!ranges && buf && buf.byteLength >= 2 * 1024 * 1024) {
+      reportDiagnostic('dash.init.expand', { stream: streamKind });
+      buf = await fetchArrayBuffer(url, headers, streamKind, 16 * 1024 * 1024);
+      ranges = findInitAndIndexRanges(buf);
+    }
     if (!ranges) throw new Error('无法解析 .m4s 初始化段');
     return { ranges: ranges, usedFallback: false };
   } catch (err) {
@@ -288,7 +336,8 @@ function startDashPlayback() {
     return;
   }
   if (!window.dashjs || !window.dashjs.MediaPlayer) {
-    showError('DASH 播放器加载失败', true);
+    // dash.js 尚未就绪（CDN 加载中/失败）：等待 fallback 加载完成后自动开始。
+    pendingStart = true;
     return;
   }
   if (typeof window.MediaSource === 'undefined' && typeof window.WebKitMediaSource === 'undefined') {
@@ -338,18 +387,37 @@ function startDashPlayback() {
     hasAudioFallback: !!config.audioFallbackUrl,
     headerKeys: Object.keys(allowedHeaders || {})
   });
-  Promise.all([
-    probeRangesForUrl(config.videoUrl, config.videoFallbackUrl, allowedHeaders, 'video'),
-    probeRangesForUrl(config.audioUrl, config.audioFallbackUrl, allowedHeaders, 'audio')
-  ]).then(function(results) {
+  // 视频/音频独立探测：音频失败（如 403）不再整体放弃，降级为仅视频静音播放。
+  var videoProbe = probeRangesForUrl(config.videoUrl, config.videoFallbackUrl, allowedHeaders, 'video')
+    .then(function(result) { return { ok: true, result: result }; })
+    .catch(function(err) { return { ok: false, error: err }; });
+  var audioProbe = probeRangesForUrl(config.audioUrl, config.audioFallbackUrl, allowedHeaders, 'audio')
+    .then(function(result) { return { ok: true, result: result }; })
+    .catch(function(err) { return { ok: false, error: err }; });
+  Promise.all([videoProbe, audioProbe]).then(function(results) {
     if (destroyed || !player) return;
     var videoResult = results[0];
     var audioResult = results[1];
-    var videoPlayUrl = videoResult.usedFallback && config.videoFallbackUrl ? config.videoFallbackUrl : config.videoUrl;
-    var audioPlayUrl = audioResult.usedFallback && config.audioFallbackUrl ? config.audioFallbackUrl : config.audioUrl;
-    reportDiagnostic('dash.init.success', { videoUsedFallback: videoResult.usedFallback, audioUsedFallback: audioResult.usedFallback });
-    var mpd = buildMpd(videoPlayUrl, videoResult.ranges, audioPlayUrl, audioResult.ranges, config.duration || 0, config.videoCodec, config.audioCodec);
+    if (!videoResult.ok) {
+      showError('DASH 初始化失败: ' + (videoResult.error && videoResult.error.message || '视频流初始化失败'), true);
+      return;
+    }
+    var audioOk = audioResult.ok && !!audioResult.result;
+    if (!audioOk) {
+      // 音频流不可用（403/超时）：降级仅视频静音播放，至少让用户看到画面（预览目的）。
+      reportDiagnostic('dash.init.audio-muted-fallback', { reason: String(audioResult.error && audioResult.error.message || 'audio unavailable') });
+    }
+    var videoPlayUrl = videoResult.result.usedFallback && config.videoFallbackUrl ? config.videoFallbackUrl : config.videoUrl;
+    var audioPlayUrl = audioOk && audioResult.result.usedFallback && config.audioFallbackUrl ? config.audioFallbackUrl : config.audioUrl;
+    reportDiagnostic('dash.init.success', { videoUsedFallback: videoResult.result.usedFallback, audioUsedFallback: audioOk ? audioResult.result.usedFallback : false, audioMutedFallback: !audioOk });
+    var mpd = buildMpd(videoPlayUrl, videoResult.result.ranges, audioOk ? audioPlayUrl : null, audioOk ? audioResult.result.ranges : null, config.duration || 0, config.videoCodec, config.audioCodec);
+    if (!audioOk) {
+      // 仅视频播放必须静音（无音频轨时 unmuted 会令 dash.js 等待音频就绪）。
+      video.muted = true;
+    }
     player.initialize(video, mpd, config.autoPlay);
+    // MSE 播放：用自绘控制条替代 iOS 原生 controls（原生对 MSE 流会闪烁/调不出）。
+    enableCustomControls();
     if (config.muted) {
       video.muted = true;
     }
@@ -376,6 +444,86 @@ window.destroyDashPlayer = function() {
     video.load();
   } catch (e) {}
 };
+
+// --- 自绘控制条（MSE 播放时替代 iOS 原生 controls——原生 controls 对 MSE 流会闪烁/调不出） ---
+var customControlsEnabled = false;
+var tapLayer = document.getElementById('tapLayer');
+var bar = document.getElementById('bar');
+var playBtn = document.getElementById('playBtn');
+var track = document.getElementById('track');
+var fill = document.getElementById('fill');
+var timeText = document.getElementById('timeText');
+var barHideTimer = null;
+var seeking = false;
+
+function formatTime(t) {
+  t = Math.max(0, isNaN(t) ? 0 : Math.floor(t));
+  var m = Math.floor(t / 60);
+  var s = t % 60;
+  return m + ':' + (s < 10 ? '0' + s : String(s));
+}
+function updateBar() {
+  var dur = video.duration || 0;
+  var cur = video.currentTime || 0;
+  playBtn.textContent = video.paused ? '▶' : '❚❚';
+  fill.style.width = (dur > 0 ? Math.min(100, (cur / dur) * 100) : 0) + '%';
+  timeText.textContent = formatTime(cur) + ' / ' + formatTime(dur);
+}
+function showBar() {
+  bar.classList.add('show');
+  updateBar();
+  if (barHideTimer) clearTimeout(barHideTimer);
+  barHideTimer = setTimeout(function() { bar.classList.remove('show'); }, 3000);
+}
+function hideBar() {
+  if (barHideTimer) clearTimeout(barHideTimer);
+  barHideTimer = null;
+  bar.classList.remove('show');
+}
+function enableCustomControls() {
+  if (customControlsEnabled) return;
+  customControlsEnabled = true;
+  try { video.removeAttribute('controls'); } catch (e) {}
+  tapLayer.style.display = 'block';
+  tapLayer.addEventListener('click', function() {
+    if (bar.classList.contains('show')) {
+      // 已唤出控制条：再次点击切换播放/暂停（贴近原生点按习惯）。
+      if (video.paused) { video.play().catch(function() {}); } else { video.pause(); }
+      showBar();
+    } else {
+      showBar();
+    }
+  });
+  playBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    if (video.paused) { video.play().catch(function() {}); } else { video.pause(); }
+    showBar();
+  });
+  track.addEventListener('pointerdown', function(e) {
+    e.stopPropagation();
+    seeking = true;
+    seekFromEvent(e);
+  });
+  track.addEventListener('pointermove', function(e) {
+    if (seeking) seekFromEvent(e);
+  });
+  ['pointerup', 'pointercancel'].forEach(function(type) {
+    track.addEventListener(type, function() { seeking = false; });
+  });
+  function seekFromEvent(e) {
+    var rect = track.getBoundingClientRect();
+    var ratio = rect.width > 0 ? Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)) : 0;
+    var t = ratio * (video.duration || 0);
+    try { video.currentTime = t; } catch (err) {}
+    updateBar();
+  }
+  video.addEventListener('timeupdate', updateBar);
+  video.addEventListener('play', updateBar);
+  video.addEventListener('pause', updateBar);
+  video.addEventListener('durationchange', updateBar);
+  video.addEventListener('ended', function() { updateBar(); showBar(); });
+  updateBar();
+}
 
 // --- 倍速控件 ---
 var SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];

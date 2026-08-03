@@ -1,6 +1,9 @@
 # Runtime logs / history (generated at runtime, not source)
 logs/
 
+# Runtime / test scratch (speed tests, budget clips, etc.)
+tmp/
+
 # Python bytecode
 __pycache__/
 *.pyc
