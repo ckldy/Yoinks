@@ -41,6 +41,12 @@ export type PreferredContainer = "mp4" | "mkv" | "avi" | "wmv"
 
 export type ToolStatus = {
   ytDlpVersion: string | null
+  /** yt-dlp-ytse UMP 组件版本；null = 未安装 */
+  ytseVersion: string | null
+  /** UMP 组件 6 处兼容补丁是否完整（ytse.py / sabr.py / ump.py） */
+  ytsePatched: boolean
+  /** 缺失的补丁名列表（调试/提示用） */
+  ytseMissing: string[]
 }
 
 export type DownloadProgress = {
@@ -126,6 +132,8 @@ const ROOT_DIR = Path.join(FileManager.documentsDirectory, "Yoinks")
 const DOWNLOAD_DIR = Path.join(ROOT_DIR, "Downloads")
 export const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
+/** yt-dlp-ytse UMP 组件检测/补丁脚本（check 输出 JSON；patch 幂等） */
+const YTSE_PATCH_PATH = Path.join(Script.directory, "python", "patch_ytse.py")
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
 /** One end-to-end probe, including automatic retries, may use at most this many seconds. */
 export const PROBE_TOTAL_TIMEOUT_SECONDS = 45
@@ -1343,11 +1351,65 @@ export function resolveAutomaticChoice(
 
 export async function getToolStatus(): Promise<ToolStatus> {
   const ytDlp = await runCommand("python3 -m yt_dlp --version", 20)
-  const status: ToolStatus = {
-    ytDlpVersion: ytDlp.exitCode === 0 ? ytDlp.output.trim().split(/\s+/)[0] || null : null,
+  const ytDlpVersion = ytDlp.exitCode === 0 ? ytDlp.output.trim().split(/\s+/)[0] || null : null
+  const ytse = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check`, 30)
+  let ytseVersion: string | null = null
+  let ytsePatched = false
+  let ytseMissing: string[] = []
+  if (ytse.exitCode === 0) {
+    try {
+      const parsed = JSON.parse(ytse.output.trim())
+      ytseVersion = typeof parsed.version === "string" ? parsed.version : null
+      ytsePatched = parsed.patched === true
+      ytseMissing = Array.isArray(parsed.missing) ? parsed.missing : []
+    } catch {
+      // 解析失败按 UMP 组件未就绪处理
+    }
   }
-  await logEvent({ level: status.ytDlpVersion ? "info" : "warn", event: "tools.checked", details: { ytDlpVersion: status.ytDlpVersion, ytDlpExitCode: ytDlp.exitCode } })
+  const status: ToolStatus = { ytDlpVersion, ytseVersion, ytsePatched, ytseMissing }
+  await logEvent({
+    level: status.ytDlpVersion ? "info" : "warn",
+    event: "tools.checked",
+    details: { ytDlpVersion, ytDlpExitCode: ytDlp.exitCode, ytseVersion, ytsePatched, ytseMissing },
+  })
   return status
+}
+
+/** 一键安装 UMP 组件：pip 安装 yt-dlp-ytse + protobug → 幂等打补丁 → 复检。 */
+export async function installYtseComponent(): Promise<{ version: string; patched: boolean }> {
+  await logEvent({ level: "info", event: "tools.install.started", details: { tool: "yt-dlp-ytse" } })
+  // 与 installYtDlp 一致：固定信任 pypi 域名，规避本环境 SSL 证书链异常（MITM/抓包）。
+  const install = await runCommand(
+    "python3 -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org yt-dlp-ytse==0.4.3 protobug==1.0.0",
+    900,
+  )
+  if (install.exitCode !== 0) {
+    await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "pip", exitCode: install.exitCode, output: install.output } })
+    throw new Error(compactMessage(install.output || "UMP 组件安装失败"))
+  }
+  const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch`, 60)
+  if (patch.exitCode !== 0) {
+    await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "patch", exitCode: patch.exitCode, output: patch.output } })
+    throw new Error(compactMessage(patch.output || "UMP 组件补丁失败"))
+  }
+  const verify = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check`, 30)
+  let version = "0.4.3"
+  let patched = false
+  if (verify.exitCode === 0) {
+    try {
+      const parsed = JSON.parse(verify.output.trim())
+      if (typeof parsed.version === "string") version = parsed.version
+      patched = parsed.patched === true
+    } catch {
+      // 解析失败视为未就绪
+    }
+  }
+  if (!patched) {
+    await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "verify", output: verify.output } })
+    throw new Error("UMP 组件已安装但补丁未完整，请重试或查看日志")
+  }
+  await logEvent({ level: "info", event: "tools.install.completed", details: { tool: "yt-dlp-ytse", version } })
+  return { version, patched }
 }
 
 export async function installYtDlp(): Promise<string> {

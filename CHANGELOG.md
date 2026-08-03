@@ -1,5 +1,21 @@
 # 更新日志
 
+## 1.6.11 — 未发布
+
+> UMP 组件（yt-dlp-ytse + protobug + 兼容补丁）检测与一键安装：从 GitHub 安装的发布版不再因缺组件而功能不完整。
+
+### 新功能
+
+- **UMP 组件检测与一键安装**（对齐 yt-dlp 模式）：设置页「工具与登录」新增 UMP 组件状态行——`未安装` / `补丁缺失` / `0.4.3 · 就绪`；未就绪时提供「安装」/「修复补丁」按钮（pip 安装 yt-dlp-ytse==0.4.3 + protobug==1.0.0 并自动应用 6 处兼容补丁，`--trusted-host` 对齐 yt-dlp）；「检查下载引擎」同时刷新两项。
+- **补丁工具 `python/patch_ytse.py`**（随仓库分发）：`check` 输出结构化 JSON（版本/6 项补丁标记/缺失列表）；`patch` 幂等补丁（PO_TOKEN 别名、`_list_formats` 5→4 值、`-ump` 稳定后缀、`__all__` 导出、sabr/ump 的 traverse_obj import），形态与 0.4.3 预期不符时保守失败不写文件。
+- 「YouTube UMP 优先下载」开关下新增提示：组件未就绪时明确告知优先下载不会生效，直接走 yt-dlp。
+
+### 验证
+
+- patch_ytse.py 测试全过（原始 0.4.3 → 6 项补丁应用 → 复检全绿 → 幂等零改动 → 语法有效 → 真实环境 patched=true）。
+- `verify_ump_tool_status` 真实环境通过（ytseVersion 0.4.3 / ytsePatched true）；项目启动回归通过。
+- 待真机：设置页状态行、安装/修复按钮点验。
+
 ## 1.6.10 — 2026-08-03
 
 > 本版为 **YouTube UMP 官方通道下载闭环**（yt-dlp-ytse 插件方案 A）+ **DASH 播放器稳定性两轮优化**（含 MSE 自绘控制条），全部静态/端到端验证与真机验收通过。

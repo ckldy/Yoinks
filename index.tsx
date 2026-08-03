@@ -47,6 +47,7 @@ import {
   extractFirstURL,
   getToolStatus,
   installYtDlp,
+  installYtseComponent,
   mediaPlatformLabel,
   probeMedia,
   probeSafariPublicPlayerFrame,
@@ -241,6 +242,13 @@ function toolLabel(tools: ToolStatus | null): string {
   return `yt-dlp ${tools.ytDlpVersion} · 就绪`
 }
 
+function ytseLabel(tools: ToolStatus | null): string {
+  if (!tools) return "UMP 组件：检测中"
+  if (!tools.ytseVersion) return "UMP 组件：未安装"
+  if (!tools.ytsePatched) return "UMP 组件：补丁缺失"
+  return `UMP 组件 ${tools.ytseVersion} · 就绪`
+}
+
 /**
  * 该 URL/已选格式是否走不依赖 yt-dlp 的下载管线：
  * HLS 原生分片（fetch/curl/ffmpeg）、原生直链（BackgroundURLSession）、抖音匿名下载。
@@ -408,6 +416,7 @@ function View() {
   const [tools, setTools] = useState<ToolStatus | null>(null)
   const [loadingTools, setLoadingTools] = useState(true)
   const [installing, setInstalling] = useState(false)
+  const [installingYtse, setInstallingYtse] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [previewing, setPreviewing] = useState(false)
   const [cancelPath, setCancelPath] = useState<string | null>(null)
@@ -1051,6 +1060,26 @@ function View() {
       setStatus(`安装失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setInstalling(false)
+    }
+  }
+
+  const installYtse = async () => {
+    const name = "UMP 组件"
+    const detail = tools?.ytseVersion
+      ? "检测到 yt-dlp-ytse 已安装但兼容补丁缺失，将重新应用补丁（不重复安装）。"
+      : "将安装 yt-dlp-ytse 0.4.3 + protobug（YouTube UMP 官方通道下载组件）并自动应用兼容补丁。"
+    const confirmed = await Dialog.confirm({ title: `安装 ${name}`, message: detail, confirmLabel: "安装", cancelLabel: "取消" })
+    if (!confirmed) return
+    setInstallingYtse(true)
+    setStatus(`正在安装 ${name}...`)
+    try {
+      const result = await installYtseComponent()
+      setStatus(`${name} ${result.version} 已就绪。`)
+      await refreshTools()
+    } catch (error) {
+      setStatus(`安装失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setInstallingYtse(false)
     }
   }
 
@@ -2682,6 +2711,7 @@ return (
               <Text font="caption" foregroundStyle="secondaryLabel">关闭后下载页不再展示最近候选库区域，减少占用；仍可随时重新打开。</Text>
               <Toggle title="YouTube UMP 优先下载" systemImage="bolt.horizontal.circle" value={preferences.umpFirst} onChanged={(value) => updatePreferences({ ...preferences, umpFirst: value })} />
               <Text font="caption" foregroundStyle="secondaryLabel">测试版：YouTube 视频先走 UMP 官方通道（60 秒预算），失败/超时自动回退 yt-dlp 下载。关闭后直接走 yt-dlp。</Text>
+              {!tools?.ytsePatched ? <Text font="caption" foregroundStyle="orange">UMP 组件未就绪（需先在下文「工具与登录」安装/修复），优先下载不会生效，将直接走 yt-dlp。</Text> : null}
             </Section>
             <Section title="自动下载">
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
@@ -2720,6 +2750,18 @@ return (
                 <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>{toolLabel(tools)}</Text>
                 {!tools?.ytDlpVersion ? <Button title={installing ? "安装中" : "安装"} action={() => void install()} disabled={installing || loadingTools} /> : null}
               </HStack>
+              <HStack spacing={10}>
+                <Image systemName={statusIcon(Boolean(tools?.ytseVersion && tools?.ytsePatched))} foregroundStyle={tools?.ytseVersion && tools?.ytsePatched ? "green" : "orange"} />
+                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>{ytseLabel(tools)}</Text>
+                {!(tools?.ytseVersion && tools?.ytsePatched) ? (
+                  <Button
+                    title={installingYtse ? "处理中" : tools?.ytseVersion ? "修复补丁" : "安装"}
+                    action={() => void installYtse()}
+                    disabled={installingYtse || loadingTools || installing}
+                  />
+                ) : null}
+              </HStack>
+              <Text font="caption" foregroundStyle="secondaryLabel">UMP 组件 = yt-dlp-ytse 0.4.3 + protobug + 兼容补丁，是「YouTube UMP 优先下载」的运行时依赖。</Text>
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
               {supportedAuthPlatforms().map((platform) => {
                 const session = platformSessions[platform]
