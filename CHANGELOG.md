@@ -1,5 +1,21 @@
 # 更新日志
 
+## 1.6.13 — 2026-08-04
+
+> UI 全面美化（参照 Pornhub / BMW Companion 的 SwiftUI 原生组件设计语言）+ UMP 组件自愈链（丢失自动恢复）+ UMP 插件迁移到项目目录（yt-dlp `--plugin-dir` 加载，彻底脱离 AppGroup 容器），全部真机验收通过。
+
+### 新功能
+
+- **UI 全面美化**：新增主题系统（`components/theme.ts`，品牌绿 + 动态深浅色）与 8 个共享组件（`components/ui.tsx`：HeroCard / MetricCard / StatTile / StatusPill / ActionPill / IconBadge / EmptyState）；记录页 2×2 统计网格 + 空态；下载页大百分比进度卡、批量队列卡（统计胶囊 + 双操作按钮 + 左滑删除）、链接 HeroCard（无条件显示“从 Safari 导入”入口）、候选库卡片、格式/任务区 ActionPill 化；设置页工具引擎状态卡片化（IconBadge + 就绪/安装胶囊）、Safari 插件状态胶囊、本地存储 3 列统计；日志页胶囊筛选器 + 等级徽章；删除了死代码 `statusIcon`。全部用 SwiftUI 原生组件实现。
+- **UMP 组件自愈链**（组件丢失自动恢复，不再需要手动重复安装）：① 启动/状态检查检测到“组件在但补丁缺”时静默自动重打补丁（幂等、离线、秒级）；② 安装成功后把组件固化到项目 `python/ump-vendor/`（iCloud 持久）+ AppGroup 独立目录双备份，组件丢失时自动从备份恢复；③ 备份也不可用时仅启动时允许联网 pip 补装（60s 缓存 + 并发锁，失败静默回退普通 yt-dlp）。诊断日志输出 `site`/`evidence`（各部件存在性），下次丢失可精确定位被清的是哪部分。
+- **UMP 插件迁移到项目目录**（彻底脱离 AppGroup 容器）：yt-dlp 通过 `--plugin-dir` 从项目 `python/ump-vendor/` 直接加载 yt_dlp_plugins 与 protobug 依赖（一个参数同时解决插件与依赖），App 更新/重装、iOS 清理都不再影响 UMP 组件；插件与补丁随仓库分发，安装版开箱即用；探测/下载命令全部注入插件目录，并清理 ios_system 常驻进程模块缓存（改插件无需重启 App）。
+
+### 验证
+
+- UI：`scripting-ts project "Yoinks"` 启动回归、TS 基线 49 无新增；真机验收通过（含功能回归：全选按钮、历史链接入口恢复）。
+- 自愈：`verify_ump_selfheal`（ensure/backup/双 vendor/restore/复检）全过；`verify_ump_selfheal_restore` 破坏性测试（组件丢失 → 自动恢复 `restored`）通过。
+- 迁移：usersite 清空 UMP 组件后端到端真实下载成功（`MEDIA_DOWNLOADER_PROTOCOL ump`）；sys.path 验证 ytse/protobug 均从项目目录加载；**真机验收通过**（播放 dash.js 有声 + 下载双流 `protocol:["ump"]` 182.98MiB/30s + 合并/相册全成功）。
+
 ## 1.6.12 — 2026-08-04
 
 > 下载可靠性三件套：B站分段下载取消与计数修复 + 下载后台保活（BackgroundKeeper）+ 下载完成通知（仅后台发送、点击通知切回原界面），全部真机验收通过。

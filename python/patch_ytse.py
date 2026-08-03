@@ -35,6 +35,21 @@ def site_packages():
     return None
 
 
+def target_site():
+    """
+    返回插件检测/补丁的目标目录。
+    优先接受 `--dir <path>`（yt-dlp --plugin-dir 项目插件目录，彻底脱离 AppGroup usersite）；
+    未指定时回退到 python site-packages（兼容旧调用）。
+    """
+    args = sys.argv[1:]
+    for i, value in enumerate(args):
+        if value == "--dir" and i + 1 < len(args):
+            d = os.path.abspath(args[i + 1])
+            if os.path.isdir(d):
+                return d
+    return site_packages()
+
+
 def plugin_dir(sp):
     return os.path.join(sp, "yt_dlp_plugins", "extractor") if sp else None
 
@@ -95,20 +110,34 @@ def check_patches(sp):
 
 
 def check():
-    sp = site_packages()
+    sp = target_site()
     if not sp:
         print(json.dumps({"installed": False, "version": None, "patches": {},
-                          "patched": False, "missing": [], "error": "yt_dlp 未安装"}))
+                          "patched": False, "missing": [], "site": None,
+                          "evidence": {}, "error": "yt_dlp 未安装"}))
         return 1
     version = installed_version(sp)
     installed = version is not None
     patches, missing = check_patches(sp)
+    # 取证：各部件存在性（用于诊断“组件丢失”时到底是哪部分被清理）
+    evidence = {
+        "yt_dlp": os.path.isdir(os.path.join(sp, "yt_dlp")),
+        "yt_dlp_dist": any(
+            n.startswith("yt_dlp-") and n.endswith(".dist-info") for n in os.listdir(sp)),
+        "protobug": os.path.isdir(os.path.join(sp, "protobug")),
+        "protobug_dist": os.path.isdir(os.path.join(sp, "protobug-1.0.0.dist-info")),
+        "plugins": os.path.isdir(os.path.join(sp, "yt_dlp_plugins")),
+        "ytse_dist": os.path.isdir(os.path.join(sp, "yt_dlp_ytse-0.4.3.dist-info")),
+        "marker": os.path.isfile(os.path.join(sp, ".yoinks-ump-marker")),
+    }
     print(json.dumps({
         "installed": installed,
         "version": version,
         "patches": patches,
         "patched": installed and len(missing) == 0,
         "missing": missing,
+        "site": sp,
+        "evidence": evidence,
     }))
     return 0
 
@@ -186,7 +215,7 @@ def patch_traverse_import(text):
 
 
 def patch():
-    sp = site_packages()
+    sp = target_site()
     if not sp:
         print(json.dumps({"ok": False, "error": "yt_dlp 未安装"}))
         return 1
@@ -265,12 +294,19 @@ def patch():
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "check"
+    args = sys.argv[1:]
+    mode = args[0] if args else "check"
+    if mode not in ("check", "patch"):
+        # 兼容 `--dir <path> check` 的参数顺序
+        for value in args:
+            if value in ("check", "patch"):
+                mode = value
+                break
     if mode == "check":
         return check()
     if mode == "patch":
         return patch()
-    print(json.dumps({"ok": False, "error": "用法: patch_ytse.py check|patch"}))
+    print(json.dumps({"ok": False, "error": "用法: patch_ytse.py check|patch [--dir <plugin_dir>]"}))
     return 2
 
 

@@ -5,6 +5,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+# ios_system 常驻 python 进程跨命令缓存 sys.modules：清掉 yt_dlp 全家与 protobug，
+# 让 --plugin-dir（项目 UMP 插件目录）每次都被重新扫描并从此加载。
+for _m in list(sys.modules):
+    if _m.startswith('yt_dlp') or _m.startswith('protobug'):
+        del sys.modules[_m]
+
 try:
     from yt_dlp import YoutubeDL
 except ImportError:
@@ -186,12 +192,23 @@ def main() -> None:
     insecure = False
     referer: str | None = None
     user_agent: str | None = None
+    plugin_dirs: list[str] = []
     positional: list[str] = []
     index = 0
     while index < len(args):
         value = args[index]
         if value == "--insecure":
             insecure = True
+        elif value == "--plugin-dir":
+            if index + 1 >= len(args):
+                print(json.dumps({"ok": False, "error": f"missing value for {value}"}))
+                raise SystemExit(2)
+            plugin_dir = args[index + 1]
+            if not Path(plugin_dir).is_dir():
+                print(json.dumps({"ok": False, "error": f"plugin dir not found: {plugin_dir}"}))
+                raise SystemExit(2)
+            plugin_dirs.append(str(Path(plugin_dir).resolve()))
+            index += 1
         elif value in {"--referer", "--user-agent"}:
             if index + 1 >= len(args):
                 print(json.dumps({"ok": False, "error": f"missing value for {value}"}))
@@ -241,6 +258,8 @@ def main() -> None:
         # This device has no JS runtime; use android_vr so YouTube formats do not depend on web nsig decryption.
         "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
     }
+    if plugin_dirs:
+        options["plugin_dirs"] = plugin_dirs
     if cookiefile:
         options["cookiefile"] = cookiefile
     if referer:

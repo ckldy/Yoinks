@@ -1,0 +1,16 @@
+protobug-1.0.0.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+protobug-1.0.0.dist-info/METADATA,sha256=ufSGO7qtDmSZBZAC9g6Heh1MP-11ZeXFqlViYOS_tLU,2295
+protobug-1.0.0.dist-info/RECORD,,
+protobug-1.0.0.dist-info/WHEEL,sha256=QccIxa26bgl1E6uMy58deGWi-0aeIkkangHcxk2kWfw,87
+protobug-1.0.0.dist-info/licenses/LICENSE,sha256=RpmGMkeoIK6CNt_nVqOYS7ueFNrlCDX5cqtsLbIdgYg,1211
+protobug/__init__.py,sha256=NQeEsGyxzSNNBwZKE3hHr2pd_4Ofi3g2I6xh4-i1aYg,1753
+protobug/__pycache__/__init__.cpython-313.pyc,,
+protobug/__pycache__/_core.cpython-313.pyc,,
+protobug/__pycache__/_reader.cpython-313.pyc,,
+protobug/__pycache__/_version.cpython-313.pyc,,
+protobug/__pycache__/_writer.cpython-313.pyc,,
+protobug/_core.py,sha256=gr_jiiCNHd3mmNfC4w11Rn2ULgbNcUoLHx0Ev_cLqPU,11320
+protobug/_reader.py,sha256=J35S2ca8e2Rl1ecye-N1F1y2bcvabkMzP7-8DZQL8mA,9408
+protobug/_version.py,sha256=JAAyU3al4wmBf3BF-Umm1J_GrCIT-yS_yWEGHqKRVHc,520
+protobug/_writer.py,sha256=PhqXzJtVeePLwfgKWfGkht_ra1uYiKZdJ4qZYM5MCx8,6017
+protobug/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0

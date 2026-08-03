@@ -43,6 +43,7 @@ import {
   cancelDownload,
   detectMediaPlatform,
   downloadMedia,
+  ensureYtseComponent,
   extractAllURLs,
   extractFirstURL,
   getToolStatus,
@@ -171,6 +172,16 @@ import {
 import type { DashPlayerService } from "./services/player/dash-player-service"
 import type { HLSPlayerService } from "./services/player/hls-player-service"
 import { DiscoverTab } from "./components/DiscoverTab"
+import { YOINKS_THEME, STATUS_COLORS } from "./components/theme"
+import {
+  ActionPill,
+  EmptyState,
+  HeroCard,
+  IconBadge,
+  MetricCard,
+  StatTile,
+  StatusPill,
+} from "./components/ui"
 
 const HISTORY_TAB = 0
 const DISCOVER_TAB = 1
@@ -238,10 +249,6 @@ function formatDownloadSpeed(speed?: number, eta?: number): string {
   return `${formatBytes(speed)}/s${etaStr}`
 }
 
-function statusIcon(ok: boolean): string {
-  return ok ? "checkmark.circle.fill" : "xmark.circle.fill"
-}
-
 function toolLabel(tools: ToolStatus | null): string {
   if (!tools) return "下载引擎：未就绪"
   if (!tools.ytDlpVersion) return "下载引擎：未安装"
@@ -282,20 +289,31 @@ function LogDetailView({ event }: { event: YoinksLogEvent }) {
   const dismiss = Navigation.useDismiss()
   return (
     <List navigationTitle="日志详情" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
-      <Section header={<Text>事件</Text>}>
-        <VStack alignment="leading" spacing={4} padding={{ vertical: 4 }}>
-          <Text font="headline">{event.event}</Text>
-          <Text font="caption" foregroundStyle="secondaryLabel">{event.timestamp}</Text>
+      <Section header={<Text font="headline">事件</Text>}>
+        <VStack alignment="leading" spacing={6} padding={{ vertical: 4 }}>
+          <HStack spacing={8}>
+            <IconBadge
+              systemName={event.level === "error" ? "xmark.circle.fill" : event.level === "warn" ? "exclamationmark.triangle.fill" : event.level === "debug" ? "ladybug" : "info.circle.fill"}
+              tint={event.level === "error" ? STATUS_COLORS.danger : event.level === "warn" ? STATUS_COLORS.warn : event.level === "debug" ? STATUS_COLORS.idle : STATUS_COLORS.info}
+              size={36}
+            />
+            <VStack alignment="leading" spacing={3}>
+              <Text font="headline">{event.event}</Text>
+              <Text font="caption" foregroundStyle="secondaryLabel">{event.timestamp}</Text>
+            </VStack>
+          </HStack>
           <HStack spacing={6}>
-            <Text font="caption2" foregroundStyle={event.level === "error" ? "red" : event.level === "warn" ? "orange" : event.level === "debug" ? "gray" : "green"}>
-              {event.level.toUpperCase()}
-            </Text>
+            <StatusPill
+              icon={event.level === "error" ? "xmark" : event.level === "warn" ? "exclamationmark" : event.level === "debug" ? "ladybug" : "checkmark"}
+              title={event.level.toUpperCase()}
+              color={event.level === "error" ? STATUS_COLORS.danger : event.level === "warn" ? STATUS_COLORS.warn : event.level === "debug" ? STATUS_COLORS.idle : STATUS_COLORS.ok}
+            />
             {event.taskId ? <Text font="caption2" foregroundStyle="secondaryLabel">{event.taskId}</Text> : null}
           </HStack>
         </VStack>
       </Section>
       {event.details ? (
-        <Section header={<Text>详情</Text>}>
+        <Section header={<Text font="headline">详情</Text>}>
           <Text font="body" foregroundStyle="label">{JSON.stringify(event.details, null, 2)}</Text>
         </Section>
       ) : null}
@@ -307,53 +325,53 @@ function ChangelogView() {
   const dismiss = Navigation.useDismiss()
   return (
     <List navigationTitle="更新内容" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
-      <Section header={<Text>版本 1.4.5 (2026-07-26)</Text>}>
+      <Section header={<Text font="headline">版本 1.4.5 (2026-07-26)</Text>}>
         <Text font="body">• HEVC / AV1 / VP9：下载后仅流拷贝合成 MKV，不再强制转码 H.264</Text>
         <Text font="body">• 格式列表标注「外部播放器 · 容器·MKV」；请用 Infuse / VLC / nPlayer 等打开</Text>
         <Text font="body">• H.264 + AAC 仍合并为 MP4；本机 ffprobe 对硬编码不可靠时改为软验证放行</Text>
       </Section>
-      <Section header={<Text>版本 1.2.0 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.2.0 (2026-07-24)</Text>}>
         <Text font="body">• A：下载进度分段映射 + 阶段清 progress + UI 节流，避免进度回跳与高频刷新</Text>
         <Text font="body">• B：紧凑进度置顶 + 右下浮层取消，下载中可正常滑动列表</Text>
         <Text font="body">• C：m3u8/HLS 经 FFmpeg 直连，失败时 BackgroundURLSession 回退</Text>
       </Section>
-      <Section header={<Text>版本 1.1.10 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.10 (2026-07-24)</Text>}>
         <Text font="body">• 下载中进度置顶，取消与进度始终可见；链接/格式在下方可继续浏览</Text>
       </Section>
-      <Section header={<Text>版本 1.1.9 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.9 (2026-07-24)</Text>}>
         <Text font="body">• 下载页去掉默认保存方式入口，统一在设置中管理</Text>
         <Text font="body">• 下载中文件大小与速度合并为一行</Text>
       </Section>
-      <Section header={<Text>版本 1.1.8 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.8 (2026-07-24)</Text>}>
         <Text font="body">• 去掉下载页底部空白区块，列表末尾不再多一截空页</Text>
       </Section>
-      <Section header={<Text>版本 1.1.7 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.7 (2026-07-24)</Text>}>
         <Text font="body">• 下载进度保留在任务区；列表底部留白，下载中仍可上滑查看链接/格式</Text>
       </Section>
-      <Section header={<Text>版本 1.1.6 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.6 (2026-07-24)</Text>}>
         <Text font="body">• 下载同分辨率只保留一路并优先 H.264，减少 AV1 导致的验证失败</Text>
         <Text font="body">• AV1/损坏流验证失败给出可操作提示；格式列表标注编码</Text>
       </Section>
-      <Section header={<Text>版本 1.1.5 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.5 (2026-07-24)</Text>}>
         <Text font="body">• 双流预览优先 H.264 视频轨，避免 AV1/HEVC 黑屏有声</Text>
         <Text font="body">• probe 从 http_headers 回填 Referer；视频轨失败时停掉孤立音频</Text>
       </Section>
-      <Section header={<Text>版本 1.1.4 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.4 (2026-07-24)</Text>}>
         <Text font="body">• 在线预览：DASH 纯视频配对 audioUrl 双流（不整包同步 player skill）</Text>
         <Text font="body">• 关闭预览页不再因 12 秒超时误报「在线预览失败」</Text>
       </Section>
-      <Section header={<Text>版本 1.1.2 (2026-07-24)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.2 (2026-07-24)</Text>}>
         <Text font="body">• 运行日志改为单一 runtime.jsonl（主链里程碑 + warn/error）</Text>
         <Text font="body">• 设置页始终可查看/清空运行日志；临时详细日志约 15 分钟</Text>
         <Text font="body">• 不改变下载与在线预览主链逻辑</Text>
       </Section>
-      <Section header={<Text>版本 1.1.1 (2026-07-22)</Text>}>
+      <Section header={<Text font="headline">版本 1.1.1 (2026-07-22)</Text>}>
         <Text font="body">• 重构在线预览功能，使用 media-player-skill 的 HLSPlayerService</Text>
         <Text font="body">• 移除旧的登录重试流程和下载兜底逻辑</Text>
         <Text font="body">• 完整使用 skill 的 headers/referer/origin/baseUrl 配置</Text>
         <Text font="body">• 诚实降级：Referer/Origin 由 WebView 上下文处理，原生 HLS 回退明确报告 customHeadersApplied: false</Text>
       </Section>
-      <Section header={<Text>版本 1.1.0</Text>}>
+      <Section header={<Text font="headline">版本 1.1.0</Text>}>
         <Text font="body">• 新增三标签页架构：记录 / 下载 / 设置</Text>
         <Text font="body">• 新增偏好设置持久化，自动迁移旧配置</Text>
         <Text font="body">• 新增下载历史记录管理（保留、清理、删除）</Text>
@@ -362,7 +380,7 @@ function ChangelogView() {
         <Text font="body">• 新增 Assistant Tool 只读工具：读取最小运行日志</Text>
         <Text font="body">• 修复抖音标题含 # 导致输出路径被截断的问题</Text>
       </Section>
-      <Section header={<Text>版本 1.0.0</Text>}>
+      <Section header={<Text font="headline">版本 1.0.0</Text>}>
         <Text font="body">• 初始版本：公开媒体链接下载、格式选择、登录重试、TLS 兼容、FFmpeg 合并、媒体验证</Text>
       </Section>
     </List>
@@ -373,7 +391,7 @@ function AboutView() {
   const dismiss = Navigation.useDismiss()
   return (
     <List navigationTitle="关于 Yoinks" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
-      <Section header={<Text>Yoinks for Scripting</Text>}>
+      <Section header={<Text font="headline">Yoinks for Scripting</Text>}>
         <VStack alignment="leading" spacing={8} padding={{ vertical: 8 }}>
           <Text font="headline">Yoinks</Text>
           <Text font="body" foregroundStyle="secondaryLabel">在 Scripting 中复刻 Yoinks 的核心下载体验</Text>
@@ -383,7 +401,7 @@ function AboutView() {
           </HStack>
         </VStack>
       </Section>
-      <Section header={<Text>技术说明</Text>}>
+      <Section header={<Text font="headline">技术说明</Text>}>
         <VStack alignment="leading" spacing={6} padding={{ vertical: 4 }}>
           <Text font="body" foregroundStyle="secondaryLabel">原版 Yoinks 基于 Node.js 生态（npm 依赖、完整 ffmpeg、完整 yt-dlp 等）。</Text>
           <Text font="body" foregroundStyle="secondaryLabel">Scripting 提供的是模拟 Node.js 运行时：</Text>
@@ -394,7 +412,7 @@ function AboutView() {
           <Text font="body" foregroundStyle="secondaryLabel">本项目保留 Yoinks 名称与核心下载体验，针对 Scripting 环境做了适配：使用 yt-dlp 独立二进制 + 内置 ffmpeg（videotoolbox 硬编），探测优先的格式选择、登录/Cookie 重试、结构化日志等均保留。</Text>
         </VStack>
       </Section>
-      <Section header={<Text>致谢</Text>}>
+      <Section header={<Text font="headline">致谢</Text>}>
         <VStack alignment="leading" spacing={6} padding={{ vertical: 4 }}>
           <Text font="body" foregroundStyle="secondaryLabel">上游项目： https://github.com/pablostanley/yoinks/tree/main</Text>
           <Text font="body" foregroundStyle="secondaryLabel">感谢 Pablo Stanley 创作原版 Yoinks。</Text>
@@ -631,6 +649,13 @@ function View() {
 
   useEffect(() => {
     void refreshTools()
+    // UMP 组件自愈：检测到缺失/补丁缺失时自动修复（仅启动允许联网补装；静默失败不影响主流程），
+    // 完成后刷新一次工具状态，让设置页/下载按钮反映最新就绪情况。
+    void ensureYtseComponent({ allowNetworkInstall: true }).then((result: { ok: boolean; action: string }) => {
+      if (result.action !== "ok") {
+        void refreshTools()
+      }
+    })
     setBrowserPlugin(getBrowserPluginStatus())
     void refreshHistory()
     void refreshLoggedInSessions()
@@ -2451,26 +2476,71 @@ function HistoryView() {
           topBarTrailing: <Button title="" systemImage="arrow.clockwise" action={() => void refreshHistory()} />,
         }}
       >
-        <Section header={<Text>{`记录 ${historySummary.totalRecords} 条 · 本地文件 ${historySummary.availableCount} 个`}</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">仅管理 Yoinks 下载目录中的原文件，不会删除相册或文件 App 中的副本。</Text>}>
+        <Section>
+          <HStack spacing={10}>
+            <MetricCard
+              icon="tray.full.fill"
+              title="下载记录"
+              value={`${historySummary.totalRecords}`}
+              subtitle="累计历史记录"
+            />
+            <MetricCard
+              icon="doc.text.fill"
+              title="本地文件"
+              value={`${historySummary.availableCount}`}
+              subtitle="Yoinks 目录原文件"
+              tint={STATUS_COLORS.info}
+            />
+          </HStack>
+          <HStack spacing={10}>
+            <MetricCard
+              icon="internaldrive.fill"
+              title="存储占用"
+              value={formatBytes(historySummary.managedBytes)}
+              subtitle="已管理原文件"
+              tint={STATUS_COLORS.warn}
+            />
+            <MetricCard
+              icon="arrow.down.circle.fill"
+              title="已加载"
+              value={`${history.length}`}
+              subtitle="当前列表条数"
+              tint={YOINKS_THEME.accentHex}
+            />
+          </HStack>
+        </Section>
+        <Section header={<Text font="headline">记录列表</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">仅管理 Yoinks 下载目录中的原文件，不会删除相册或文件 App 中的副本。</Text>}>
           {history.length ? history.map((record) => (
             <Button key={record.id} action={() => void openHistoryActions(record)}>
               <HStack spacing={12}>
-                <Image systemName={record.mediaKind === "audio" ? "music.note" : record.mediaKind === "image" ? "photo" : "play.rectangle"} foregroundStyle={record.mediaKind === "audio" ? "purple" : record.mediaKind === "image" ? "orange" : "blue"} frame={{ width: 24 }} />
+                <IconBadge
+                  systemName={record.mediaKind === "audio" ? "music.note" : record.mediaKind === "image" ? "photo" : "play.rectangle"}
+                  tint={record.mediaKind === "audio" ? "#AF52DE" : record.mediaKind === "image" ? "#FF9F0A" : STATUS_COLORS.info}
+                />
                 <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
                   <Text font="headline" lineLimit={2}>{record.title || record.fileName}</Text>
-                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{record.formatLabel} · {historyAvailability[record.id] ? "本地文件可用" : "文件已清理"}</Text>
-                  <HStack>
-                    <Text font="caption2" foregroundStyle="secondaryLabel">{formatBytes(record.fileSizeBytes)}</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{record.formatLabel}</Text>
+                  <HStack spacing={6}>
+                    <StatusPill
+                      icon={historyAvailability[record.id] ? "checkmark.circle.fill" : "archivebox.fill"}
+                      title={historyAvailability[record.id] ? "本地可用" : "已清理"}
+                      color={historyAvailability[record.id] ? STATUS_COLORS.ok : STATUS_COLORS.idle}
+                    />
                     <Spacer />
-                    <Text font="caption2" foregroundStyle="secondaryLabel">{formatHistoryDate(record.createdAt)}</Text>
+                    <Text font="caption2" foregroundStyle="secondaryLabel">{formatBytes(record.fileSizeBytes)} · {formatHistoryDate(record.createdAt)}</Text>
                   </HStack>
                 </VStack>
               </HStack>
             </Button>
-          )) : <Text foregroundStyle="secondaryLabel">尚无下载记录。</Text>}
+          )) : (
+            <EmptyState icon="tray" title="尚无下载记录" message="完成下载后，记录会显示在这里。可在设置中管理保留策略。" />
+          )}
         </Section>
-        <Section title="存储">
-          <Text foregroundStyle="secondaryLabel">已管理 {formatBytes(historySummary.managedBytes)}</Text>
+        <Section header={<Text font="headline">存储</Text>}>
+          <HStack spacing={10}>
+            <Image systemName="internaldrive.fill" foregroundStyle={STATUS_COLORS.warn as any} />
+            <Text>已管理 {formatBytes(historySummary.managedBytes)}</Text>
+          </HStack>
           <Button title="清空下载记录和原文件" systemImage="trash" role="destructive" action={() => void clearHistory()} disabled={!history.length} />
         </Section>
       </List>
@@ -2489,20 +2559,34 @@ function DownloadView() {
           topBarTrailing: <Button title="" systemImage="plus" action={() => void chooseLinkSource()} disabled={enteringURL || analyzing || (downloading && !batchQueue.running)} />,
         }}
       >
-        {/* B: 紧凑进度置顶；取消改右下浮层，避免占 List 行程 */}
+        {/* 下载中：进度大卡置顶（百分比 + 阶段 + 速度） */}
         {downloading ? (
           <Section
-            header={<Text>{batchQueue.running ? "批量下载中" : "下载中"}</Text>}
+            header={
+              <HStack>
+                <Text font="headline">{batchQueue.running ? "批量下载中" : "下载中"}</Text>
+                <Spacer />
+                <StatusPill
+                  icon="arrow.down.circle.fill"
+                  title={`${Math.round(progress.fraction * 100)}%`}
+                  color={YOINKS_THEME.accentHex}
+                />
+              </HStack>
+            }
             footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}
           >
-            <VStack alignment="leading" spacing={6} padding={{ vertical: 2 }}>
-              <HStack>
-                <Text font="subheadline" lineLimit={1}>{progress.stage}</Text>
+            <VStack alignment="leading" spacing={10} padding={{ vertical: 4 }}>
+              <HStack alignment="center">
+                <Text font={44} fontWeight="bold" foregroundStyle={YOINKS_THEME.accent as any} minScaleFactor={0.6}>
+                  {Math.round(progress.fraction * 100)}%
+                </Text>
                 <Spacer />
-                <Text font="caption" foregroundStyle="secondaryLabel">{Math.round(progress.fraction * 100)}%</Text>
+                <VStack alignment="trailing" spacing={3}>
+                  <Text font="subheadline" lineLimit={1}>{progress.stage}</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${formatDownloadBytes(progress.downloadedBytes, progress.totalBytes)} · ${formatDownloadSpeed(progress.speed, progress.eta)}`}</Text>
+                </VStack>
               </HStack>
               <ProgressView value={progress.fraction} />
-              <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${formatDownloadBytes(progress.downloadedBytes, progress.totalBytes)} · ${formatDownloadSpeed(progress.speed, progress.eta)}`}</Text>
             </VStack>
           </Section>
         ) : null}
@@ -2515,38 +2599,41 @@ function DownloadView() {
           const retryable = counts.failed + counts.cancelled
           const finished = counts.completed + counts.cancelled
           const rows = displayBatchItems(batchQueue.items)
+          const queueTone = counts.failed > 0 ? STATUS_COLORS.danger : counts.active > 0 ? STATUS_COLORS.info : counts.completed > 0 ? STATUS_COLORS.ok : STATUS_COLORS.idle
           return (
             <Section
-              header={<Text>{formatBatchHeader(counts)}</Text>}
-              footer={<Text font="caption" foregroundStyle="secondaryLabel">「从剪贴板添加」直接入队不弹确认；左滑可删除。点条目可播放/分享。</Text>}
+              header={
+                <HStack>
+                  <Text font="headline">批量队列</Text>
+                  <Spacer />
+                  <StatusPill icon="list.bullet" title={`${counts.total} 条`} color={queueTone} />
+                </HStack>
+              }
+              footer={<Text font="caption" foregroundStyle="secondaryLabel">{formatBatchHeader(counts)}。从剪贴板添加直接入队不弹确认；左滑可删除。点条目可播放/分享。</Text>}
             >
-              <Button
-                title="从剪贴板添加"
-                systemImage="doc.on.clipboard"
-                action={() => void quickEnqueueFromClipboard()}
-                disabled={enteringURL || analyzing}
-              />
-              <Button
-                title={`统一格式：${formatLabel}`}
-                systemImage="slider.horizontal.3"
-                action={() => void chooseBatchFormatStrategy()}
-                disabled={batchQueue.running || analyzing}
-              />
-              <Button
+              <HStack spacing={8}>
+                <ActionPill title="从剪贴板添加" systemImage="doc.on.clipboard" action={() => void quickEnqueueFromClipboard()} disabled={enteringURL || analyzing} />
+                <ActionPill title={`统一格式：${formatLabel}`} systemImage="slider.horizontal.3" tone="secondary" action={() => void chooseBatchFormatStrategy()} disabled={batchQueue.running || analyzing} />
+              </HStack>
+              <ActionPill
                 title={batchQueue.running ? "停止整批" : "开始批量下载"}
                 systemImage={batchQueue.running ? "stop.circle" : "arrow.down.circle.fill"}
                 action={() => void startBatchDownload()}
                 disabled={batchQueue.running ? false : (analyzing || downloading || !counts.pending)}
               />
               {retryable > 0 && !batchQueue.running ? (
-                <Button title={`重试失败/取消（${retryable}）`} systemImage="arrow.clockwise" action={retryBatchFailed} />
+                <ActionPill title={`重试失败/取消（${retryable}）`} systemImage="arrow.clockwise" tone="secondary" action={retryBatchFailed} />
               ) : null}
               {finished > 0 ? (
-                <Button title={`清理已结束（${finished}）`} systemImage="checkmark.circle" action={clearBatchFinished} disabled={batchQueue.running} />
+                <ActionPill title={`清理已结束（${finished}）`} systemImage="checkmark.circle" tone="secondary" action={clearBatchFinished} disabled={batchQueue.running} />
               ) : null}
               <Button title="清空队列" systemImage="trash" role="destructive" action={() => void clearBatchAll()} disabled={batchQueue.running} />
               {rows.map((item) => {
                 const canSwipeDelete = item.status !== "probing" && item.status !== "downloading"
+                const rowTint = item.status === "failed" ? STATUS_COLORS.danger
+                  : item.status === "completed" ? STATUS_COLORS.ok
+                    : item.status === "downloading" || item.status === "probing" ? STATUS_COLORS.info
+                      : STATUS_COLORS.idle
                 return (
                   <HStack
                     key={item.id}
@@ -2564,16 +2651,7 @@ function DownloadView() {
                   >
                     <Button action={() => void openBatchItemActions(item)} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
                       <HStack spacing={12}>
-                        <Image
-                          systemName={batchStatusIcon(item.status)}
-                          foregroundStyle={
-                            item.status === "failed" ? "red"
-                              : item.status === "completed" ? "green"
-                                : item.status === "downloading" || item.status === "probing" ? "blue"
-                                  : "secondaryLabel"
-                          }
-                          frame={{ width: 22 }}
-                        />
+                        <IconBadge systemName={batchStatusIcon(item.status)} tint={rowTint} size={32} />
                         <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
                           <Text font="subheadline" lineLimit={2}>{batchItemTitle(item)}</Text>
                           <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={2}>{batchItemSubtitle(item)}</Text>
@@ -2587,46 +2665,106 @@ function DownloadView() {
           )
         })() : null}
 
-        <Section title="当前链接">
-          <VStack alignment="leading" spacing={5}>
-            <Text foregroundStyle={url ? "label" : "secondaryLabel"} lineLimit={3}>{url || "从剪贴板粘贴或手动添加公开媒体链接。"}</Text>
-            {mediaPlatformLabel(url) ? <Text font="caption" foregroundStyle="secondaryLabel">来源：{mediaPlatformLabel(url)}</Text> : null}
-          </VStack>
-          {!url ? <Button title="添加媒体链接" systemImage="plus.circle" action={() => void chooseLinkSource()} disabled={enteringURL || analyzing || (downloading && !batchQueue.running)} /> : null}
-          <Button title="从 Safari 导入媒体候选" systemImage="safari" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
-           <Button title="历史链接" systemImage="clock.arrow.circlepath" action={() => void chooseRecentLink()} disabled={!recentLinks.length || analyzing || analysisDraining || downloading || batchQueue.running} />
-          {analyzing ? <Button title="停止分析" systemImage="stop.circle" role="destructive" action={() => void stopAnalysis()} /> : null}
-          {url ? <Button title={analysisDraining ? "正在停止分析……" : analyzing ? "分析中……" : "重新分析链接"} systemImage="waveform.path.ecg" action={() => void analyzeMedia()} disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || analysisDraining || downloading || batchQueue.running} /> : null}
-          {url ? <Button title="清除链接" systemImage="xmark.circle" role="destructive" action={clearCurrentLink} disabled={analyzing || analysisDraining || downloading || batchQueue.running} /> : null}
+        <Section>
+          <HeroCard
+            eyebrow={url ? (mediaPlatformLabel(url) ? `来源：${mediaPlatformLabel(url)}` : "媒体链接") : undefined}
+            title={url || "粘贴一个公开媒体链接"}
+            subtitle={url ? status : "支持抖音 / B站 / YouTube / 小红书等公开链接，也可从 Safari 导入候选。"}
+            tone={url ? "primary" : "soft"}
+            actions={
+              url ? (
+                <HStack spacing={YOINKS_THEME.layout.compact} frame={{ maxWidth: "infinity" }}>
+                  <ActionPill
+                    title={analysisDraining ? "正在停止分析……" : analyzing ? "分析中……" : "重新分析"}
+                    systemImage="waveform.path.ecg"
+                    action={() => void analyzeMedia()}
+                    disabled={(detectMediaPlatform(url) !== "douyin" && !tools?.ytDlpVersion) || analyzing || analysisDraining || downloading || batchQueue.running}
+                  />
+                  <ActionPill
+                    title="清除"
+                    systemImage="xmark.circle"
+                    tone="danger"
+                    action={clearCurrentLink}
+                    disabled={analyzing || analysisDraining || downloading || batchQueue.running}
+                  />
+                </HStack>
+              ) : (
+                <HStack spacing={YOINKS_THEME.layout.compact} frame={{ maxWidth: "infinity" }}>
+                  <ActionPill
+                    title="添加媒体链接"
+                    systemImage="plus.circle"
+                    action={() => void chooseLinkSource()}
+                    disabled={enteringURL || analyzing || (downloading && !batchQueue.running)}
+                  />
+                </HStack>
+              )
+            }
+          />
+          <HStack spacing={YOINKS_THEME.layout.compact} frame={{ maxWidth: "infinity" }}>
+            <ActionPill
+              title="从 Safari 导入媒体候选"
+              systemImage="safari"
+              tone="secondary"
+              action={() => void importSafariMediaCandidate()}
+              disabled={analyzing || analysisDraining || downloading || batchQueue.running}
+            />
+            <ActionPill
+              title="历史链接"
+              systemImage="clock.arrow.circlepath"
+              tone="secondary"
+              action={() => void chooseRecentLink()}
+              disabled={!recentLinks.length || analyzing || analysisDraining || downloading || batchQueue.running}
+            />
+          </HStack>
+          {analyzing ? <ActionPill title="停止分析" systemImage="stop.circle" tone="danger" action={() => void stopAnalysis()} /> : null}
         </Section>
 
-        {preferences.showRecentCandidates && mediaCandidates.length ? <Section title="最近候选库">
-          <Button title={`筛选：${mediaCandidateFilter === "all" ? "全部" : mediaCandidateFilter === "recommended" ? "推荐" : mediaCandidateFilter.toUpperCase()}`} systemImage="line.3.horizontal.decrease.circle" action={() => void (async () => { const filters: MediaCandidateFilter[] = ["all", "recommended", "hls", "dash", "video", "audio", "page"]; const selected = await Dialog.actionSheet({ title: "筛选候选", actions: filters.map(filter => ({ label: filter === "all" ? "全部" : filter === "recommended" ? "推荐" : filter.toUpperCase() })), cancelButton: true }); if (selected != null) setMediaCandidateFilter(filters[selected]) })()} disabled={analyzing || downloading} />
-          <Button title="读取 Safari 最新采集" systemImage="arrow.clockwise" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
-          <Button title="清空候选" systemImage="trash" role="destructive" action={() => void (async () => { if (await Dialog.confirm({ title: "清空最近候选", message: "这不会删除下载记录或文件。", confirmLabel: "清空", cancelLabel: "取消" })) { clearMediaCandidates(); setMediaCandidates([]) } })()} disabled={analyzing || downloading} />
-          {(showAllMediaCandidates ? filterMediaCandidates(mediaCandidates, mediaCandidateFilter) : filterMediaCandidates(mediaCandidates, mediaCandidateFilter).slice(0, 3)).map((candidate) => <Button key={candidate.id} title={`${candidate.source === "safari" ? "Safari" : candidate.source === "discover" ? "发现" : "手动"} · ${candidate.kind || "页面"} · ${candidate.qualityHint || candidate.containerHint || candidate.title || new URL(candidate.url).host}`} systemImage="info.circle" action={() => void (async () => { const safariOnly = candidate.source === "safari"; const confirmed = await Dialog.confirm({ title: candidate.title || new URL(candidate.url).host, message: `类型：${candidate.kind || "未知"}\n采集来源：${candidate.captureSource || (safariOnly ? "未知" : "不适用")}\n质量：${candidateDetailValue(candidate.qualityHint, safariOnly)}\n容器：${candidateDetailValue(candidate.containerHint, safariOnly)}\n编码/音轨/大小：${candidateDetailValue(undefined, safariOnly)}\n\n仅在确认后分析此候选。`, confirmLabel: "导入并分析", cancelLabel: "取消" }); if (!confirmed) return; if (safariOnly && candidate.pageURL && candidate.kind) { await analyzeSafariCandidate({ id: candidate.id, url: candidate.url, kind: candidate.kind === "page" ? "inferred" : candidate.kind, pageURL: candidate.pageURL, pageTitle: candidate.title, discoveredAt: candidate.createdAt, captureSource: candidate.captureSource }); return } safariCandidateURLRef.current = safariOnly ? candidate.url : null; safariCandidateRefererRef.current = safariOnly ? safariPageReferer(candidate.pageURL) || null : null; safariCandidateMediaKindRef.current = safariCandidateNeedsTitleAlignment(candidate) ? "video" : null; safariCandidateTitleRef.current = safariCandidateNeedsTitleAlignment(candidate) ? candidate.title || null : null; setURL(candidate.url); setProbe(null); setSelectedChoice(null); setStatus("正在分析候选库项目。"); await analyzeMedia(candidate.url) })()} disabled={analyzing || downloading || batchQueue.running} />)}
-           {!showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title={`展开其他 ${filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length - 3} 条`} systemImage="chevron.down" action={() => setShowAllMediaCandidates(true)} disabled={analyzing || downloading} /> : null}
-           {showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <Button title="收起较早候选" systemImage="chevron.up" action={() => setShowAllMediaCandidates(false)} disabled={analyzing || downloading} /> : null}
+        {preferences.showRecentCandidates && mediaCandidates.length ? <Section
+          header={
+            <HStack>
+              <Text font="headline">最近候选库</Text>
+              <Spacer />
+              <StatusPill icon="clock.arrow.circlepath" title={`${mediaCandidates.length} 条`} color={STATUS_COLORS.info} />
+            </HStack>
+          }
+        >
+          <HStack spacing={8}>
+            <ActionPill title={`筛选：${mediaCandidateFilter === "all" ? "全部" : mediaCandidateFilter === "recommended" ? "推荐" : mediaCandidateFilter.toUpperCase()}`} systemImage="line.3.horizontal.decrease.circle" tone="secondary" action={() => void (async () => { const filters: MediaCandidateFilter[] = ["all", "recommended", "hls", "dash", "video", "audio", "page"]; const selected = await Dialog.actionSheet({ title: "筛选候选", actions: filters.map(filter => ({ label: filter === "all" ? "全部" : filter === "recommended" ? "推荐" : filter.toUpperCase() })), cancelButton: true }); if (selected != null) setMediaCandidateFilter(filters[selected]) })()} disabled={analyzing || downloading} />
+            <ActionPill title="读取 Safari 最新采集" systemImage="arrow.clockwise" tone="secondary" action={() => void importSafariMediaCandidate()} disabled={analyzing || analysisDraining || downloading || batchQueue.running} />
+          </HStack>
+          <ActionPill title="清空候选" systemImage="trash" tone="danger" action={() => void (async () => { if (await Dialog.confirm({ title: "清空最近候选", message: "这不会删除下载记录或文件。", confirmLabel: "清空", cancelLabel: "取消" })) { clearMediaCandidates(); setMediaCandidates([]) } })()} disabled={analyzing || downloading} />
+          {(showAllMediaCandidates ? filterMediaCandidates(mediaCandidates, mediaCandidateFilter) : filterMediaCandidates(mediaCandidates, mediaCandidateFilter).slice(0, 3)).map((candidate) => <Button key={candidate.id} action={() => void (async () => { const safariOnly = candidate.source === "safari"; const confirmed = await Dialog.confirm({ title: candidate.title || new URL(candidate.url).host, message: `类型：${candidate.kind || "未知"}\n采集来源：${candidate.captureSource || (safariOnly ? "未知" : "不适用")}\n质量：${candidateDetailValue(candidate.qualityHint, safariOnly)}\n容器：${candidateDetailValue(candidate.containerHint, safariOnly)}\n编码/音轨/大小：${candidateDetailValue(undefined, safariOnly)}\n\n仅在确认后分析此候选。`, confirmLabel: "导入并分析", cancelLabel: "取消" }); if (!confirmed) return; if (safariOnly && candidate.pageURL && candidate.kind) { await analyzeSafariCandidate({ id: candidate.id, url: candidate.url, kind: candidate.kind === "page" ? "inferred" : candidate.kind, pageURL: candidate.pageURL, pageTitle: candidate.title, discoveredAt: candidate.createdAt, captureSource: candidate.captureSource }); return } safariCandidateURLRef.current = safariOnly ? candidate.url : null; safariCandidateRefererRef.current = safariOnly ? safariPageReferer(candidate.pageURL) || null : null; safariCandidateMediaKindRef.current = safariCandidateNeedsTitleAlignment(candidate) ? "video" : null; safariCandidateTitleRef.current = safariCandidateNeedsTitleAlignment(candidate) ? candidate.title || null : null; setURL(candidate.url); setProbe(null); setSelectedChoice(null); setStatus("正在分析候选库项目。"); await analyzeMedia(candidate.url) })()} disabled={analyzing || downloading || batchQueue.running}>
+            <HStack spacing={12}>
+              <IconBadge systemName={candidate.kind === "page" ? "safari" : candidate.kind === "hls" ? "rectangle.stack" : candidate.kind === "audio" ? "music.note" : "play.rectangle"} tint={candidate.source === "safari" ? STATUS_COLORS.info : YOINKS_THEME.accentHex} size={32} />
+              <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                <Text font="subheadline" lineLimit={2}>{candidate.title || new URL(candidate.url).host}</Text>
+                <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{`${candidate.source === "safari" ? "Safari" : candidate.source === "discover" ? "发现" : "手动"} · ${candidate.kind || "页面"} · ${candidate.qualityHint || candidate.containerHint || "未知质量"}`}</Text>
+              </VStack>
+              <Image systemName="chevron.right" font="caption" foregroundStyle="tertiaryLabel" />
+            </HStack>
+          </Button>)}
+           {!showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <ActionPill title={`展开其他 ${filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length - 3} 条`} systemImage="chevron.down" tone="secondary" action={() => setShowAllMediaCandidates(true)} disabled={analyzing || downloading} /> : null}
+           {showAllMediaCandidates && filterMediaCandidates(mediaCandidates, mediaCandidateFilter).length > 3 ? <ActionPill title="收起较早候选" systemImage="chevron.up" tone="secondary" action={() => setShowAllMediaCandidates(false)} disabled={analyzing || downloading} /> : null}
          </Section> : null}
 
-        <Section title="格式">
+        <Section header={<Text font="headline">格式</Text>}>
           {!probe ? <Text foregroundStyle="secondaryLabel">添加链接后将自动识别可下载格式。</Text> : (
             <>
-              <VStack alignment="leading" spacing={3}>
+              <VStack alignment="leading" spacing={3} padding={{ vertical: 2 }}>
                 <Text font="headline" lineLimit={2}>{probe.title}</Text>
                 {probe.uploader ? <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{probe.uploader}</Text> : null}
               </VStack>
-              <Button title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing || batchQueue.running} />
-              <Button title={previewing ? "正在打开预览……" : "在线预览"} systemImage="play.circle" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || previewing || downloading || analyzing || batchQueue.running} />
+              <ActionPill title={selectedChoice?.label || "选择格式"} systemImage={selectedChoice?.kind === "audio" ? "music.note" : selectedChoice?.kind === "image" ? "photo" : "play.rectangle"} action={() => void chooseFormat()} disabled={downloading || analyzing || batchQueue.running} />
+              <ActionPill title={previewing ? "正在打开预览……" : "在线预览"} systemImage="play.circle" tone="secondary" action={() => void previewSelectedChoice()} disabled={!selectedChoice?.previewURL || previewing || downloading || analyzing || batchQueue.running} />
             </>
           )}
         </Section>
 
         {!downloading ? (
-          <Section header={<Text>任务</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
-            <Button title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (!tools?.ytDlpVersion && !canDownloadWithoutYtDlp(url, selectedChoice)) || installing || !selectedChoice || analyzing || batchQueue.running} />
-            {result && completedSaveMode && completedSaveMode !== "ask" ? <Button title="播放" systemImage="play.circle" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
-            {result ? <Button title="分享" systemImage="square.and.arrow.up" action={() => void ShareSheet.present([result.filePath])} /> : null}
+          <Section header={<Text font="headline">任务</Text>} footer={<Text font="caption" foregroundStyle="secondaryLabel">{status}</Text>}>
+            <ActionPill title="开始下载" systemImage="arrow.down.circle.fill" action={() => void startDownload()} disabled={!url || (!tools?.ytDlpVersion && !canDownloadWithoutYtDlp(url, selectedChoice)) || installing || !selectedChoice || analyzing || batchQueue.running} />
+            {result && completedSaveMode && completedSaveMode !== "ask" ? <ActionPill title="播放" systemImage="play.circle" tone="secondary" action={() => void QuickLook.previewURLs([result.filePath], true)} /> : null}
+            {result ? <ActionPill title="分享" systemImage="square.and.arrow.up" tone="secondary" action={() => void ShareSheet.present([result.filePath])} /> : null}
           </Section>
         ) : null}
       </List>
@@ -2659,27 +2797,45 @@ function DownloadView() {
 
     return (
       <List navigationTitle="运行日志" navigationBarTitleDisplayMode="inline" toolbar={{ cancellationAction: <Button title="关闭" action={dismiss} /> }}>
-        <Section>
+        <Section header={<Text font="headline">筛选</Text>}>
           <HStack spacing={8}>
-            <Text font="caption" foregroundStyle="secondaryLabel">筛选：</Text>
-            {["all", "info", "warn", "error"].map((f) => (
-              <Button key={f} title={f === "all" ? "全部" : f} action={() => { setFilter(f as LogFilter); loadPage(); }} disabled={filter === f} />
-            ))}
+            {["all", "info", "warn", "error"].map((f) => {
+              const active = filter === f
+              const color = f === "error" ? STATUS_COLORS.danger : f === "warn" ? STATUS_COLORS.warn : f === "info" ? STATUS_COLORS.info : STATUS_COLORS.idle
+              return (
+                <Button key={f} buttonStyle="plain" action={() => { setFilter(f as LogFilter); loadPage(); }} disabled={active}>
+                  <HStack
+                    spacing={5}
+                    padding={{ horizontal: 12, vertical: 6 }}
+                    background={active ? `${color}26` as any : YOINKS_THEME.surface.actionPillBackground}
+                    clipShape={{ type: "capsule", style: "continuous" }}
+                  >
+                    <Text font="caption" fontWeight="semibold" foregroundStyle={active ? color as any : "secondaryLabel"}>
+                      {f === "all" ? "全部" : f.toUpperCase()}
+                    </Text>
+                  </HStack>
+                </Button>
+              )
+            })}
           </HStack>
         </Section>
-        <Section header={<Text>{page ? `显示 ${page.events.length} 条 / 共 ${page.totalMatching} 条` : "加载中..."}</Text>}>
+        <Section header={<Text font="headline">{page ? `显示 ${page.events.length} 条 / 共 ${page.totalMatching} 条` : "加载中..."}</Text>}>
           {page?.events.map((event) => (
             <Button key={event.timestamp + event.event} action={() => void Navigation.present({ element: <LogDetailView event={event} /> })}>
-              <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
-                <HStack spacing={6}>
-                  <Text font="subheadline">{event.event}</Text>
-                  <Text font="caption2" foregroundStyle={event.level === "error" ? "red" : event.level === "warn" ? "orange" : event.level === "debug" ? "gray" : "green"}>
-                    {event.level.toUpperCase()}
-                  </Text>
-                  {event.taskId ? <Text font="caption2" foregroundStyle="secondaryLabel">{event.taskId}</Text> : null}
-                </HStack>
-                <Text font="caption2" foregroundStyle="tertiaryLabel">{event.timestamp}</Text>
-              </VStack>
+              <HStack spacing={12}>
+                <IconBadge
+                  systemName={event.level === "error" ? "xmark.circle.fill" : event.level === "warn" ? "exclamationmark.triangle.fill" : event.level === "debug" ? "ladybug" : "info.circle.fill"}
+                  tint={event.level === "error" ? STATUS_COLORS.danger : event.level === "warn" ? STATUS_COLORS.warn : event.level === "debug" ? STATUS_COLORS.idle : STATUS_COLORS.info}
+                  size={32}
+                />
+                <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                  <HStack spacing={6}>
+                    <Text font="subheadline">{event.event}</Text>
+                    {event.taskId ? <Text font="caption2" foregroundStyle="secondaryLabel">{event.taskId}</Text> : null}
+                  </HStack>
+                  <Text font="caption2" foregroundStyle="tertiaryLabel">{event.timestamp}</Text>
+                </VStack>
+              </HStack>
             </Button>
           ))}
           {page?.hasMore && !loading && (
@@ -2719,7 +2875,7 @@ return (
             navigationBarTitleDisplayMode="inline"
             toolbar={{ cancellationAction: <Button title="关闭" action={closeYoinks} /> }}
           >
-            <Section title="下载偏好">
+            <Section header={<Text font="headline">下载偏好</Text>}>
               <Button title={`默认保存方式：${SAVE_LABELS[saveMode]}`} systemImage="square.and.arrow.down" action={() => void chooseSaveMode()} disabled={downloading || analyzing} />
               <Button title={`下载并发：${CONCURRENCY_LABELS[concurrentFragments]}`} systemImage="arrow.triangle.2.circlepath" action={() => void chooseConcurrency()} disabled={downloading || analyzing} />
               <Button title={`在线预览：${PREVIEW_AUTOPLAY_LABELS[preferences.previewAutoplayMode]}`} systemImage="play.circle" action={() => void choosePreviewAutoplayMode()} disabled={downloading || analyzing} />
@@ -2731,11 +2887,11 @@ return (
               <Toggle title="后台下载完成通知" systemImage="bell.badge" value={preferences.notifyDownloadComplete} onChanged={(value) => updatePreferences({ ...preferences, notifyDownloadComplete: value })} />
               <Text font="caption" foregroundStyle="secondaryLabel">下载在 App 处于后台时完成（或失败），发送本地通知提示；前台不通知。需在系统设置中允许 Scripting 的通知权限。</Text>
             </Section>
-            <Section title="自动下载">
+            <Section header={<Text font="headline">自动下载</Text>}>
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
               <Text font="caption" foregroundStyle="secondaryLabel">启动进入下载页时会自动分析剪贴板中的公开链接。自动下载默认关闭。格式默认见下方「批量下载」。</Text>
             </Section>
-            <Section title="批量下载">
+            <Section header={<Text font="headline">批量下载</Text>}>
               <Button
                 title={`统一格式：${AUTOMATIC_DOWNLOAD_FORMAT_LABELS[preferences.automaticDownloadFormatStrategy]}`}
                 systemImage="slider.horizontal.3"
@@ -2752,33 +2908,58 @@ return (
               ) : null}
               <Text font="caption" foregroundStyle="secondaryLabel">新建或空闲队列使用此默认；队列内「统一格式」只改本批，批量进行中改设置不影响当前批次。</Text>
             </Section>
-            <Section title="本地存储">
+            <Section header={<Text font="headline">本地存储</Text>}>
               <Text font="caption" foregroundStyle="secondaryLabel">自动清理优先删除最早的 Yoinks 原文件和对应记录。</Text>
+              <HStack spacing={8}>
+                <StatTile title="文件" value={`${historySummary.availableCount}`} icon="doc.text.fill" />
+                <StatTile title="占用" value={formatBytes(historySummary.managedBytes)} icon="internaldrive.fill" />
+                <StatTile title="缓存" value={downloadCacheBytes == null ? "…" : formatBytes(downloadCacheBytes)} icon="archivebox.fill" />
+              </HStack>
               <Toggle title="保留原文件" systemImage="internaldrive" value={preferences.retainOriginalFiles} onChanged={(value) => void changeRetention(value)} />
-              <Text foregroundStyle="secondaryLabel">当前：{historySummary.availableCount} 个文件 · {formatBytes(historySummary.managedBytes)}</Text>
               <Button title={`本地文件上限：${preferences.maxManagedBytes == null ? "不限" : formatBytes(preferences.maxManagedBytes)}`} systemImage="externaldrive" action={() => void chooseManagedBytes()} />
               <Button title={`下载记录上限：${preferences.maxHistoryRecords == null ? "不限" : `${preferences.maxHistoryRecords} 条`}`} systemImage="list.number" action={() => void chooseHistoryLimit()} />
-              <Text foregroundStyle="secondaryLabel">下载缓存：{downloadCacheBytes == null ? "…" : formatBytes(downloadCacheBytes)}（失败/中断任务的临时分片与工作文件）</Text>
               <Button title={cacheClearing ? "正在清理…" : "清理下载缓存"} systemImage="trash" action={() => void clearDownloadCacheNow()} disabled={downloading || analyzing || cacheClearing} />
               <Text font="caption" foregroundStyle="secondaryLabel">删除 tmp 下非正在运行任务的临时目录与取消标记，不影响已下载文件；正在下载的任务目录会被跳过。</Text>
             </Section>
-            <Section title="工具与登录">
-              <HStack spacing={10}>
-                <Image systemName={statusIcon(Boolean(tools?.ytDlpVersion))} foregroundStyle={tools?.ytDlpVersion ? "green" : "orange"} />
-                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>{toolLabel(tools)}</Text>
-                {!tools?.ytDlpVersion ? <Button title={installing ? "安装中" : "安装"} action={() => void install()} disabled={installing || loadingTools} /> : null}
-              </HStack>
-              <HStack spacing={10}>
-                <Image systemName={statusIcon(Boolean(tools?.ytseVersion && tools?.ytsePatched))} foregroundStyle={tools?.ytseVersion && tools?.ytsePatched ? "green" : "orange"} />
-                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>{ytseLabel(tools)}</Text>
-                {!(tools?.ytseVersion && tools?.ytsePatched) ? (
-                  <Button
-                    title={installingYtse ? "处理中" : tools?.ytseVersion ? "修复补丁" : "安装"}
-                    action={() => void installYtse()}
-                    disabled={installingYtse || loadingTools || installing}
+            <Section header={<Text font="headline">工具与登录</Text>}>
+              <VStack alignment="leading" spacing={12} padding={{ vertical: 6 }}>
+                <HStack spacing={12}>
+                  <IconBadge
+                    systemName={tools?.ytDlpVersion ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"}
+                    tint={tools?.ytDlpVersion ? STATUS_COLORS.ok : STATUS_COLORS.warn}
                   />
-                ) : null}
-              </HStack>
+                  <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                    <Text font="subheadline" fontWeight="semibold">下载引擎</Text>
+                    <Text font="caption" foregroundStyle="secondaryLabel">{toolLabel(tools)}</Text>
+                  </VStack>
+                  <Spacer />
+                  {!tools?.ytDlpVersion ? (
+                    <Button title={installing ? "安装中" : "安装"} action={() => void install()} disabled={installing || loadingTools} />
+                  ) : (
+                    <StatusPill icon="checkmark.circle.fill" title="就绪" color={STATUS_COLORS.ok} />
+                  )}
+                </HStack>
+                <HStack spacing={12}>
+                  <IconBadge
+                    systemName={tools?.ytseVersion && tools?.ytsePatched ? "checkmark.seal.fill" : "wrench.and.screwdriver.fill"}
+                    tint={tools?.ytseVersion && tools?.ytsePatched ? STATUS_COLORS.ok : STATUS_COLORS.warn}
+                  />
+                  <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                    <Text font="subheadline" fontWeight="semibold">UMP 组件</Text>
+                    <Text font="caption" foregroundStyle="secondaryLabel">{ytseLabel(tools)}</Text>
+                  </VStack>
+                  <Spacer />
+                  {!(tools?.ytseVersion && tools?.ytsePatched) ? (
+                    <Button
+                      title={installingYtse ? "处理中" : tools?.ytseVersion ? "修复补丁" : "安装"}
+                      action={() => void installYtse()}
+                      disabled={installingYtse || loadingTools || installing}
+                    />
+                  ) : (
+                    <StatusPill icon="checkmark.circle.fill" title="就绪" color={STATUS_COLORS.ok} />
+                  )}
+                </HStack>
+              </VStack>
               <Text font="caption" foregroundStyle="secondaryLabel">UMP 组件 = yt-dlp-ytse 0.4.3 + protobug + 兼容补丁，是「YouTube UMP 优先下载」的运行时依赖。</Text>
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
               {supportedAuthPlatforms().map((platform) => {
@@ -2803,7 +2984,7 @@ return (
               {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : null}
               <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书、YouTube 等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>
             </Section>
-            <Section title="发现">
+            <Section header={<Text font="headline">发现</Text>}>
               <Toggle
                 title="实验性发现功能"
                 systemImage="binoculars"
@@ -2812,7 +2993,7 @@ return (
               />
               <Text font="caption" foregroundStyle="secondaryLabel">开启后，发现页显示「关键词搜索」和「相关推荐」。播放列表/作者主页发现始终可用。</Text>
             </Section>
-            <Section title="运行日志">
+            <Section header={<Text font="headline">运行日志</Text>}>
               <Button title="查看运行日志" systemImage="list.bullet" action={() => void Navigation.present({ element: <LogListView /> })} />
               <Toggle title="临时详细日志（15 分钟）" systemImage="ladybug" value={verboseLog} onChanged={changeVerboseLog} />
               <Button title="清空运行日志" systemImage="trash" role="destructive" action={() => void (async () => {
@@ -2823,12 +3004,24 @@ return (
               })()} />
               <Text font="caption" foregroundStyle="secondaryLabel">默认只记录主链里程碑与警告/错误。临时详细日志约 15 分钟后自动关闭，不影响下载与在线预览。</Text>
             </Section>
-            <Section title="Safari 浏览器脚本">
-              <HStack spacing={10}>
-                <Image systemName={browserPlugin.upToDate ? "checkmark.circle.fill" : browserPlugin.currentKnown ? "exclamationmark.triangle.fill" : "questionmark.circle"} foregroundStyle={browserPlugin.upToDate ? "green" : browserPlugin.currentKnown ? "orange" : "secondaryLabel"} />
-                <Text frame={{ maxWidth: "infinity", alignment: "leading" }}>
-                  源码 v{browserPlugin.expected ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
-                </Text>
+            <Section header={<Text font="headline">Safari 浏览器脚本</Text>}>
+              <HStack spacing={12}>
+                <IconBadge
+                  systemName={browserPlugin.upToDate ? "checkmark.seal.fill" : browserPlugin.currentKnown ? "exclamationmark.triangle.fill" : "questionmark.circle"}
+                  tint={browserPlugin.upToDate ? STATUS_COLORS.ok : browserPlugin.currentKnown ? STATUS_COLORS.warn : STATUS_COLORS.idle}
+                />
+                <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                  <Text font="subheadline" fontWeight="semibold">浏览器脚本</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel">
+                    源码 v{browserPlugin.expected ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
+                  </Text>
+                </VStack>
+                <Spacer />
+                <StatusPill
+                  icon={browserPlugin.upToDate ? "checkmark.circle.fill" : browserPlugin.currentKnown ? "arrow.triangle.2.circlepath" : "questionmark.circle"}
+                  title={browserPlugin.upToDate ? "最新" : browserPlugin.currentKnown ? "需同步" : "未知"}
+                  color={browserPlugin.upToDate ? STATUS_COLORS.ok : browserPlugin.currentKnown ? STATUS_COLORS.warn : STATUS_COLORS.idle}
+                />
               </HStack>
               <Text font="caption" foregroundStyle="secondaryLabel">
                 {browserPlugin.upToDate

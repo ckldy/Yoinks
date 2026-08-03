@@ -5,6 +5,7 @@ import {
   List,
   NavigationStack,
   Section,
+  Spacer,
   Text,
   VStack,
   modifiers,
@@ -14,6 +15,8 @@ import {
 import type { BatchEnqueueInput, EnqueueResult } from "../services/batch-queue"
 import { BATCH_QUEUE_MAX, extractFirstURL } from "../services/media"
 import { discover, discoveryKindLabel, discoveryPlatformLabel, type DiscoveryItem, type DiscoveryKind, type DiscoveryPlatform, ALL_DISCOVERY_PLATFORMS } from "../services/discovery"
+import { YOINKS_THEME, STATUS_COLORS } from "./theme"
+import { ActionPill, HeroCard, StatusPill } from "./ui"
 
 const MAX_ITEMS_OPTIONS = [10, 20, 30, 40, 50]
 const RELATED_SUPPORTED_PLATFORMS: DiscoveryPlatform[] = ["bilibili", "youtube"]
@@ -331,123 +334,122 @@ export function DiscoverTab(props: DiscoverTabProps) {
         navigationBarTitleDisplayMode="large"
         toolbar={{ cancellationAction: <Button title="关闭" action={() => props.onClose()} /> }}
       >
-        <Section header={<Text>发现类型</Text>}>
-          <Button title={discoveryKindLabel(kind)} action={() => void chooseKind()} />
-        {isPlatformRelevant && (
-          <Button title={discoveryPlatformLabel(platform)} systemImage="globe" action={() => void choosePlatform()} />
-        )}
-        {!props.experimentalEnabled && (
-          <Text font="caption" foregroundStyle="secondaryLabel">
-            开启设置中的「实验性发现功能」后可使用搜索和相关推荐。
-          </Text>
-        )}
-      </Section>
-
-      <Section header={<Text>{inputLabel}</Text>}>
-        <VStack alignment="leading" spacing={5}>
-          <Text foregroundStyle={input ? "label" : "secondaryLabel"} lineLimit={3}>
-            {input || (isSearch ? "请输入关键词。" : "从剪贴板粘贴或手动输入公开链接。")}
-          </Text>
-        </VStack>
-        <Button title="从剪贴板粘贴" systemImage="doc.on.clipboard" action={() => void pasteInput()} />
-        <Button title="手动输入" systemImage="keyboard" action={() => void enterInput()} />
-        {input ? <Button title="清除" systemImage="xmark.circle" role="destructive" action={() => setInput("")} /> : null}
-      </Section>
-
-      <Section header={<Text>选项</Text>}>
-        <Button title={`数量上限：${maxItems} 条`} action={() => void chooseMaxItems()} />
-      </Section>
-
-      <Section>
-        <Button
-          title={loading ? "发现中..." : "开始发现"}
-          systemImage="magnifyingglass"
-          action={() => void startDiscovery()}
-          disabled={loading || !isInputValid()}
-        />
-        {status ? <Text foregroundStyle="secondaryLabel">{status}</Text> : null}
-      </Section>
-
-      {items.length > 0 && (
-        <Section
-          header={
-            <HStack>
-              <Text>共 {items.length} 条 · 已选 {selectedItems.length}</Text>
-              <Button
-                title={selectedItems.length === items.length ? "取消全选" : "全选"}
-                action={() => (selectedItems.length === items.length ? deselectAll() : selectAll())}
-              />
-            </HStack>
-          }
-        >
-          {items.map((item) => (
-            <Button
-              key={item.id}
-              action={() => toggleSelection(item.id)}
-            >
-              <HStack spacing={10} alignment="center">
-                <Image
-                  systemName={selectedIds.has(item.id) ? "checkmark.circle.fill" : "circle"}
-                  foregroundStyle={selectedIds.has(item.id) ? "green" : "secondaryLabel"}
-                  frame={{ width: 22 }}
-                />
-                <ThumbnailView url={item.thumbnail} />
-                <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" }}>
-                  <Text lineLimit={2}>{item.title}</Text>
-                  <HStack spacing={8}>
-                    {item.uploader ? (
-                      <HStack spacing={2}>
-                        <Image
-                          systemName="person.fill"
-                          foregroundStyle="secondaryLabel"
-                          imageScale="small"
-                          frame={{ width: 10 }}
-                        />
-                        <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>
-                          {item.uploader}
-                        </Text>
-                      </HStack>
-                    ) : null}
-                    {typeof item.duration === "number" && item.duration > 0 ? (
-                      <HStack spacing={2}>
-                        <Image
-                          systemName="clock.fill"
-                          foregroundStyle="secondaryLabel"
-                          imageScale="small"
-                          frame={{ width: 10 }}
-                        />
-                        <Text font="caption" foregroundStyle="secondaryLabel">
-                          {formatDuration(item.duration)}
-                        </Text>
-                      </HStack>
-                    ) : null}
-                  </HStack>
-                </VStack>
-              </HStack>
-            </Button>
-          ))}
-        </Section>
-      )}
-
-      {items.length > 0 && (
         <Section>
-          <Button
-            title={`加入批量队列（${selectedItems.length}）`}
-            systemImage="arrow.down.circle"
-            action={() => addToQueue()}
-            disabled={selectedItems.length === 0 || selectedItems.length > remainingCapacity}
+          <HeroCard
+            eyebrow="Discovery"
+            title="发现视频"
+            subtitle="播放列表 / 作者主页 / 关键词搜索 / 相关推荐"
+            tone="primary"
+            actions={
+              <HStack spacing={YOINKS_THEME.layout.compact} frame={{ maxWidth: "infinity" }}>
+                <ActionPill title={discoveryKindLabel(kind)} systemImage="square.grid.2x2" action={() => void chooseKind()} />
+                {isPlatformRelevant ? (
+                  <ActionPill title={discoveryPlatformLabel(platform)} systemImage="globe" tone="secondary" action={() => void choosePlatform()} />
+                ) : null}
+              </HStack>
+            }
           />
-          {canLoadNext && (
-            <Button
-              title={loading ? "加载中..." : `换一批（第 ${page} / ${totalPages} 批）`}
-              systemImage="arrow.clockwise"
-              action={() => void loadNextBatch()}
-              disabled={loading}
-            />
-          )}
-          <Button title="清空结果" systemImage="trash" role="destructive" action={() => clearResults()} />
+          {!props.experimentalEnabled ? (
+            <Text font="caption" foregroundStyle="secondaryLabel">
+              开启设置中的「实验性发现功能」后可使用搜索和相关推荐。
+            </Text>
+          ) : null}
         </Section>
-      )}
+
+        <Section header={<Text font="headline">{inputLabel}</Text>}>
+          <VStack alignment="leading" spacing={5} padding={{ vertical: 2 }}>
+            <Text foregroundStyle={input ? "label" : "secondaryLabel"} lineLimit={3}>
+              {input || (isSearch ? "请输入关键词。" : "从剪贴板粘贴或手动输入公开链接。")}
+            </Text>
+          </VStack>
+          <HStack spacing={YOINKS_THEME.layout.compact} frame={{ maxWidth: "infinity" }}>
+            <ActionPill title="从剪贴板粘贴" systemImage="doc.on.clipboard" action={() => void pasteInput()} />
+            <ActionPill title="手动输入" systemImage="keyboard" tone="secondary" action={() => void enterInput()} />
+          </HStack>
+          {input ? <ActionPill title="清除" systemImage="xmark.circle" tone="danger" action={() => setInput("")} /> : null}
+        </Section>
+
+        <Section header={<Text font="headline">选项</Text>}>
+          <ActionPill title={`数量上限：${maxItems} 条`} systemImage="number" tone="secondary" action={() => void chooseMaxItems()} />
+        </Section>
+
+        <Section>
+          <ActionPill
+            title={loading ? "发现中..." : "开始发现"}
+            systemImage="magnifyingglass"
+            action={() => void startDiscovery()}
+            disabled={loading || !isInputValid()}
+          />
+          {status ? <Text foregroundStyle="secondaryLabel">{status}</Text> : null}
+        </Section>
+
+        {items.length > 0 && (
+          <Section
+            header={
+              <HStack>
+                <Text font="headline">共 {items.length} 条 · 已选 {selectedItems.length}</Text>
+                <Spacer />
+                <StatusPill
+                  icon={selectedItems.length === items.length ? "checkmark.circle.fill" : "circle"}
+                  title={selectedItems.length === items.length ? "已全选" : "部分选中"}
+                  color={selectedItems.length === items.length ? STATUS_COLORS.ok : STATUS_COLORS.info}
+                />
+                <Button
+                  title={selectedItems.length === items.length ? "取消全选" : "全选"}
+                  action={() => (selectedItems.length === items.length ? deselectAll() : selectAll())}
+                />
+              </HStack>
+            }
+          >
+            {items.map((item) => (
+              <Button
+                key={item.id}
+                action={() => toggleSelection(item.id)}
+              >
+                <HStack spacing={10} alignment="center">
+                  <Image
+                    systemName={selectedIds.has(item.id) ? "checkmark.circle.fill" : "circle"}
+                    foregroundStyle={selectedIds.has(item.id) ? STATUS_COLORS.ok as any : "secondaryLabel"}
+                    frame={{ width: 22 }}
+                  />
+                  <ThumbnailView url={item.thumbnail} />
+                  <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
+                    <Text lineLimit={2}>{item.title}</Text>
+                    <HStack spacing={6}>
+                      {item.uploader ? (
+                        <StatusPill icon="person.fill" title={item.uploader} color={STATUS_COLORS.idle} />
+                      ) : null}
+                      {typeof item.duration === "number" && item.duration > 0 ? (
+                        <StatusPill icon="clock.fill" title={formatDuration(item.duration)} color={STATUS_COLORS.info} />
+                      ) : null}
+                    </HStack>
+                  </VStack>
+                </HStack>
+              </Button>
+            ))}
+          </Section>
+        )}
+
+        {items.length > 0 && (
+          <Section>
+            <ActionPill
+              title={`加入批量队列（${selectedItems.length}）`}
+              systemImage="arrow.down.circle"
+              action={() => addToQueue()}
+              disabled={selectedItems.length === 0 || selectedItems.length > remainingCapacity}
+            />
+            {canLoadNext && (
+              <ActionPill
+                title={loading ? "加载中..." : `换一批（第 ${page} / ${totalPages} 批）`}
+                systemImage="arrow.clockwise"
+                tone="secondary"
+                action={() => void loadNextBatch()}
+                disabled={loading}
+              />
+            )}
+            <ActionPill title="清空结果" systemImage="trash" tone="danger" action={() => clearResults()} />
+          </Section>
+        )}
       </List>
     </NavigationStack>
   )

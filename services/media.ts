@@ -47,6 +47,10 @@ export type ToolStatus = {
   ytsePatched: boolean
   /** 缺失的补丁名列表（调试/提示用） */
   ytseMissing: string[]
+  /** 取证：python 用户 site-packages 路径（诊断“组件丢失”用） */
+  ytseSite?: string | null
+  /** 取证：UMP 组件各部件存在性（yt_dlp/protobug/plugins/dist-info/marker） */
+  ytseEvidence?: Record<string, boolean>
 }
 
 export type DownloadProgress = {
@@ -134,6 +138,16 @@ export const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 const RUNNER_PATH = Path.join(Script.directory, "ytdlp_runner.py")
 /** yt-dlp-ytse UMP 组件检测/补丁脚本（check 输出 JSON；patch 幂等） */
 const YTSE_PATCH_PATH = Path.join(Script.directory, "python", "patch_ytse.py")
+/**
+ * UMP 组件主插件目录（项目 python/ump-vendor）：
+ * yt-dlp 通过 --plugin-dir 从该目录直接加载 yt_dlp_plugins 与 protobug，
+ * 彻底脱离 AppGroup usersite（iOS 可清理）。iCloud 同步、永不丢失。
+ */
+const UMP_PLUGIN_DIR = Path.join(Script.directory, "python", "ump-vendor")
+/** UMP 组件次级备份（AppGroup 独立目录，本地 IO；仅作恢复源） */
+const UMP_VENDOR_DIR_APPGROUP = Path.join(FileManager.appGroupDocumentsDirectory, "yoinks-ump-vendor")
+/** 固化备份包含的顶层目录/文件（yt-dlp-ytse 0.4.3 + protobug 1.0.0 的完整安装产物） */
+const UMP_VENDOR_ITEMS = ["yt_dlp_plugins", "protobug", "protobug-1.0.0.dist-info", "yt_dlp_ytse-0.4.3.dist-info"]
 const PROBE_PATH = Path.join(Script.directory, "ytdlp_probe.py")
 /** One end-to-end probe, including automatic retries, may use at most this many seconds. */
 export const PROBE_TOTAL_TIMEOUT_SECONDS = 45
@@ -1349,33 +1363,193 @@ export function resolveAutomaticChoice(
   return { choice, usedFallback: choice !== null && choice.container !== preferredContainer }
 }
 
+/** 解析 patch_ytse.py check 输出；解析失败返回 null。目标始终为项目 UMP 插件目录。 */
+async function runYtseCheck(): Promise<{
+  installed: boolean
+  version: string | null
+  patched: boolean
+  missing: string[]
+  site: string | null
+  evidence: Record<string, boolean>
+} | null> {
+  // 项目插件目录缺失时直接判定未安装（不触发 --dir 回退到 usersite 的误报）
+  if (!FileManager.existsSync(Path.join(UMP_PLUGIN_DIR, "yt_dlp_plugins")) && !FileManager.existsSync(UMP_PLUGIN_DIR)) {
+    return {
+      installed: false,
+      version: null,
+      patched: false,
+      missing: [],
+      site: UMP_PLUGIN_DIR,
+      evidence: {},
+    }
+  }
+  const ytse = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check --dir ${quote(UMP_PLUGIN_DIR)}`, 30)
+  if (ytse.exitCode !== 0) return null
+  try {
+    const parsed = JSON.parse(ytse.output.trim())
+    return {
+      installed: parsed.installed === true,
+      version: typeof parsed.version === "string" ? parsed.version : null,
+      patched: parsed.patched === true,
+      missing: Array.isArray(parsed.missing) ? parsed.missing : [],
+      site: typeof parsed.site === "string" ? parsed.site : UMP_PLUGIN_DIR,
+      evidence: parsed.evidence && typeof parsed.evidence === "object" ? parsed.evidence : {},
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 复制目录/文件到目标（目标已存在则先移除，NSFileManager copyItem 不允许目标存在）。 */
+async function copyItemReplace(src: string, dest: string): Promise<void> {
+  if (!FileManager.existsSync(src)) return
+  if (FileManager.existsSync(dest)) FileManager.removeSync(dest)
+  FileManager.copyFileSync(src, dest)
+}
+
+/** 固化 UMP 组件：从 usersite 复制到项目插件目录（iCloud 持久）+ AppGroup 独立目录（本地备份）。 */
+export async function backupYtseVendor(site: string | null | undefined): Promise<boolean> {
+  if (!site) return false
+  try {
+    for (const name of UMP_VENDOR_ITEMS) {
+      const src = Path.join(site, name)
+      if (!FileManager.existsSync(src)) continue
+      for (const dir of [UMP_PLUGIN_DIR, UMP_VENDOR_DIR_APPGROUP]) {
+        const dest = Path.join(dir, name)
+        if (src === dest) continue // 源与目标相同（site 即项目目录）时跳过
+        if (!FileManager.existsSync(dir)) FileManager.createDirectorySync(dir, true)
+        await copyItemReplace(src, dest)
+      }
+    }
+    for (const dir of [UMP_PLUGIN_DIR, UMP_VENDOR_DIR_APPGROUP]) {
+      if (!FileManager.existsSync(dir)) FileManager.createDirectorySync(dir, true)
+      FileManager.writeAsStringSync(Path.join(dir, ".yoinks-ump-marker"), new Date().toISOString())
+    }
+    await logEvent({ level: "info", event: "tools.ytse.vendor-backed-up", details: { site, projectDir: UMP_PLUGIN_DIR } })
+    return true
+  } catch (error) {
+    await logEvent({ level: "warn", event: "tools.ytse.vendor-backup-failed", details: { site, error: error instanceof Error ? error.message : String(error) } })
+    return false
+  }
+}
+
+/** 从 AppGroup 备份恢复 UMP 组件到指定目录（默认项目插件目录）。 */
+export async function restoreYtseVendor(site: string | null | undefined = UMP_PLUGIN_DIR): Promise<boolean> {
+  if (!site) return false
+  try {
+    if (!FileManager.existsSync(Path.join(UMP_VENDOR_DIR_APPGROUP, "yt_dlp_plugins"))) return false
+    if (!FileManager.existsSync(site)) FileManager.createDirectorySync(site, true)
+    for (const name of UMP_VENDOR_ITEMS) {
+      await copyItemReplace(Path.join(UMP_VENDOR_DIR_APPGROUP, name), Path.join(site, name))
+    }
+    await logEvent({ level: "info", event: "tools.ytse.vendor-restored", details: { site, source: UMP_VENDOR_DIR_APPGROUP } })
+    return true
+  } catch (error) {
+    await logEvent({ level: "warn", event: "tools.ytse.vendor-restore-failed", details: { site, error: error instanceof Error ? error.message : String(error) } })
+    return false
+  }
+}
+
 export async function getToolStatus(): Promise<ToolStatus> {
   const ytDlp = await runCommand("python3 -m yt_dlp --version", 20)
   const ytDlpVersion = ytDlp.exitCode === 0 ? ytDlp.output.trim().split(/\s+/)[0] || null : null
-  const ytse = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check`, 30)
-  let ytseVersion: string | null = null
-  let ytsePatched = false
-  let ytseMissing: string[] = []
-  if (ytse.exitCode === 0) {
-    try {
-      const parsed = JSON.parse(ytse.output.trim())
-      ytseVersion = typeof parsed.version === "string" ? parsed.version : null
-      ytsePatched = parsed.patched === true
-      ytseMissing = Array.isArray(parsed.missing) ? parsed.missing : []
-    } catch {
-      // 解析失败按 UMP 组件未就绪处理
-    }
+  let check = await runYtseCheck()
+  // 自动修复：组件已安装但兼容补丁缺失时静默重打补丁（幂等、秒级、无需网络），
+  // 避免“补丁被 yt-dlp 升级/pip 校验覆盖”这类高频丢失需要用户手动点修复。
+  if (check && check.installed && !check.patched) {
+    const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch --dir ${quote(UMP_PLUGIN_DIR)}`, 60)
+    const patched = patch.exitCode === 0
+    const recheck = await runYtseCheck()
+    if (recheck) check = { ...recheck, evidence: recheck.evidence }
+    await logEvent({
+      level: patched && check?.patched ? "info" : "warn",
+      event: patched && check?.patched ? "tools.ytse.auto-patched" : "tools.ytse.auto-patch-failed",
+      details: { patchExitCode: patch.exitCode, missing: check?.missing || [], evidence: check?.evidence || {} },
+    })
   }
-  const status: ToolStatus = { ytDlpVersion, ytseVersion, ytsePatched, ytseMissing }
+  const status: ToolStatus = {
+    ytDlpVersion,
+    ytseVersion: check?.version ?? null,
+    ytsePatched: check?.patched === true,
+    ytseMissing: check?.missing || [],
+    ytseSite: check?.site ?? null,
+    ytseEvidence: check?.evidence || undefined,
+  }
   await logEvent({
     level: status.ytDlpVersion ? "info" : "warn",
     event: "tools.checked",
-    details: { ytDlpVersion, ytDlpExitCode: ytDlp.exitCode, ytseVersion, ytsePatched, ytseMissing },
+    details: { ytDlpVersion, ytDlpExitCode: ytDlp.exitCode, ytseVersion: status.ytseVersion, ytsePatched: status.ytsePatched, ytseMissing: status.ytseMissing, ytseSite: status.ytseSite, ytseEvidence: status.ytseEvidence },
   })
   return status
 }
 
-/** 一键安装 UMP 组件：pip 安装 yt-dlp-ytse + protobug → 幂等打补丁 → 复检。 */
+let ensureYtseRunning = false
+let ensureYtseLast: { ok: boolean; at: number } | null = null
+
+/**
+ * UMP 组件自愈链（幂等、可重复调用）：
+ * 1. check → 已就绪直接返回；
+ * 2. 组件在但补丁缺 → 自动重打补丁（离线）；
+ * 3. 组件缺失 → 从固化备份恢复（AppGroup → 项目 iCloud）；
+ * 4. 备份不可用且 allowNetworkInstall → pip install 后固化备份。
+ * 全程失败不抛异常（调用方是启动/下载路径，UMP 缺失时主流程自动回退普通 yt-dlp）。
+ */
+export async function ensureYtseComponent(options: { allowNetworkInstall?: boolean; force?: boolean } = {}): Promise<{ ok: boolean; action: "ok" | "patched" | "restored" | "installed" | "failed" }> {
+  if (!options.force && ensureYtseLast && Date.now() - ensureYtseLast.at < 60_000) {
+    return { ok: ensureYtseLast.ok, action: ensureYtseLast.ok ? "ok" : "failed" }
+  }
+  if (ensureYtseRunning) return { ok: false, action: "failed" }
+  ensureYtseRunning = true
+  try {
+    let check = await runYtseCheck()
+    if (check?.patched) {
+      ensureYtseLast = { ok: true, at: Date.now() }
+      return { ok: true, action: "ok" }
+    }
+    if (check?.installed) {
+      // 组件在、补丁缺：自动重打补丁（幂等、离线）
+      const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch --dir ${quote(UMP_PLUGIN_DIR)}`, 60)
+      check = await runYtseCheck()
+      if (patch.exitCode === 0 && check?.patched) {
+        await logEvent({ level: "info", event: "tools.ytse.ensure-patched", details: { site: check.site, evidence: check.evidence } })
+        ensureYtseLast = { ok: true, at: Date.now() }
+        return { ok: true, action: "patched" }
+      }
+      // patch 失败（可能插件文件整体丢失而 dist-info 残留）：继续尝试从备份恢复
+      await logEvent({ level: "warn", event: "tools.ytse.ensure-patch-failed", details: { patchExitCode: patch.exitCode, missing: check?.missing || [], evidence: check?.evidence || {} } })
+    }
+    // 组件缺失或补丁修复失败：从固化备份恢复（离线）
+    if (check?.site) {
+      const restored = await restoreYtseVendor(check.site)
+      if (restored) {
+        const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch --dir ${quote(UMP_PLUGIN_DIR)}`, 60)
+        const recheck = await runYtseCheck()
+        if (patch.exitCode === 0 && recheck?.patched) {
+          await logEvent({ level: "info", event: "tools.ytse.ensure-restored", details: { site: check.site } })
+          ensureYtseLast = { ok: true, at: Date.now() }
+          return { ok: true, action: "restored" }
+        }
+        await logEvent({ level: "warn", event: "tools.ytse.ensure-restore-patch-failed", details: { site: check.site, missing: recheck?.missing || [] } })
+      } else {
+        await logEvent({ level: "warn", event: "tools.ytse.ensure-restore-miss", details: { site: check.site, evidence: check.evidence, appGroupVendor: UMP_VENDOR_DIR_APPGROUP, projectVendor: UMP_VENDOR_DIR } })
+      }
+    }
+    // 备份不可用：仅允许网络安装时走 pip
+    if (options.allowNetworkInstall) {
+      const installed = await installYtseComponent()
+      ensureYtseLast = { ok: installed.patched, at: Date.now() }
+      return { ok: installed.patched, action: installed.patched ? "installed" : "failed" }
+    }
+    return { ok: false, action: "failed" }
+  } catch (error) {
+    await logEvent({ level: "error", event: "tools.ytse.ensure-failed", details: { error: error instanceof Error ? error.message : String(error) } })
+    return { ok: false, action: "failed" }
+  } finally {
+    ensureYtseRunning = false
+  }
+}
+
+/** 一键安装 UMP 组件：pip 安装 yt-dlp-ytse + protobug → 固化到项目插件目录 → 幂等打补丁 → 复检。 */
 export async function installYtseComponent(): Promise<{ version: string; patched: boolean }> {
   await logEvent({ level: "info", event: "tools.install.started", details: { tool: "yt-dlp-ytse" } })
   // 与 installYtDlp 一致：固定信任 pypi 域名，规避本环境 SSL 证书链异常（MITM/抓包）。
@@ -1387,12 +1561,27 @@ export async function installYtseComponent(): Promise<{ version: string; patched
     await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "pip", exitCode: install.exitCode, output: install.output } })
     throw new Error(compactMessage(install.output || "UMP 组件安装失败"))
   }
-  const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch`, 60)
+  // 定位 pip 安装位置（usersite）并把组件固化到项目插件目录 + AppGroup 备份，
+  // 后续 yt-dlp 从项目目录加载（--plugin-dir），彻底脱离 AppGroup usersite。
+  const siteCheck = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check`, 30)
+  let site: string | null = null
+  if (siteCheck.exitCode === 0) {
+    try {
+      const parsed = JSON.parse(siteCheck.output.trim())
+      if (typeof parsed.site === "string") site = parsed.site
+    } catch {
+      // 忽略：site 保持 null，patch 目标仍是项目目录
+    }
+  }
+  if (site && site !== UMP_PLUGIN_DIR) {
+    await backupYtseVendor(site)
+  }
+  const patch = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} patch --dir ${quote(UMP_PLUGIN_DIR)}`, 60)
   if (patch.exitCode !== 0) {
     await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "patch", exitCode: patch.exitCode, output: patch.output } })
     throw new Error(compactMessage(patch.output || "UMP 组件补丁失败"))
   }
-  const verify = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check`, 30)
+  const verify = await runCommand(`python3 ${quote(YTSE_PATCH_PATH)} check --dir ${quote(UMP_PLUGIN_DIR)}`, 30)
   let version = "0.4.3"
   let patched = false
   if (verify.exitCode === 0) {
@@ -1408,7 +1597,7 @@ export async function installYtseComponent(): Promise<{ version: string; patched
     await logEvent({ level: "error", event: "tools.install.failed", details: { tool: "yt-dlp-ytse", stage: "verify", output: verify.output } })
     throw new Error("UMP 组件已安装但补丁未完整，请重试或查看日志")
   }
-  await logEvent({ level: "info", event: "tools.install.completed", details: { tool: "yt-dlp-ytse", version } })
+  await logEvent({ level: "info", event: "tools.install.completed", details: { tool: "yt-dlp-ytse", version, pluginDir: UMP_PLUGIN_DIR } })
   return { version, patched }
 }
 
@@ -2468,6 +2657,8 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
   const refererArgument = referer ? ` --referer ${quote(referer)}` : ""
   const userAgentArgument = safariUserAgent ? ` --user-agent ${quote(safariUserAgent)}` : ""
   const cookieArgument = options.cookieFile ? ` ${quote(options.cookieFile)}` : ""
+  // UMP 插件从项目目录加载（yt-dlp --plugin-dir），探测也需能看到 -ump 后缀格式
+  const pluginDirArgument = FileManager.existsSync(UMP_PLUGIN_DIR) ? ` --plugin-dir ${quote(UMP_PLUGIN_DIR)}` : ""
   const startedAt = Date.now()
   const deadline = startedAt + PROBE_TOTAL_TIMEOUT_SECONDS * 1000
   let attemptCount = 0
@@ -2522,7 +2713,7 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
     if (remainingMilliseconds <= 0) throw timeoutError()
     attemptCount += 1
     const result = await runCommand(
-      `python3 ${quote(PROBE_PATH)}${insecure ? " --insecure" : ""}${refererArgument}${userAgentArgument} ${quote(probeURL)}${cookieArgument}`,
+      `python3 ${quote(PROBE_PATH)}${pluginDirArgument}${insecure ? " --insecure" : ""}${refererArgument}${userAgentArgument} ${quote(probeURL)}${cookieArgument}`,
       Math.max(1, Math.ceil(remainingMilliseconds / 1000)),
     )
     if (Date.now() >= deadline) {
@@ -3284,6 +3475,8 @@ export async function downloadMedia(options: {
   // 失败自动回退普通 yt-dlp 双轨下载（每流各自回退一次）。自研驱动 downloadYouTubeUMPFallback 本轮停用。
   let umpFirstAttempted = false
   if (getPreferences().umpFirst && options.choice && isYouTubeUMPChoice(sourceURL, options.choice) && (options.choice.mergeAudioFormat || Boolean(options.choice.previewAudioURL)) && !isCancelFlagSet()) {
+    // 走 UMP 通道前快速自愈（60s 缓存；只做离线补丁/备份恢复，不触发网络安装）
+    await ensureYtseComponent({ allowNetworkInstall: false })
     umpFirstAttempted = true
     options.onCancelPath(cancelPath)
     await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: "ump-first", concurrentFragments: 1, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: false, safariUserAgentApplied: false, outputDirectory: DOWNLOAD_DIR } })
@@ -3745,6 +3938,9 @@ export async function downloadMedia(options: {
     referer,
     user_agent: safariUserAgent || (detectMediaPlatform(sourceURL) === "youtube" ? YOUTUBE_DOWNLOAD_UA : undefined),
     extract_audio: false,
+    // UMP 插件从项目目录加载（yt-dlp --plugin-dir），脱离 AppGroup usersite；
+    // JSON.stringify 会忽略 undefined，目录不存在时不传（回退 usersite 插件）
+    plugin_dirs: FileManager.existsSync(UMP_PLUGIN_DIR) ? [UMP_PLUGIN_DIR] : undefined,
   }
   await FileManager.writeAsString(configPath, JSON.stringify(config))
   await logEvent({ level: "info", event: "download.started", taskId, details: { sourceURL, choiceId: options.choice.id, choiceLabel: options.choice.label, formatExpression: options.choice.formatExpression, concurrentFragments: effectiveConcurrency, tlsInsecure: Boolean(options.insecureTLS), authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent), outputDirectory: DOWNLOAD_DIR } })

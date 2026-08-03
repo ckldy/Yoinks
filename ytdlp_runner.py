@@ -7,9 +7,10 @@ from urllib.parse import urlparse
 
 # ios_system 常驻 python 进程跨命令缓存 sys.modules，且 yt-dlp 的插件发现
 # （all_plugins_loaded）只在首次加载时执行——改插件（如 yt-dlp-ytse 补丁）后
-# 不清理缓存会继续用旧字节码。每次运行前清掉 yt_dlp 全家，强制重新扫描插件。
+# 不清理缓存会继续用旧字节码。每次运行前清掉 yt_dlp 全家（含 yt_dlp_plugins）
+# 与 protobug，强制重新扫描插件并让 ytse 从 --plugin-dir（项目目录）重新加载依赖。
 for _m in list(sys.modules):
-    if _m.startswith('yt_dlp'):
+    if _m.startswith('yt_dlp') or _m.startswith('protobug'):
         del sys.modules[_m]
 
 from yt_dlp import YoutubeDL
@@ -150,6 +151,17 @@ def main():
         "overwrites": False,
         "extractor_args": extractor_args,
     }
+
+    # UMP 组件插件目录（项目内，脱离 AppGroup usersite）：yt-dlp 会把该目录
+    # 插入 sys.path 并加载其中的 yt_dlp_plugins 包，protobug 同目录可被 ytse import。
+    plugin_dirs = config.get("plugin_dirs")
+    if isinstance(plugin_dirs, list):
+        valid = []
+        for p in plugin_dirs:
+            if isinstance(p, str) and os.path.isdir(p):
+                valid.append(os.path.abspath(p))
+        if valid:
+            options["plugin_dirs"] = valid
 
     cookiefile = config.get("cookiefile")
     if cookiefile:
