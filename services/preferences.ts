@@ -22,6 +22,8 @@ export type YoinksPreferences = {
   showRecentCandidates: boolean
   /** YouTube UMP 优先下载（测试版）：DASH 先走 UMP 官方通道，60s 预算，失败/超时回退 yt-dlp。 */
   umpFirst: boolean
+  /** 下载完成/失败时若 App 在后台，发送本地通知提示（默认开）。 */
+  notifyDownloadComplete: boolean
 }
 
 export const DEFAULT_PREFERENCES: YoinksPreferences = {
@@ -37,6 +39,7 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   experimentalDiscoveryEnabled: false,
   showRecentCandidates: true,
   umpFirst: true,
+  notifyDownloadComplete: true,
 }
 
 function isSaveMode(value: unknown): value is SaveMode {
@@ -82,6 +85,7 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     experimentalDiscoveryEnabled: isBoolean(source.experimentalDiscoveryEnabled) ? source.experimentalDiscoveryEnabled : DEFAULT_PREFERENCES.experimentalDiscoveryEnabled,
     showRecentCandidates: isBoolean(source.showRecentCandidates) ? source.showRecentCandidates : DEFAULT_PREFERENCES.showRecentCandidates,
     umpFirst: isBoolean(source.umpFirst) ? source.umpFirst : DEFAULT_PREFERENCES.umpFirst,
+    notifyDownloadComplete: isBoolean(source.notifyDownloadComplete) ? source.notifyDownloadComplete : DEFAULT_PREFERENCES.notifyDownloadComplete,
   }
 }
 

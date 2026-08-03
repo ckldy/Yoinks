@@ -2045,11 +2045,15 @@ export async function downloadDirectSegmented(options: {
     const start = index * chunk
     const end = Math.min(start + chunk - 1, total - 1)
     const partPath = Path.join(workDirectory, `seg_${String(index).padStart(4, "0")}.part`)
+    // 该段当前尝试已写入的字节数：失败重试前从总计数中扣除（重试会重新下载整段），
+    // 否则 downloaded 重复计数会超过 total，进度显示「已下载 > 总大小」。
+    let size = 0
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (options.isCancelFlagSet()) return false
       try {
         if (FileManager.existsSync(partPath)) FileManager.removeSync(partPath)
       } catch {}
+      size = 0
       try {
         const controller = new AbortController()
         // 动态超时：小段（≤1MB）15s 足够，大段按 2s/MB 线性放，上限 120s；避免卡段拖满固定 60s×3。
@@ -2077,9 +2081,12 @@ export async function downloadDirectSegmented(options: {
           }
           if (response.status !== 206) throw new Error(`HTTP ${response.status}`)
           const reader = response.dataStream.getReader()
-          let size = 0
+          size = 0
           try {
             while (true) {
+              // 取消检查点：每块数据读取前检查。原实现读循环内无检查，取消后仍会读完
+              // 当前段（数据不断流时需几十秒），表现为「取消停止不下来」。
+              if (options.isCancelFlagSet()) throw new Error("下载已取消")
               // googlevideo 偶发返回 206 后数据流挂起（header 到了但 body 不推，abort 无效）；
               // 15s 无数据视为该段失败，走外层重试（重新 fetch 该段）。
               const { done, value } = await Promise.race([
@@ -2106,6 +2113,10 @@ export async function downloadDirectSegmented(options: {
           clearTimeout(timeout)
         }
       } catch (error) {
+        // 扣除本段本次尝试已写入的字节（重试将重新下载整段），避免 downloaded 虚增
+        downloaded = Math.max(0, downloaded - size)
+        // 取消错误不再静默重试，立即向上抛出（取消时其他段也通过检查点退出）
+        if (options.isCancelFlagSet() || (error instanceof Error && error.message === "下载已取消")) throw error
         if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 300 * (attempt + 1)))
       }
     }

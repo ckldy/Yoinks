@@ -64,6 +64,12 @@ import {
   type SaveMode,
   type ToolStatus,
 } from "./services/media"
+import { beginDownloadKeepAlive } from "./services/background-keepalive"
+import {
+  notifyBatchFinished,
+  notifyDownloadComplete,
+  notifyDownloadFailed,
+} from "./services/download-notify"
 import {
   batchItemSubtitle,
   batchItemTitle,
@@ -2007,6 +2013,7 @@ function View() {
           const session = probeSession
           const importedCookie = session ? getImportedCookiePath() : null
           let cookieFile: string | undefined
+          const releaseDownloadKeepAlive = beginDownloadKeepAlive()
           try {
             if (importedCookie) cookieFile = importedCookie
             else if (session) cookieFile = await createTaskCookieFile(session)
@@ -2030,6 +2037,7 @@ function View() {
               outputTitle: probeResult.title || item.title,
             })
           } finally {
+            releaseDownloadKeepAlive()
             if (cookieFile && !getImportedCookiePath()) await FileManager.remove(cookieFile).catch(() => {})
             if (session?.retention === "temporary") disposeTemporarySession(platform as AuthPlatform)
           }
@@ -2136,6 +2144,7 @@ function View() {
         event: "batch.finished",
         details: { ok, fail, cancelled: cancelledCount },
       })
+      await notifyBatchFinished(ok, fail, cancelledCount)
     }
   }
 
@@ -2334,6 +2343,7 @@ function View() {
     applyProgressUi({ fraction: 0.02, stage: "正在解析媒体" }, true)
     setStatus(earlyPlatform === "douyin" ? "正在匿名下载抖音媒体…" : "yt-dlp 正在准备下载。")
 
+    const releaseDownloadKeepAlive = beginDownloadKeepAlive()
     try {
       const platform = detectMediaPlatform(validURL)
       // YouTube 必须沿用本次探测的授权状态：匿名格式只能匿名下载。
@@ -2375,6 +2385,8 @@ function View() {
         setResult(downloaded)
         setCompletedSaveMode(saveMode)
         setStatus(saveMessage || "下载完成。")
+        // App 在后台时通知下载完成（前台不打扰，界面已有状态显示）
+        await notifyDownloadComplete(downloaded.fileName)
         if (validURL !== safariCandidateURLRef.current) {
           await rememberRecentLink(validURL)
           setRecentLinks(listRecentLinks())
@@ -2396,8 +2408,12 @@ function View() {
         await startDownload(true, automatic, retriedTransientAccess)
         return
       }
-      if (message !== "下载已取消") await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
+      if (message !== "下载已取消") {
+        await notifyDownloadFailed(downloadChoice?.label || probe?.title || "未知标题", message)
+        await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
+      }
     } finally {
+      releaseDownloadKeepAlive()
       const platform = detectMediaPlatform(validURL)
       if (isAuthPlatform(platform)) disposeTemporarySession(platform)
       setDownloading(false)
@@ -2712,6 +2728,8 @@ return (
               <Toggle title="YouTube UMP 优先下载" systemImage="bolt.horizontal.circle" value={preferences.umpFirst} onChanged={(value) => updatePreferences({ ...preferences, umpFirst: value })} />
               <Text font="caption" foregroundStyle="secondaryLabel">测试版：YouTube 视频先走 UMP 官方通道（60 秒预算），失败/超时自动回退 yt-dlp 下载。关闭后直接走 yt-dlp。</Text>
               {!tools?.ytsePatched ? <Text font="caption" foregroundStyle="orange">UMP 组件未就绪（需先在下文「工具与登录」安装/修复），优先下载不会生效，将直接走 yt-dlp。</Text> : null}
+              <Toggle title="后台下载完成通知" systemImage="bell.badge" value={preferences.notifyDownloadComplete} onChanged={(value) => updatePreferences({ ...preferences, notifyDownloadComplete: value })} />
+              <Text font="caption" foregroundStyle="secondaryLabel">下载在 App 处于后台时完成（或失败），发送本地通知提示；前台不通知。需在系统设置中允许 Scripting 的通知权限。</Text>
             </Section>
             <Section title="自动下载">
               <Toggle title="剪贴板分析后自动下载" systemImage="arrow.down.circle" value={preferences.automaticDownloadEnabled} onChanged={(value) => updatePreferences({ ...preferences, automaticDownloadEnabled: value })} />
