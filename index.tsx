@@ -136,6 +136,7 @@ import {
   beginPlatformLogin,
   clearPlatformLogin,
   createTaskCookieFile,
+  removeTaskCookieFile,
   disposePlatformSession,
   restorePersistentPlatformSession,
   type AuthPlatform,
@@ -1438,10 +1439,10 @@ function View() {
     const confirmed = await Dialog.confirm({ title: "清除所有平台登录状态", message: "将清除所有平台的 Cookie 和持久化会话。", confirmLabel: "清除", cancelLabel: "取消" })
     if (!confirmed) return
     await Promise.all(supportedAuthPlatforms().map((platform) => clearPlatformLogin(platform)))
-    clearImportedCookie()
-    setImportedCookieActive(false)
+    const importedCookieCleared = await clearImportedCookie()
+    if (importedCookieCleared) setImportedCookieActive(false)
     updatePlatformSessions(() => ({}))
-    setStatus("已清除登录状态。")
+    setStatus(importedCookieCleared ? "已清除登录状态。" : "平台会话已清除，但导入的 Cookie 文件删除失败，请稍后重试。")
   }
 
   const handleImportCookie = async () => {
@@ -2369,16 +2370,18 @@ function View() {
     setStatus(earlyPlatform === "douyin" ? "正在匿名下载抖音媒体…" : "yt-dlp 正在准备下载。")
 
     const releaseDownloadKeepAlive = beginDownloadKeepAlive()
+    let ownedCookieFile: string | undefined
     try {
       const platform = detectMediaPlatform(validURL)
       // YouTube 必须沿用本次探测的授权状态：匿名格式只能匿名下载。
       const useSession = platform !== "youtube" || probeAuthorizedPlatformRef.current === "youtube"
       const session = useSession && platform !== "douyin" && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       const importedCookie = session ? getImportedCookiePath() : null
+      if (!importedCookie && session) ownedCookieFile = await createTaskCookieFile(session)
       const downloaded = await downloadMedia({
         url: validURL,
         choice: downloadChoice,
-        cookieFile: importedCookie || (session ? await createTaskCookieFile(session) : undefined),
+        cookieFile: importedCookie || ownedCookieFile,
         concurrentFragments,
         insecureTLS,
         onProgress: (p: DownloadProgress) => applyProgressUi(p),
@@ -2438,6 +2441,7 @@ function View() {
         await Dialog.alert({ title: "下载失败", message: `${message}\n\n任务日志已写入：${getLogDirectory()}` })
       }
     } finally {
+      await removeTaskCookieFile(ownedCookieFile)
       releaseDownloadKeepAlive()
       const platform = detectMediaPlatform(validURL)
       if (isAuthPlatform(platform)) disposeTemporarySession(platform)

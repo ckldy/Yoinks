@@ -159,11 +159,14 @@ export async function createTaskCookieFile(session: PlatformAuthSession): Promis
   return path
 }
 
-export async function removeTaskCookieFile(path: string | null | undefined): Promise<void> {
-  if (!path) return
+export async function removeTaskCookieFile(path: string | null | undefined): Promise<boolean> {
+  if (!path) return true
   try {
     if (await FileManager.exists(path)) await FileManager.remove(path)
-  } catch {}
+    return !(await FileManager.exists(path))
+  } catch {
+    return false
+  }
 }
 
 export function disposePlatformSession(session: PlatformAuthSession | null | undefined): void {
@@ -191,11 +194,12 @@ export function getImportedCookiePath(): string | null {
   return importedCookiePath
 }
 
-export function clearImportedCookie(): void {
-  if (importedCookiePath) {
-    removeTaskCookieFile(importedCookiePath)
-    importedCookiePath = null
-  }
+export async function clearImportedCookie(): Promise<boolean> {
+  const path = importedCookiePath
+  if (!path) return true
+  const removed = await removeTaskCookieFile(path)
+  if (removed && importedCookiePath === path) importedCookiePath = null
+  return removed
 }
 
 export async function importCookieFile(): Promise<string | null> {
@@ -204,8 +208,8 @@ export async function importCookieFile(): Promise<string | null> {
   const sourcePath = paths[0]
   if (!(await FileManager.exists(sourcePath))) throw new Error("选择的 Cookie 文件不存在。")
   if (!(await FileManager.exists(TEMP_DIR))) await FileManager.createDirectory(TEMP_DIR, true)
-  // 清理旧的导入文件
-  clearImportedCookie()
+  // 先可靠清理旧的导入文件；失败时保留旧路径，避免丢失后续清理能力。
+  if (!(await clearImportedCookie())) throw new Error("无法清理旧的 Cookie 文件，请稍后重试。")
   const destPath = Path.join(TEMP_DIR, `${createTaskId()}.imported.cookies.txt`)
   await FileManager.copyFile(sourcePath, destPath)
   importedCookiePath = destPath

@@ -1,5 +1,22 @@
 # 更新日志
 
+## 1.6.14 — 2026-08-14
+
+> 可靠性与隐私加固：Safari 用户脚本发布失败不再破坏旧版本，单链授权下载不再残留认证源 Cookie，并补齐故障注入回归。
+
+### 修复
+
+- **Safari 用户脚本事务发布**：`browser.tsx.src` 转换结果先写同目录临时文件并通过 JavaScript 语法校验，再替换正式 `Yoinks.user.js`；替换 `rename` 失败会自动恢复旧版本，恢复失败则明确报告保留的备份路径。成功替换后的备份清理失败不再误报发布失败。
+- **单链下载 Cookie 源文件清理**：WebView 授权会话生成的认证源 Cookie 文件由单链下载流程显式持有，并在成功、失败、取消和 TLS 兼容重试结束后的 `finally` 中删除；任务目录内 Cookie 副本仍由下载层原有清理负责。
+- **导入 Cookie 可重试清理**：`clearImportedCookie` 改为异步等待删除，删除失败时保留原路径供再次清理；导入新 Cookie 前必须先成功清理旧文件；设置页清除登录状态会提示 Cookie 文件部分清理失败。
+- 更新缓存清理专项验证以适配当前设置页 `StatTile` 界面，消除旧 UI 文本断言造成的误报。
+
+### 验证
+
+- `verify_reliability_hardening` 15 项：覆盖校验失败不触碰旧插件、第二次 `rename` 故障注入与旧版恢复、成功替换、事务文件清理及 Cookie 删除幂等。
+- 回归：`verify_browser_publish` 35 项、`verify_cache_cleanup` 13 项、`verify_download_cancel` 41 项、`verify_batch_queue` 27 项全部通过。
+- `scripting-ts project "Yoinks"` 启动回归通过；DSH 两轮独立复审确认无阻塞问题。
+
 ## 1.6.13 — 2026-08-04
 
 > UI 全面美化（参照 Pornhub / BMW Companion 的 SwiftUI 原生组件设计语言）+ UMP 组件自愈链（丢失自动恢复）+ UMP 插件迁移到项目目录（yt-dlp `--plugin-dir` 加载，彻底脱离 AppGroup 容器），全部真机验收通过。

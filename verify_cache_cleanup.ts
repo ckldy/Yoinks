@@ -17,7 +17,7 @@ const checks: Array<[string, boolean]> = [
   ["returns removed bytes and item count", /Promise<\{ removedBytes: number; removedItems: number \}>/.test(cacheSource)],
   ["uses the Yoinks tmp directory", /Path\.join\(FileManager\.documentsDirectory, \"Yoinks\", \"tmp\"\)/.test(cacheSource)],
   // 设置页入口
-  ["settings page shows cache size", /下载缓存：\{downloadCacheBytes == null \? \"…\" : formatBytes\(downloadCacheBytes\)\}/.test(indexSource)],
+  ["settings page shows cache size", /<StatTile title=\"缓存\" value=\{downloadCacheBytes == null \? \"…\" : formatBytes\(downloadCacheBytes\)\}/.test(indexSource)],
   ["settings page exposes a clear button", /清理下载缓存/.test(indexSource) && /clearDownloadCacheNow\(\)/.test(indexSource)],
   ["clear button is guarded while busy", /disabled=\{downloading \|\| analyzing \|\| cacheClearing\}/.test(indexSource)],
   ["handler refreshes after clearing and reports result", /await clearDownloadCache\(activeTaskId\)[\s\S]{0,120}refreshDownloadCache\(\)/.test(indexSource)],

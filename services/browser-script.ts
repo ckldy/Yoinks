@@ -201,6 +201,73 @@ function removeTypeDefinitionBlocks(source: string): string {
   return result.join("\n")
 }
 
+/**
+ * 先写同目录临时文件并校验，再替换正式 userscript。
+ * 任一步失败都会保留或恢复旧文件，并清理事务临时文件。
+ */
+export type UserscriptFileOperations = {
+  exists: (path: string) => Promise<boolean>
+  write: (path: string, contents: string) => Promise<void>
+  rename: (path: string, newPath: string) => Promise<void>
+  remove: (path: string) => Promise<void>
+}
+
+const defaultUserscriptFileOperations: UserscriptFileOperations = {
+  exists: (path) => FileManager.exists(path),
+  write: (path, contents) => FileManager.writeAsString(path, contents),
+  rename: (path, newPath) => FileManager.rename(path, newPath),
+  remove: (path) => FileManager.remove(path),
+}
+
+export async function replaceValidatedUserscript(
+  targetPath: string,
+  contents: string,
+  validate: (temporaryPath: string) => Promise<boolean>,
+  files: UserscriptFileOperations = defaultUserscriptFileOperations,
+): Promise<void> {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const temporaryPath = `${targetPath}.publishing-${suffix}`
+  const backupPath = `${targetPath}.backup-${suffix}`
+  let backedUp = false
+  let restored = false
+  try {
+    await files.write(temporaryPath, contents)
+    if (!(await validate(temporaryPath))) throw new Error("部署产物语法自检失败")
+    if (await files.exists(targetPath)) {
+      await files.rename(targetPath, backupPath)
+      backedUp = true
+    }
+    try {
+      await files.rename(temporaryPath, targetPath)
+    } catch (publishError) {
+      if (backedUp && await files.exists(backupPath) && !(await files.exists(targetPath))) {
+        try {
+          await files.rename(backupPath, targetPath)
+          restored = true
+          backedUp = false
+        } catch (restoreError) {
+          throw new Error(`发布失败且旧脚本恢复失败；备份保留在 ${backupPath}：${restoreError instanceof Error ? restoreError.message : String(restoreError)}`)
+        }
+      }
+      throw publishError
+    }
+    if (backedUp && await files.exists(backupPath)) await files.remove(backupPath).catch(() => {})
+  } finally {
+    if (await files.exists(temporaryPath)) await files.remove(temporaryPath).catch(() => {})
+    if (await files.exists(backupPath)) {
+      if (!(await files.exists(targetPath)) && !restored) {
+        try {
+          await files.rename(backupPath, targetPath)
+        } catch (error) {
+          throw new Error(`旧脚本恢复失败；备份保留在 ${backupPath}：${error instanceof Error ? error.message : String(error)}`)
+        }
+      } else if (await files.exists(targetPath)) {
+        await files.remove(backupPath).catch(() => {})
+      }
+    }
+  }
+}
+
 /** 发布：browser.tsx.src -> 纯 JS -> userscripts/Yoinks.user.js。返回 { ok, path, version }。 */
 export async function publishBrowserUserscript(): Promise<{ ok: boolean; path: string; version: string | null; error?: string }> {
   try {
@@ -215,13 +282,16 @@ export async function publishBrowserUserscript(): Promise<{ ok: boolean; path: s
       return { ok: false, path: "", version: null, error: "Safari 浏览器脚本目录不可用" }
     }
     const path = `${dir}/${PUBLISHED_USERSCRIPT_NAME}`
-    await FileManager.writeAsString(path, js)
-    // 发布后自检：用 node vm.Script 编译产物（只解析不执行），防转换器残留 TS 语法
-    // 导致 Safari 注入失败（曾因匿名函数表达式参数 `function (this: any, ...)` 未被剥离而踩坑）。
-    const syntax = await runCommand(`node -e \"new (require('vm').Script)(require('fs').readFileSync(process.argv[1], 'utf8')); console.log('SYNTAX_OK')\" ${quote(path)}`, 60).catch(() => ({ exitCode: 1, output: "" }))
-    if (syntax.exitCode !== 0 || !String(syntax.output || "").includes("SYNTAX_OK")) {
-      return { ok: false, path, version: null, error: `部署产物语法自检失败：${String(syntax.output || "").slice(0, 200)}` }
-    }
+    let syntaxOutput = ""
+    await replaceValidatedUserscript(path, js, async (temporaryPath) => {
+      // 用 node vm.Script 编译临时产物（只解析不执行）；校验通过前不触碰正式 userscript。
+      const syntax = await runCommand(`node -e \"new (require('vm').Script)(require('fs').readFileSync(process.argv[1], 'utf8')); console.log('SYNTAX_OK')\" ${quote(temporaryPath)}`, 60).catch(() => ({ exitCode: 1, output: "" }))
+      syntaxOutput = String(syntax.output || "")
+      return syntax.exitCode === 0 && syntaxOutput.includes("SYNTAX_OK")
+    }).catch((error) => {
+      const detail = syntaxOutput.slice(0, 200)
+      throw new Error(detail ? `部署产物语法自检失败：${detail}` : error instanceof Error ? error.message : String(error))
+    })
     const version = source.match(/\/\/\s*@version\s+(\S+)/)?.[1] ?? null
     return { ok: true, path, version }
   } catch (error) {
