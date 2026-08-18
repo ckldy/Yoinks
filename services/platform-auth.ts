@@ -2,7 +2,7 @@ import { Path, Script, type Cookie } from "scripting"
 import { createTaskId } from "./logs"
 import type { MediaPlatform } from "./media"
 
-export type AuthPlatform = "xiaohongshu" | "youtube" | "bilibili"
+export type AuthPlatform = "douyin" | "xiaohongshu" | "youtube" | "bilibili"
 export type LoginRetention = "temporary" | "persistent"
 
 export type PlatformAuthSession = {
@@ -16,7 +16,11 @@ const ROOT_DIR = Path.join(FileManager.documentsDirectory, "Yoinks")
 const TEMP_DIR = Path.join(ROOT_DIR, "tmp")
 
 const PLATFORM_CONFIG: Record<AuthPlatform, { label: string; loginURL: string; domains: string[] }> = {
-  // 抖音走匿名 WebView 直链下载，不提供用户登录 Cookie 路径。
+  douyin: {
+    label: "抖音",
+    loginURL: "https://www.douyin.com/",
+    domains: ["douyin.com", "iesdouyin.com"],
+  },
   xiaohongshu: {
     label: "小红书",
     loginURL: "https://www.xiaohongshu.com/",
@@ -94,7 +98,7 @@ export function supportedAuthPlatforms(): AuthPlatform[] {
 }
 
 export function isAuthPlatform(platform: MediaPlatform): platform is AuthPlatform {
-  return platform === "xiaohongshu" || platform === "youtube" || platform === "bilibili"
+  return platform === "douyin" || platform === "xiaohongshu" || platform === "youtube" || platform === "bilibili"
 }
 
 export function authPlatformLabel(platform: AuthPlatform): string {

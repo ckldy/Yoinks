@@ -71,6 +71,7 @@ export type ExtractedInfo = {
   bodyTextPreview: string
   resourceHints: string[]
   performanceMedia: string[]
+  captchaPage: boolean
 }
 
 export type DownloadedFile = {
@@ -107,6 +108,8 @@ export type DownloadCandidate = {
   label: string
   url: string
   headers: Record<string, string>
+  /** DASH 视频档位关联的独立音频镜像；仅在线预览使用。 */
+  audioURLs?: string[]
 }
 
 export const ROOT_DIR = Path.join(FileManager.documentsDirectory, "Yoinks")
@@ -118,18 +121,24 @@ export const MOBILE_SAFARI_UA = [
   "Version/18.0 Mobile/15E148 Safari/604.1",
 ].join(" ")
 
+export const DESKTOP_CHROME_UA = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+  "AppleWebKit/537.36 (KHTML, like Gecko)",
+  "Chrome/126.0.0.0 Safari/537.36",
+].join(" ")
+
 function getNestedRecord(source: Record<string, unknown>, key: string): Record<string, unknown> | null {
   const value = source[key]
   return isRecord(value) ? value : null
 }
 
-function extractVideoId(url: string | null): string | null {
+export function extractVideoId(url: string | null): string | null {
   if (!url) return null
   const match = url.match(/[?&]video_id=([^&]+)/)
   return match?.[1] || null
 }
 
-function extractAwemeIdFromURL(url: string | null): string | null {
+export function extractAwemeIdFromURL(url: string | null): string | null {
   if (!url) return null
   const match = url.match(/\/(?:share\/)?(?:video|note|gallery|slides)\/(\d{15,20})/) || url.match(/[?&](?:modal_id|aweme_id|item_id)=(\d{15,20})/)
   return match?.[1] || null
@@ -401,6 +410,27 @@ export function extractInlineDetailRoot(extracted: ExtractedInfo): Record<string
   return null
 }
 
+/**
+ * 2026-08-18 瘦 detail 韧性：多路提取可用于构造 play 地址的 video_id。
+ * 1) aweme 壳 video.video_id（完整 detail 才有）；2) videoSrc URL 的 video_id 参数；
+ * 3) 页面/源 URL 中的数字作品 ID（抖音 play 接口的 video_id 与 aweme_id 同值）。
+ */
+export function resolveFallbackVideoId(extracted: ExtractedInfo, sourceURL: string): string | null {
+  const inlineRoot = extractInlineDetailRoot(extracted)
+  const video = inlineRoot && typeof inlineRoot.video === "object" && inlineRoot.video !== null
+    ? (inlineRoot.video as Record<string, unknown>)
+    : null
+  const fromVideo = video && typeof video.video_id === "string" ? video.video_id : null
+  if (fromVideo) return fromVideo
+  const fromVideoSrc = extractVideoId(extracted.videoSrc)
+  if (fromVideoSrc) return fromVideoSrc
+  return (
+    extractAwemeIdFromURL(extracted.pageURL) ||
+    extractAwemeIdFromURL(extracted.canonical) ||
+    extractAwemeIdFromURL(sourceURL)
+  )
+}
+
 export function buildDownloadCandidates(
   extracted: ExtractedInfo,
   preferNoWatermark: boolean
@@ -418,7 +448,7 @@ export function buildDownloadCandidates(
   if (inlineRoot) {
     const video = getNestedRecord(inlineRoot, "video")
     if (video) {
-      const pushAddress = (label: string, address: unknown) => {
+      const pushAddress = (label: string, address: unknown, audioURLs?: string[]) => {
         if (!isRecord(address)) return
         const addressRecord = address
         const urls = getArray(addressRecord.url_list)
@@ -433,6 +463,7 @@ export function buildDownloadCandidates(
                 ...baseHeaders,
                 Referer: pageReferer,
               },
+              audioURLs,
             })
           }
           candidates.push({
@@ -442,6 +473,7 @@ export function buildDownloadCandidates(
               ...baseHeaders,
               Referer: pageReferer,
             },
+            audioURLs,
           })
         }
       }
@@ -451,23 +483,41 @@ export function buildDownloadCandidates(
       pushAddress("inline_play_addr_265", video.play_addr_265)
       pushAddress("inline_download_addr", video.download_addr)
 
+      const audioURLsByFileId = new Map<string, string[]>()
+      for (const item of getArray(video.bit_rate_audio)) {
+        if (!isRecord(item)) continue
+        const audioMeta = getNestedRecord(item, "audio_meta")
+        const fileId = audioMeta && getString(audioMeta.file_id)
+        if (!audioMeta || !fileId) continue
+        const urlList = audioMeta.url_list
+        const urls = isRecord(urlList)
+          ? dedupeStrings([getString(urlList.main_url), getString(urlList.backup_url), getString(urlList.fallback_url)].filter((url): url is string => Boolean(url)))
+          : urlsFromAddress(urlList)
+        if (urls.length) audioURLsByFileId.set(fileId, urls)
+      }
+
       const bitRates = getArray(video.bit_rate)
       for (const item of bitRates) {
         if (!isRecord(item)) continue
         const gearName = getString(item.gear_name) || getString(item.quality_type) || "bit_rate"
-        pushAddress(`inline_bit_rate_${gearName}`, item.play_addr)
+        const videoExtra = safeJSONParse(getString(item.video_extra))
+        const audioFileId = isRecord(videoExtra) ? getString(videoExtra.audio_file_id) : null
+        pushAddress(`inline_bit_rate_${gearName}`, item.play_addr, audioFileId ? audioURLsByFileId.get(audioFileId) : undefined)
       }
     }
   }
 
-  if (!extracted.videoSrc) {
+  if (!extracted.videoSrc || inlineRoot) {
+    // 有内嵌 aweme 数据（detail API）时，videoSrc 可能是广告流，不再混入候选。
     return dedupeCandidates(candidates)
   }
 
   const videoId = extractVideoId(extracted.videoSrc)
+  const isMobilePlayURL = extracted.videoSrc.includes("m.douyin.com/aweme/v1/play")
 
   if (preferNoWatermark) {
-    if (extracted.videoSrc.includes("/playwm/")) {
+    if (extracted.videoSrc.includes("/playwm/") && !isMobilePlayURL) {
+      // 桌面版 playwm→play 替换；移动版 m.douyin.com/aweme/v1/playwm/ 替换为 /play/ 会 404，保留原 URL。
       candidates.push({
         label: "replace_playwm_to_play",
         url: extracted.videoSrc.replace("/playwm/", "/play/"),
@@ -478,7 +528,7 @@ export function buildDownloadCandidates(
       })
     }
 
-    if (videoId) {
+    if (videoId && !isMobilePlayURL) {
       candidates.push({
         label: "constructed_play_watermark0",
         url: `https://www.iesdouyin.com/aweme/v1/play/?video_id=${videoId}&ratio=720p&line=0&is_play_url=1&watermark=0&source=PackSourceEnum_PUBLISH`,
@@ -538,7 +588,7 @@ export function isLikelyMediaResponse(finalURL: string, mimeType?: string): bool
   const mime = mimeType || ""
   if (mime.startsWith("video/")) return true
   if (mime === "application/octet-stream") return true
-  return ["douyinvod", ".mp4", "video_mp4", "tos-cn", "aweme.snssdk.com/aweme/v1/play"].some((token) => finalURL.includes(token))
+  return ["douyinvod", ".mp4", "video_mp4", "tos-cn", "aweme.snssdk.com/aweme/v1/play", "m.douyin.com/aweme/v1/play"].some((token) => finalURL.includes(token))
 }
 
 export function isLikelyImageResponse(finalURL: string, mimeType?: string): boolean {
@@ -561,39 +611,6 @@ async function cancelResponseBody(response: Response) {
   try {
     await response.body.getReader().cancel("handled by BackgroundURLSession")
   } catch {}
-}
-
-async function waitForInitialWebViewLoad(webView: WebViewController, log?: DownloadLogFn): Promise<void> {
-  let waitSettled = false
-  const loadPromise = webView.waitForLoad()
-    .then(() => {
-      waitSettled = true
-      return true
-    })
-    .catch((error: unknown) => {
-      waitSettled = true
-      log?.(`页面首屏加载等待异常，继续解析：${error instanceof Error ? error.message : String(error)}`)
-      return false
-    })
-
-  const loaded = await Promise.race([
-    loadPromise,
-    sleep(8000).then(() => false),
-  ])
-
-  if (loaded) {
-    log?.("页面首屏加载完成，等待脚本注入稳定…")
-    return
-  }
-
-  if (!waitSettled) {
-    try {
-      const readyState = await webView.evaluateJavaScript<string>("document.readyState")
-      log?.(`页面首屏加载等待超时，当前 readyState=${readyState || "unknown"}，继续读取已加载数据。`)
-    } catch {
-      log?.("页面首屏加载等待超时，继续读取已加载数据。")
-    }
-  }
 }
 
 async function downloadImageBatch(options: {
@@ -704,49 +721,196 @@ async function downloadImageBatch(options: {
   }
 }
 
+// 注入式签名详情接口捕获：在页面上下文中 hook fetch/XHR，把页面自身发出的
+// /aweme/v1/web/aweme/ 响应（含完整 aweme_detail）缓存到 window.__dyCapturedDetails。
+// 幂等：重复调用只检查已有缓存，不重复安装。页面加载后约 3 秒才发起签名请求，
+// loadURL 返回后尽早轮询注入即可命中。
+const DY_DETAIL_HOOK_JS = `
+(() => {
+  if (!window.__dyDetailHookInstalled) {
+    window.__dyDetailHookInstalled = true
+    window.__dyCapturedDetails = window.__dyCapturedDetails || []
+    const pushDetail = (url, text) => {
+      try {
+        const json = JSON.parse(text)
+        if (json && typeof json === 'object' && json.aweme_detail !== undefined) {
+          window.__dyCapturedDetails.push({ url: url, text: text })
+          if (window.__dyCapturedDetails.length > 5) window.__dyCapturedDetails.shift()
+        }
+      } catch (e) {}
+    }
+    const origFetch = window.fetch.bind(window)
+    window.fetch = async (...args) => {
+      const response = await origFetch(...args)
+      try {
+        const url = (typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url)) || ''
+        if (url.indexOf('/aweme/v1/web/aweme/') !== -1) {
+          response.clone().text().then((text) => pushDetail(url, text)).catch(() => {})
+        }
+      } catch (e) {}
+      return response
+    }
+    const origOpen = XMLHttpRequest.prototype.open
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      try { this.__dyHookUrl = String(url) } catch (e) {}
+      return origOpen.apply(this, [method, url, ...rest])
+    }
+    const origSend = XMLHttpRequest.prototype.send
+    XMLHttpRequest.prototype.send = function(...args) {
+      try {
+        const u = this.__dyHookUrl || ''
+        if (u.indexOf('/aweme/v1/web/aweme/') !== -1) {
+          this.addEventListener('load', () => {
+            try { pushDetail(u, this.responseText || '') } catch (e) {}
+          })
+        }
+      } catch (e) {}
+      return origSend.apply(this, args)
+    }
+  }
+})()
+return {
+  count: (window.__dyCapturedDetails || []).length,
+  // 2026-08-18 实锤：TTGCaptcha 对象和 rc-verifycenter/rmc-nocaptcha iframe 在正常页面
+  // 也存在（验证 SDK 预加载），均不能作为滑块判据；真实滑块页会显示验证文案。
+  captcha: (document.title || '').indexOf('验证码') !== -1
+    || (document.body && (document.body.innerText || '').indexOf('请完成验证') !== -1)
+    || (document.body && (document.body.innerText || '').indexOf('拖动滑块') !== -1)
+    || (document.body && (document.body.innerText || '').indexOf('安全验证') !== -1),
+  hasVideo: document.querySelector('video') !== null,
+}
+`
+
 export async function extractFromWebView(
   url: string,
   options?: {
     onLog?: DownloadLogFn
     onProgress?: DownloadProgressFn
+    userAgent?: string
+    mode?: "desktop" | "mobile"
+    /** Persistent local login WebView; never serialized or sent remotely. */
+    webView?: WebViewController
   }
 ): Promise<ExtractedInfo> {
   const log = options?.onLog
   const report = options?.onProgress
-  const webView = new WebViewController({ ephemeral: true })
+  const webView = options?.webView || new WebViewController()
+  const ownsWebView = !options?.webView
 
   try {
-    log?.("正在创建 WebView 并设置移动端 UA…")
-    webView.setCustomUserAgent(MOBILE_SAFARI_UA)
+    // 1) 解析短链 → 提取 aweme_id → 直接打开主站完整视频页（分享页已不再下发媒体数据）。
+    const resolvedURL = url.includes("v.douyin.com") ? await resolveShortLink(url) : url
+    const awemeId = extractAwemeIdFromURL(resolvedURL) || extractAwemeIdFromURL(url)
+    const galleryHint =
+      /\/(?:share\/)?(?:note|gallery|slides)\//.test(url) ||
+      /\/(?:share\/)?(?:note|gallery|slides)\//.test(resolvedURL)
+    const targetURL = awemeId
+      ? (galleryHint ? `https://www.douyin.com/note/${awemeId}` : `https://www.douyin.com/video/${awemeId}`)
+      : resolvedURL
 
-    report?.({ fraction: 0.05, stage: "正在打开分享链接" })
-    log?.(`开始加载页面：${url}`)
-    await webView.loadURL(url)
-
-    report?.({ fraction: 0.1, stage: "正在等待页面首屏加载" })
-    await waitForInitialWebViewLoad(webView, log)
-    await sleep(2500)
-
-    report?.({ fraction: 0.14, stage: "正在尝试激活视频节点" })
-    await webView.evaluateJavaScript(`
-      (async () => {
-        const video = document.querySelector('video')
-        if (video) {
-          try {
-            video.muted = true
-            await video.play()
-          } catch (e) {}
+    // 2) 收集页面自己发出的签名接口请求（带 a_bogus 等），供稍后重放。
+    const signedDetailURLs: string[] = []
+    webView.shouldAllowRequest = async (request) => {
+      try {
+        if (request.url.includes("/aweme/v1/web/") && !signedDetailURLs.includes(request.url)) {
+          signedDetailURLs.push(request.url)
         }
-        return {
-          hasVideo: Boolean(video),
-          readyState: video?.readyState || 0,
-          currentSrc: video?.currentSrc || video?.src || null,
-        }
-      })()
-    `)
+      } catch {}
+      return true
+    }
 
-    log?.("已执行视频激活动作，继续等待页面内嵌数据出现…")
-    await sleep(4000)
+    // 3) 预置匿名 webid cookie（s_v_web_id），降低匿名风控概率；持久数据存储可累积 ttwid。
+    const webId = generateDouyinWebId()
+    await webView.setCookie({
+      name: "s_v_web_id",
+      value: webId,
+      domain: ".douyin.com",
+      path: "/",
+      isSecure: false,
+      isHTTPOnly: false,
+      isSessionOnly: false,
+      expiresDate: new Date(Date.now() + 365 * 86400_000),
+    })
+
+    // UA 策略（2026-08-18 实锤）：伪造的桌面 UA 尾部（Version/18.0 Safari/605.1.15）与真实
+    // WKWebView UA 不符会被抖音 secsdk 识别触发滑块风控；移动 iPhone UA 会被 302 到
+    // m.douyin.com 分享引导页（无 detail）。使用系统默认真实 UA（本机 iPad Safari，桌面
+    // 布局）页面正常打开并自签名 detail。因此 desktop 模式默认不设置自定义 UA；
+    // mobile 模式保持 iPhone UA（页面会跳分享页但可兜底 playwm）。
+    const mode = options?.mode || "mobile"
+    const userAgent = options?.userAgent ?? (mode === "desktop" ? undefined : MOBILE_SAFARI_UA)
+    if (userAgent) {
+      log?.(mode === "desktop" ? "正在设置桌面 Safari UA…" : "正在创建 WebView 并设置 iPhone UA（指纹自洽，规避桌面伪装风控）…")
+      webView.setCustomUserAgent(userAgent)
+    } else {
+      log?.("使用本机真实 Safari UA（不设置自定义 UA，规避伪造 UA 风控）…")
+    }
+
+    report?.({ fraction: 0.05, stage: "正在打开视频页面" })
+    log?.(`开始加载页面：${targetURL}`)
+    await webView.loadURL(targetURL)
+
+    report?.({ fraction: 0.1, stage: "正在等待页面签名详情接口" })
+
+    // 4) 尽早注入 fetch/XHR hook 捕获页面自身发出的签名详情接口响应（a_bogus/签名由页面
+    //    JS 生成，捕获响应文本即拿到正片数据，无需重放、不依赖 performance entries）。
+    //    轮询同时激活视频节点，辅助页面初始化播放器发起签名请求。
+    let capturedDetailText: string | null = null
+    let videoActivated = false
+    let videoSeenAt = -1
+    const maxPolls = mode === "desktop" ? 40 : 30
+    for (let index = 0; index < maxPolls; index += 1) {
+      let captured: Array<{ url: string; text: string }> | null = null
+      let captchaDetected = false
+      try {
+        const state = await webView.evaluateJavaScript<{ count: number; captcha: boolean; hasVideo: boolean }>(DY_DETAIL_HOOK_JS)
+        captchaDetected = Boolean(state && state.captcha)
+        if (videoSeenAt < 0 && state && state.hasVideo) videoSeenAt = index
+        if (state && state.count > 0) {
+          captured = await webView.evaluateJavaScript<Array<{ url: string; text: string }>>(
+            "return (window.__dyCapturedDetails || []).slice(-1)"
+          )
+        }
+      } catch {}
+      if (captured && captured.length && captured[0].text) {
+        capturedDetailText = captured[0].text
+        log?.("已捕获页面签名作品详情接口响应。")
+        break
+      }
+      if (captchaDetected) {
+        log?.("检测到抖音验证码中间页（风控），提前结束等待。")
+        break
+      }
+      // 移动版页面通常不发送签名 detail 接口，video 节点出现后再等约 2 秒即可读取正片地址。
+      if (mode !== "desktop" && videoSeenAt >= 0 && index - videoSeenAt >= 4) {
+        log?.("页面视频节点已就绪，提前结束等待。")
+        break
+      }
+      if (!videoActivated) {
+        try {
+          await webView.evaluateJavaScript(`
+            (() => {
+              const video = document.querySelector('video')
+              if (video) {
+                try {
+                  video.muted = true
+                  video.play().catch(() => {})
+                } catch (e) {}
+              }
+              return Boolean(video)
+            })()
+          `)
+          videoActivated = true
+        } catch {}
+      }
+      await sleep(500)
+    }
+    if (!capturedDetailText) {
+      log?.("等待页面签名详情接口超时，继续尝试重放或兜底接口。")
+    } else {
+      report?.({ fraction: 0.14, stage: "等待播放器使用详情数据" })
+      await sleep(1200)
+    }
 
     report?.({ fraction: 0.18, stage: "正在读取页面内嵌数据" })
     const data = await webView.evaluateJavaScript<ExtractedInfo>(`
@@ -795,20 +959,78 @@ export async function extractFromWebView(
         bodyTextPreview: document.body?.innerText?.slice(0, 600) || '',
         resourceHints: scripts,
         performanceMedia: mediaEntries,
+        captchaPage: (document.title || '').includes('验证码')
+          || (document.body && (document.body.innerText || '').indexOf('请完成验证') !== -1)
+          || (document.body && (document.body.innerText || '').indexOf('拖动滑块') !== -1)
+          || (document.body && (document.body.innerText || '').indexOf('安全验证') !== -1),
       }
     `)
 
     log?.(`页面信息读取完成：title=${data.title || "(空)"}`)
+    if (data.captchaPage) {
+      throw new Error("抖音触发滑块验证风控：请稍后（建议 10 分钟以上）重试，或切换网络后再试；可在设置页使用本机抖音扫码登录后重新测试")
+    }
     const preliminaryImages = extractImageURLs(data)
     const galleryLike = isGalleryURL(url) || isGalleryURL(data.canonical) || isGalleryURL(data.pageURL)
-    const shouldFetchDetail = galleryLike || (!data.videoSrc && preliminaryImages.length === 0)
-    const awemeId = shouldFetchDetail ? (extractAwemeIdFromURL(data.canonical) || extractAwemeIdFromURL(data.pageURL) || extractAwemeIdFromURL(url)) : null
-    if (awemeId) {
-      report?.({ fraction: 0.19, stage: "正在尝试读取作品详情接口" })
+    let hasInlineRoot = Boolean(extractInlineDetailRoot(data))
+    // 2026-08-18 瘦 detail 韧性：hook 竞态未捕获签名响应时，内嵌 routerData/videoInfoRes 可能只有
+    // aweme 壳（video.bit_rate 为空、无 video_id）。此时仍要尝试 hook 赋值/重放/兑底拿完整 bit_rate，
+    // 否则只回退 videoSrc 单档（本地解析偶发“只出 1 个格式”的根因之一）。
+    let localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
+    let hasRichDetail = hasInlineRoot && localBitRateCount > 0
+
+    // 4.5) 优先使用注入 hook 捕获的页面签名详情响应（页面自生成签名，天然有效且无需重放）。
+    if (capturedDetailText && !hasRichDetail) {
+      data.apiDetailJSON = capturedDetailText
+      hasInlineRoot = true
+      localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
+      hasRichDetail = localBitRateCount > 0
+      log?.("使用注入捕获的签名详情数据。")
+    }
+
+    // 4) 兜底：重放页面自身发出的带签名 detail 请求（a_bogus 由页面 JS 生成，重放即可复用签名与 cookie）。
+    //    注意：shouldAllowRequest 只拦截导航请求不拦截 fetch，真正可靠的 URL 来源是 performance entries。
+    const detailURLsFromPerformance = (data.performanceMedia || []).filter((item) =>
+      item.includes("/aweme/v1/web/aweme/detail/") || item.includes("/aweme/v1/web/aweme/")
+    )
+    const allDetailURLs = Array.from(new Set([...signedDetailURLs, ...detailURLsFromPerformance]))
+    if (!hasRichDetail && allDetailURLs.length) {
+      report?.({ fraction: 0.19, stage: "正在重放签名作品详情接口" })
       try {
-        const apiDetailJSON = await fetchAwemeDetailInWebView(webView, awemeId)
+        const replayed = await replaySignedDetailURL(webView, allDetailURLs)
+        if (replayed) {
+          data.apiDetailJSON = replayed
+          localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
+          hasRichDetail = localBitRateCount > 0
+          log?.("签名作品详情接口重放命中。")
+          if (!data.title) {
+            const root = extractInlineDetailRoot(data)
+            if (root) {
+              data.title = getString(root.desc) || getString(root.caption) || data.title
+            }
+          }
+        } else {
+          log?.("签名作品详情接口重放未命中，继续使用页面内嵌数据。")
+        }
+      } catch (error) {
+        log?.(`签名作品详情接口重放跳过：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // 5) 兑底：无签名 fetch 作品详情接口（依赖预置 cookie，成功率较低）。
+    const shouldFetchDetail = galleryLike
+      || (!hasRichDetail && (hasInlineRoot || (!data.videoSrc && preliminaryImages.length === 0)))
+    const fallbackAwemeId = shouldFetchDetail
+      ? (extractAwemeIdFromURL(data.canonical) || extractAwemeIdFromURL(data.pageURL) || awemeId)
+      : null
+    if (fallbackAwemeId && !hasRichDetail) {
+      report?.({ fraction: 0.2, stage: "正在尝试读取作品详情接口" })
+      try {
+        const apiDetailJSON = await fetchAwemeDetailInWebView(webView, fallbackAwemeId)
         if (apiDetailJSON) {
           data.apiDetailJSON = apiDetailJSON
+          localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
+          hasRichDetail = localBitRateCount > 0
           log?.("作品详情接口已命中。")
         } else {
           log?.("作品详情接口未命中，继续使用页面内嵌数据。")
@@ -817,6 +1039,7 @@ export async function extractFromWebView(
         log?.(`作品详情接口跳过：${error instanceof Error ? error.message : String(error)}`)
       }
     }
+    log?.(`本地格式证据：detail=${data.apiDetailJSON ? "有" : "无"}，bitRate=${localBitRateCount}，登录会话=${options?.webView ? "有" : "无"}`)
     log?.(`videoSrc=${data.videoSrc ? "已提取" : "未提取"}，apiDetail=${data.apiDetailJSON ? "有" : "无"}，routerData=${data.routerDataJSON ? "有" : "无"}，videoInfoRes=${data.videoInfoResJSON ? "有" : "无"}`)
     data.thumbnailURL = extractThumbnailURL(data)
     const structuredImageCount = extractImageURLs({ ...data, imageURLs: [] }).length
@@ -827,8 +1050,49 @@ export async function extractFromWebView(
 
     return data
   } finally {
-    webView.dispose()
+    if (ownsWebView) webView.dispose()
   }
+}
+
+async function resolveShortLink(url: string): Promise<string> {
+  try {
+    const response = await fetch(url, { method: "GET", timeout: 20, debugLabel: "douyin-resolve-shortlink" })
+    return response.url || url
+  } catch {
+    return url
+  }
+}
+
+function generateDouyinWebId(): string {
+  return (Date.now().toString() + String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0")).slice(-19)
+}
+
+async function replaySignedDetailURL(webView: WebViewController, urls: string[]): Promise<string | null> {
+  const targets = JSON.stringify(urls.slice(0, 3))
+  return webView.evaluateJavaScript<string | null>(`
+    (async () => {
+      const urls = ${targets}
+      for (const url of urls) {
+        try {
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 5000)
+          const response = await fetch(url, {
+            credentials: 'include',
+            signal: controller.signal,
+            headers: { accept: 'application/json, text/plain, */*' },
+          })
+          clearTimeout(timer)
+          if (!response.ok) continue
+          const text = await response.text()
+          try {
+            const json = JSON.parse(text)
+            if (json && typeof json === 'object' && json.aweme_detail !== undefined) return text
+          } catch (e) {}
+        } catch (e) {}
+      }
+      return null
+    })()
+  `)
 }
 
 async function fetchAwemeDetailInWebView(webView: WebViewController, awemeId: string): Promise<string | null> {

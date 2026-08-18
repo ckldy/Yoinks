@@ -11,8 +11,8 @@ try:
         _PoTokenContext
     )
     from yt_dlp.extractor.youtube._video import (
-        STREAMING_DATA_CLIENT_NAME,
         STREAMING_DATA_FETCH_GVS_PO_TOKEN,
+        STREAMING_DATA_CLIENT_NAME,
     )
     # yt-dlp 2026.07.04 移除了 STREAMING_DATA_INITIAL_PO_TOKEN，用 FETCH_GVS 语义替代
     STREAMING_DATA_INITIAL_PO_TOKEN = STREAMING_DATA_FETCH_GVS_PO_TOKEN
@@ -283,8 +283,6 @@ class _YTSE(YoutubeIE, plugin_name='YTSE'):
                     continue
                 format_copy = f.copy()
                 format_copy['protocol'] = 'ump'
-                # 稳定后缀：UMP 副本 format_id = {原id}-ump（yt-dlp 去重后缀 -0/-1 顺序不稳定，
-                # 曾导致 -0 匹配到 https 版、UMP 未生效；-ump 后缀保证格式表达式可确定选中 UMP 副本）。
                 format_copy['format_id'] = f"{f.get('format_id')}-ump"
                 format_copy['url'] = update_url_query(format_copy['url'], {'ump': 1, 'srfvp': 1})
                 ump_formats.append(format_copy)

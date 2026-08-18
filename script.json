@@ -17,16 +17,11 @@
     "homepage": null,
     "name": "vcncv"
   },
-  "name": "Yoinks",
+  "name": "YoinksRemote",
   "runInApp": true,
-  "version": "1.6.14",
+  "version": "1.6.17",
   "icon": "arrow.down.to.line.compact",
   "permissions": null,
-  "remoteResource": {
-    "url": "https://github.com/ckldy/Yoinks",
-    "hash": "c89cbbd17c0e8de62dec4a598703546d",
-    "autoUpdateInterval": null
-  },
   "localizedDescriptions": {
     "zh": "粘贴或分享公开媒体链接，选择格式下载；支持批量添加后顺序下载，并保存到相册或文件。",
     "en": "Paste or share a public media link, choose an output format, then save it to Photos or Files."

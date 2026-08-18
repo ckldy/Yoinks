@@ -17,7 +17,7 @@ async function run() {
     return
   }
 
-  await Script.run({ name: "Yoinks", queryParameters: { url }, singleMode: true })
+  await Script.run({ name: "YoinksRemote", queryParameters: { url }, singleMode: true })
   Script.exit(Intent.text("已在 Yoinks 中打开链接。"))
 }
 

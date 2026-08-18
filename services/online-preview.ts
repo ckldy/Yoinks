@@ -14,6 +14,8 @@ export type OnlinePreviewOptions = {
   previewHeaders?: Record<string, string>
   /** Separate audio for DASH video-only preview (Bilibili/YouTube). */
   audioUrl?: string
+  /** Audio track is muxed inside the video file (Douyin bit_rate/play_addr). */
+  muxedAudio?: boolean
   /** Media duration in seconds; required for DASH MPD generation. */
   duration?: number
   /** Actual video codec string for DASH MPD (e.g. avc1.640033). */
@@ -255,7 +257,7 @@ export async function openOnlinePreview(
             soft: true,
             requestMode: player.getRequestMode(),
             headersApplied: player.getHeadersApplied(),
-            hasAudio: Boolean(options.audioUrl),
+            hasAudio: Boolean(options.audioUrl) || Boolean(options.muxedAudio),
           },
         })
         return { status: "presented", player: null, played: false }
@@ -268,7 +270,7 @@ export async function openOnlinePreview(
           message: mediaFailed,
           requestMode: player.getRequestMode(),
           headersApplied: player.getHeadersApplied(),
-          hasAudio: Boolean(options.audioUrl),
+          hasAudio: Boolean(options.audioUrl) || Boolean(options.muxedAudio),
         },
       })
       return { status: "failed", message: mediaFailed }
@@ -282,7 +284,7 @@ export async function openOnlinePreview(
         isMuted: autoplayMode === "muted",
         requestMode: player.getRequestMode(),
         headersApplied: player.getHeadersApplied(),
-        hasAudio: Boolean(options.audioUrl),
+        hasAudio: Boolean(options.audioUrl) || Boolean(options.muxedAudio),
         played,
       },
     })

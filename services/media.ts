@@ -18,6 +18,7 @@ import {
 } from "./hls"
 import { formatBytes, runCommand } from "./shell-utils"
 import { downloadMpdNative, isMPDURL } from "./mpd"
+import { resolveRemoteMedia, type RemoteResolveResult } from "./remote-resolver"
 
 // HLS 清单解析与变体选择已拆分到 services/hls.ts；
 // 保留 re-export 以兼容既有 import（verify 脚本等）与公开 API。
@@ -25,10 +26,13 @@ export { listHlsVariants, parseHlsManifestSummary, selectHighestHlsVariant } fro
 import {
   buildDownloadCandidates,
   downloadVideo as downloadDouyinVideo,
+  extractAwemeIdFromURL,
   extractFromWebView,
   extractImageURLs,
   extractInlineDetailRoot,
+  resolveFallbackVideoId,
   MOBILE_SAFARI_UA,
+  type DownloadCandidate,
   type DownloadSuccess as DouyinDownloadSuccess,
   type ExtractedInfo,
 } from "./douyin"
@@ -96,6 +100,8 @@ export type MediaChoice = {
   youtubeVideoItag?: number
   /** YouTube UMP/SABR 音频轨 itag；DASH 合并格式必填。 */
   youtubeAudioItag?: number
+  /** 抖音远程高清解析候选（Camoufox 抓取的 aweme/detail 直链，无水印多档；本地移动版仅 720p 带水印）。 */
+  douyinRemoteCandidates?: Array<{ label: string; url: string; referer?: string }>
 }
 
 export type MediaProbe = {
@@ -795,7 +801,7 @@ export type MediaPlatform = "douyin" | "xiaohongshu" | "youtube" | "bilibili" | 
 
 const XIAOHONGSHU_URL_PATTERNS = [
   /https?:\/\/(?:www\.)?(?:xiaohongshu|rednote)\.com\/(?:explore|discovery\/item|search_result|user\/profile\/[a-z0-9]+)\/[a-z0-9]+(?:\?[^\s"'<>，。！？；：、]*)?/i,
-  /https?:\/\/xhslink\.com\/[^\s"'<>，。！？；：、]+/i,
+  /https?:\/\/xhslink\.(?:com|cn)\/[^\s"'<>，。！？；：、]+/i,
 ]
 const DOUYIN_URL_PATTERNS = [
   /https?:\/\/v\.douyin\.com\/[a-zA-Z0-9_-]+/i,
@@ -850,6 +856,22 @@ export function mediaPlatformLabel(value: string | null | undefined): string | n
     case "xiaohongshu": return "小红书"
     case "bilibili": return "B站"
     default: return null
+  }
+}
+
+/**
+ * 小红书网页版地址栏/分享面板复制的完整链接可能不含 xsec_token（页面加载后 token 被移除）。
+ * 无 token 的 discovery/explore 链接任何浏览器都 404，远程解析也无法救。
+ * xhslink 短链 302 目标携带新鲜 token，放行（无法本地判断）。
+ */
+export function xiaohongshuMissingToken(value: string | null | undefined): boolean {
+  if (!value || detectMediaPlatform(value) !== "xiaohongshu") return false
+  try {
+    const url = new URL(value)
+    if (url.hostname.toLowerCase().endsWith("xhslink.com") || url.hostname.toLowerCase().endsWith("xhslink.cn")) return false
+    return !url.searchParams.has("xsec_token")
+  } catch {
+    return false
   }
 }
 
@@ -1620,6 +1642,8 @@ export async function installYtDlp(): Promise<string> {
 export type ProbeOptions = {
   cookieFile?: string
   authorizedPlatform?: AuthPlatform
+  /** Persistent on-device Douyin WebView session. Never serialized or sent to remote resolvers. */
+  douyinWebView?: WebViewController
   /** Public Safari page URL, used only for this probe as Referer. */
   referer?: string
   /** The Safari DOM explicitly identified this public URL as a media element, even when its path has no extension. */
@@ -1751,8 +1775,41 @@ async function probePublicPlayerSource(sourceURL: string, taskId: string, deadli
 
 export const DOUYIN_DIRECT_FORMAT = "douyin-webview"
 
+export const REMOTE_DIRECT_FORMAT = "remote-direct"
+
 function isDouyinDirectChoice(choice: MediaChoice | null | undefined): boolean {
   return Boolean(choice && (choice.formatExpression === DOUYIN_DIRECT_FORMAT || choice.id.startsWith("douyin-")))
+}
+
+/** 通用远程解析候选（远程只解析、本地下载的真实播放资源直链）。 */
+function isRemoteDirectChoice(choice: MediaChoice | null | undefined): boolean {
+  return Boolean(choice && choice.formatExpression === REMOTE_DIRECT_FORMAT)
+}
+
+/** 远程解析结果 → 展开为独立 MediaChoice（远程直链，排到本地候选前）。 */
+function remoteResultToMediaChoices(remote: RemoteResolveResult, referer: string): MediaChoice[] {
+  return remote.candidates.map((candidate, index) => {
+    const kindTag = candidate.kind === "dash" ? " · DASH" : candidate.kind === "m3u8" ? " · HLS" : ""
+    const parts: string[] = ["远程"]
+    if (candidate.height) parts.push(`${candidate.height}p`)
+    if (candidate.codec) parts.push(candidate.codec)
+    if (candidate.bitrate) parts.push(`· ${(candidate.bitrate / 1e6).toFixed(1)}Mbps`)
+    if (kindTag) parts.push(kindTag.trim())
+    if (candidate.gear) parts.push(`· ${candidate.gear}`)
+    if (parts.length === 1) parts.push(candidate.kind === "m3u8" ? "HLS" : "MP4")
+    return {
+      id: `remote-${remote.platform}-${index}`,
+      label: parts.join(" "),
+      kind: "video",
+      formatExpression: REMOTE_DIRECT_FORMAT,
+      container: "mp4",
+      height: candidate.height,
+      sourceURL: candidate.url,
+      previewURL: candidate.url,
+      previewReferer: referer,
+      previewHeaders: { "User-Agent": MOBILE_SAFARI_UA, Referer: referer, ...(candidate.headers ?? {}) },
+    }
+  })
 }
 
 /**
@@ -2395,15 +2452,192 @@ function douyinChoiceFromExtracted(extracted: ExtractedInfo, sourceURL: string):
   return { probe, extracted }
 }
 
-async function probeDouyinDirect(sourceURL: string): Promise<MediaProbe> {
+async function probeDouyinDirect(sourceURL: string, douyinWebView?: WebViewController): Promise<MediaProbe> {
   const taskId = createTaskId()
-  await logEvent({ level: "info", event: "probe.douyin.started", taskId, details: { sourceURL, mode: "anonymous-webview" } })
-  const extracted = await extractFromWebView(sourceURL, {
-    onLog: (message) => {
-      void logEvent({ level: "info", event: "probe.douyin.log", taskId, details: { message: message.slice(0, 500) } })
+  await logEvent({ level: "info", event: "probe.douyin.started", taskId, details: { sourceURL, mode: "desktop-safari-first" } })
+  const onLog = (message: string) => {
+    void logEvent({ level: "info", event: "probe.douyin.log", taskId, details: { message: message.slice(0, 500) } })
+  }
+
+  // 默认只走本地解析；用户显式启用远程解析时，先请求 Camoufox，
+  // 本地链路仍继续执行以提供标题、封面和远程失败回退。
+  const preferences = getPreferences()
+  await logEvent({
+    level: "info",
+    event: "probe.douyin.remote.config",
+    taskId,
+    details: { enabled: preferences.douyinRemoteEnabled, hasToken: Boolean(preferences.douyinRemoteToken), endpoint: preferences.douyinRemoteEndpoint },
+  })
+  const remote = preferences.douyinRemoteEnabled && preferences.douyinRemoteToken
+    ? await resolveRemoteMedia({
+        config: {
+          enabled: true,
+          endpoint: preferences.douyinRemoteEndpoint,
+          token: preferences.douyinRemoteToken,
+        },
+        url: sourceURL,
+        log: (message) => {
+          void logEvent({ level: "info", event: "probe.douyin.remote.log", taskId, details: { message: message.slice(0, 300) } })
+        },
+      })
+    : null
+
+  await logEvent({ level: "info", event: "probe.douyin.desktop.started", taskId, details: { sourceURL } })
+  let extracted: ExtractedInfo | null = null
+  let desktopQualities: ReturnType<typeof buildDownloadCandidates> = []
+  let fallbackReason = "未捕获桌面 bit_rate 清晰度列表"
+  try {
+    extracted = await extractFromWebView(sourceURL, {
+      onLog,
+      // 2026-08-18 实锤：不传 UA = 本机真实 Safari UA（桌面布局），页面正常自签名 detail（15 档）；
+      // 伪造 DESKTOP_SAFARI_UA 会被抖音风控触发滑块验证。
+      mode: "desktop",
+      webView: douyinWebView,
+    })
+    const desktopCandidates = buildDownloadCandidates(extracted, true)
+    desktopQualities = desktopCandidates.filter((candidate) => candidate.label.startsWith("inline_bit_rate_"))
+    if (desktopQualities.length) {
+      await logEvent({
+        level: "info",
+        event: "probe.douyin.desktop.completed",
+        taskId,
+        details: { qualityCount: desktopQualities.length, candidateCount: desktopCandidates.length },
+      })
+    }
+  } catch (error) {
+    fallbackReason = error instanceof Error ? error.message : String(error)
+    await logEvent({ level: "warn", event: "probe.douyin.desktop.failed", taskId, details: { message: fallbackReason } })
+  }
+  if (!desktopQualities.length) {
+    // hook 安装在 loadURL 返回后，极快页面偶尔会在安装前完成签名 detail 请求。
+    // 对视频不将 video_id 构造的 play 接口伪装成完整多格式，因为该 MP4 可能没有音轨。
+    // 保持同一登录会话，重新进入桌面作品页捕获一次完整 bit_rate。
+    await logEvent({ level: "info", event: "probe.douyin.desktop.retry-full-detail", taskId, details: { reason: fallbackReason.slice(0, 300) } })
+    onLog("未捕获完整清晰度详情，正在重新加载作品页…")
+    extracted = await extractFromWebView(sourceURL, {
+      onLog,
+      mode: "desktop",
+      webView: douyinWebView,
+    })
+    const retryCandidates = buildDownloadCandidates(extracted, true)
+    desktopQualities = retryCandidates.filter((candidate) => candidate.label.startsWith("inline_bit_rate_"))
+  }
+  if (!extracted) throw new Error("抖音桌面页面未返回媒体数据")
+  if (!desktopQualities.length && extracted.videoSrc) {
+    await logEvent({ level: "warn", event: "probe.douyin.desktop.full-detail-unavailable", taskId, details: { reason: fallbackReason.slice(0, 300) } })
+    throw new Error("未能获取作品完整清晰度详情，请稍后重新分析")
+  }
+  if (!desktopQualities.length) {
+    // 图文等没有 videoSrc 的页面仍按原有轻量数据链路处理。
+    await logEvent({ level: "info", event: "probe.douyin.desktop.fallback.mobile", taskId, details: { reason: fallbackReason.slice(0, 300) } })
+    extracted = await extractFromWebView(sourceURL, { onLog, mode: "mobile", webView: douyinWebView })
+  }
+
+  const { probe } = douyinChoiceFromExtracted(extracted, sourceURL)
+  const localBitRateCount = buildDownloadCandidates(extracted, true).filter((candidate) => candidate.label.startsWith("inline_bit_rate_")).length
+  await logEvent({
+    level: "info",
+    event: "probe.douyin.local-format-evidence",
+    taskId,
+    details: {
+      hasLocalLoginSession: Boolean(douyinWebView),
+      captcha: extracted.captchaPage,
+      hasDetail: Boolean(extractInlineDetailRoot(extracted)),
+      bitRateCount: localBitRateCount,
+      desktopCandidateCount: desktopQualities.length,
+      finalLocalChoiceCount: desktopQualities.length || probe.choices.length,
+      // 2026-08-18 瘦 detail 诊断：记录数据来源，区分 hook 捕获/内嵌/构造兜底
+      hasCapturedHookDetail: Boolean((extracted.apiDetailJSON || "").length > 2000 && (extracted.apiDetailJSON || "").includes("aweme_detail")),
+      hasRouterData: Boolean(extracted.routerDataJSON),
+      hasVideoInfoRes: Boolean(extracted.videoInfoResJSON),
+      hasVideoSrc: Boolean(extracted.videoSrc),
+      videoId: resolveFallbackVideoId(extracted, sourceURL),
+      awemeId: extractAwemeIdFromURL(extracted.pageURL) || extractAwemeIdFromURL(extracted.canonical) || extractAwemeIdFromURL(sourceURL),
+      constructedFallback: desktopQualities.length > 0 && desktopQualities[0].label.startsWith("constructed_"),
     },
   })
-  const { probe } = douyinChoiceFromExtracted(extracted, sourceURL)
+  if (desktopQualities.length) {
+    const referer = extracted.pageURL || sourceURL
+    // 抖音桌面 detail 的 bit_rate 是 DASH 纯视频；video_extra.audio_file_id 对应
+    // bit_rate_audio 的独立 HE-AACv2 音频。预览必须成对选择，不能把 media-video-hvc1 当 muxed MP4。
+    // 这里按档位（label）分组；每个镜像均先做范围请求健康检查，v26-web 这类 403 地址会被排除。
+    const groups = new Map<string, DownloadCandidate[]>()
+    for (const candidate of desktopQualities) {
+      const list = groups.get(candidate.label) ?? []
+      list.push(candidate)
+      groups.set(candidate.label, list)
+    }
+    // 302 播放接口可能被 fetch 健康检查跟随到最终 CDN；缓存最终 URL，
+    // 否则检查虽然成功，AVPlayer 仍会收到 www.douyin.com 的 302 入口而无法进入 ready。
+    const playableCache = new Map<string, { ok: boolean; url: string }>()
+    const inspectPlayable = async (url: string): Promise<{ ok: boolean; url: string }> => {
+      const cached = playableCache.get(url)
+      if (cached !== undefined) return cached
+      let result = { ok: false, url }
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          timeout: 8,
+          headers: { Range: "bytes=0-1023" },
+        })
+        const type = (response.headers.get("content-type") || "").toLowerCase()
+        result = {
+          ok: (response.status === 200 || response.status === 206)
+            && (type.includes("video") || type.includes("octet-stream") || type.includes("mp4")),
+          url: response.url || url,
+        }
+      } catch {}
+      playableCache.set(url, result)
+      if (result.url !== url) playableCache.set(result.url, result)
+      return result
+    }
+    const pickPlayable = async (urls: string[]): Promise<string> => {
+      for (const url of urls) {
+        const result = await inspectPlayable(url)
+        if (result.ok) return result.url
+      }
+      return urls[0] ?? ""
+    }
+    const entries = Array.from(groups.entries())
+    const checked: Array<{ label: string; url: string; audioURL?: string; headers: Record<string, string>; playable: boolean }> = []
+    let cursor = 0
+    const CONCURRENCY = 5
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, entries.length) }, async () => {
+        while (cursor < entries.length) {
+          const [label, candidates] = entries[cursor]
+          cursor += 1
+          const url = await pickPlayable(candidates.map((c) => c.url))
+          const health = await inspectPlayable(url)
+          const audioURL = await pickPlayable(candidates.flatMap((candidate) => candidate.audioURLs || []))
+          const audioHealth = audioURL ? await inspectPlayable(audioURL) : { ok: false, url: "" }
+          checked.push({ label, url: health.url, audioURL: audioHealth.ok ? audioHealth.url : undefined, headers: candidates[0].headers, playable: health.ok && audioHealth.ok })
+        }
+      }),
+    )
+    const playableCount = checked.filter((c) => c.playable).length
+    await logEvent({
+      level: "info",
+      event: "probe.douyin.preview-health",
+      taskId,
+      details: { groups: checked.length, playable: playableCount, blocked: checked.length - playableCount, pairedAudio: checked.filter((item) => Boolean(item.audioURL)).length },
+    })
+    probe.choices = checked.filter((item) => item.playable).map((item, index) => ({
+      id: `douyin-desktop-${index}`,
+      label: `${douyinWebView ? "本地登录" : "本地桌面 Safari"} · ${item.label.replace("inline_bit_rate_", "")}`,
+      kind: "video" as const,
+      formatExpression: DOUYIN_DIRECT_FORMAT,
+      container: "mp4",
+      sourceURL: item.url,
+      previewURL: item.url,
+      previewReferer: referer,
+      previewHeaders: item.headers,
+      previewAudioURL: item.audioURL,
+    }))
+    if (!probe.choices.length) {
+      throw new Error("当前作品没有可用的音视频配对预览流，请稍后重新分析")
+    }
+  }
   await logEvent({
     level: "info",
     event: "probe.douyin.completed",
@@ -2417,7 +2651,78 @@ async function probeDouyinDirect(sourceURL: string): Promise<MediaProbe> {
       hasInline: Boolean(extractInlineDetailRoot(extracted)),
     },
   })
+
+  // 远程高清解析开启时已先于本地链路完成；成功时把无水印多档
+  // （最高 4K / H.265）排到本地候选之前。
+  if (remote) {
+      // 每个远程档位展开为一个 choice（对齐 douyin-quality.mjs 的“列档选择”体验），远程优先于本地 720p。
+      const remoteChoices: MediaChoice[] = remoteResultToMediaChoices(remote, probe.webpageURL || sourceURL)
+      probe.choices = [...remoteChoices, ...probe.choices]
+      await logEvent({
+        level: "info",
+        event: "probe.douyin.remote.completed",
+        taskId,
+        details: { platform: remote.platform, via: remote.via, qualityCount: remote.candidates.length, topHeight: remote.candidates[0]?.height ?? 0, topCodec: remote.candidates[0]?.codec, choiceCount: probe.choices.length },
+      })
+  }
+
   return probe
+}
+
+/**
+ * 通用远程直链下载：远程解析候选（真实播放资源）在本地并发分段下载。
+ * 远程只解析不下载——所有字节都在 iOS 本地完成。
+ */
+async function downloadRemoteDirect(options: {
+  sourceURL: string
+  choice: MediaChoice
+  outputTitle?: string
+  onProgress: (value: DownloadProgress) => void
+  onCancelPath: (path: string) => void
+}): Promise<DownloadResult> {
+  const taskId = createTaskId()
+  await ensureDirectories()
+  const cancelPath = Path.join(TEMP_DIR, `${taskId}.cancel`)
+  try { if (FileManager.existsSync(cancelPath)) FileManager.removeSync(cancelPath) } catch {}
+  options.onCancelPath(cancelPath)
+  await logEvent({ level: "info", event: "download.remote.started", taskId, details: { sourceURL: options.sourceURL, choiceId: options.choice.id, label: options.choice.label } })
+  const isCancelFlagSet = () => FileManager.existsSync(cancelPath)
+  const url = options.choice.sourceURL
+  if (!url) throw new Error("远程候选缺少直链地址")
+  const workPath = Path.join(TEMP_DIR, `${taskId}.remote.mp4`)
+  const segmented = await downloadDirectSegmented({
+    url,
+    destination: workPath,
+    headers: { "User-Agent": MOBILE_SAFARI_UA, Accept: "*/*", Referer: options.choice.previewReferer || options.sourceURL },
+    concurrentFragments: getPreferences().concurrentFragments,
+    start: 0.02,
+    end: 0.95,
+    stage: "远程直链下载（多线程）",
+    onProgress: options.onProgress,
+    isCancelFlagSet,
+  })
+  if (!segmented) {
+    try { FileManager.removeSync(workPath) } catch {}
+    throw new Error("远程直链分段下载不可用（文件过小或 206 失败）")
+  }
+  if (isCancelFlagSet()) throw new Error("下载已取消")
+  const filePath = await publishMediaFile(workPath, taskId, options.outputTitle)
+  const choice: MediaChoice = { ...options.choice, kind: "video" }
+  try {
+    await verifyMediaFile(filePath, { ...choice, kind: "video" }, taskId)
+  } catch (error) {
+    await logEvent({ level: "warn", event: "download.remote.verify.soft-fail", taskId, details: { message: error instanceof Error ? error.message : String(error), filePath } })
+  }
+  options.onProgress({ fraction: 1, stage: "下载完成" })
+  await logEvent({ level: "info", event: "download.remote.completed", taskId, details: { filePath, label: options.choice.label } })
+  return {
+    filePath,
+    fileName: Path.basename(filePath),
+    sourceURL: options.sourceURL,
+    choice,
+    taskId,
+    fileSizeBytes: await fileSizeBytes(filePath),
+  }
 }
 
 async function downloadDouyinDirect(options: {
@@ -2435,6 +2740,103 @@ async function downloadDouyinDirect(options: {
   await logEvent({ level: "info", event: "download.douyin.started", taskId, details: { sourceURL: options.sourceURL, choiceId: options.choice.id } })
   const isCancelFlagSet = () => FileManager.existsSync(cancelPath)
   try {
+    // 远程高清档位（choice.sourceURL = Camoufox 抓取的无水印 CDN 直链）：直接并发分段下载，
+    // 失败回退本地 WebView 候选（带水印 720p）。
+    if (options.choice.sourceURL) {
+      const workPath = Path.join(TEMP_DIR, `${taskId}.remote.mp4`)
+      try {
+        await logEvent({ level: "info", event: "download.douyin.remote.started", taskId, details: { label: options.choice.label } })
+        const segmented = await downloadDirectSegmented({
+          url: options.choice.sourceURL,
+          destination: workPath,
+          headers: { "User-Agent": MOBILE_SAFARI_UA, Accept: "*/*", Referer: options.choice.previewReferer || options.sourceURL },
+          concurrentFragments: getPreferences().concurrentFragments,
+          start: 0.02,
+          end: 0.95,
+          stage: "远程高清下载（多线程）",
+          onProgress: options.onProgress,
+          isCancelFlagSet,
+        })
+        if (segmented) {
+          if (isCancelFlagSet()) throw new Error("下载已取消")
+          const filePath = await publishMediaFile(workPath, taskId, options.outputTitle)
+          const choice: MediaChoice = { ...options.choice, kind: "video" }
+          try {
+            await verifyMediaFile(filePath, { ...choice, kind: "video" }, taskId)
+          } catch (error) {
+            await logEvent({ level: "warn", event: "download.douyin.remote.verify.soft-fail", taskId, details: { message: error instanceof Error ? error.message : String(error), filePath } })
+          }
+          options.onProgress({ fraction: 1, stage: "下载完成" })
+          await logEvent({ level: "info", event: "download.douyin.remote.completed", taskId, details: { filePath, label: options.choice.label } })
+          return {
+            filePath,
+            fileName: Path.basename(filePath),
+            sourceURL: options.sourceURL,
+            choice,
+            taskId,
+            fileSizeBytes: await fileSizeBytes(filePath),
+          }
+        }
+        try { FileManager.removeSync(workPath) } catch {}
+        await logEvent({ level: "warn", event: "download.douyin.remote.fallback", taskId, details: { message: "分段探测不可用（文件过小或 206 失败），回退本地候选" } })
+      } catch (error) {
+        if (isCancelFlagSet()) throw error instanceof Error ? error : new Error(String(error))
+        await logEvent({ level: "warn", event: "download.douyin.remote.failed", taskId, details: { label: options.choice.label, message: error instanceof Error ? error.message : String(error) } })
+        try { FileManager.removeSync(workPath) } catch {}
+      }
+    }
+
+    // 远程高清候选优先：无水印多档直链（Camoufox 抓取的 aweme/detail），逐个尝试分段下载；
+    // 全部失败或未启用时回退本地 WebView 候选（带水印 720p）。
+    const remoteCandidates = options.choice.douyinRemoteCandidates || []
+    if (remoteCandidates.length > 0) {
+      for (const [index, candidate] of remoteCandidates.entries()) {
+        if (isCancelFlagSet()) throw new Error("下载已取消")
+        const workPath = Path.join(TEMP_DIR, `${taskId}.remote.${index + 1}.mp4`)
+        try {
+          await logEvent({ level: "info", event: "download.douyin.remote.started", taskId, details: { label: candidate.label, index: index + 1, total: remoteCandidates.length } })
+          const segmented = await downloadDirectSegmented({
+            url: candidate.url,
+            destination: workPath,
+            headers: { "User-Agent": MOBILE_SAFARI_UA, Accept: "*/*", Referer: candidate.referer || options.sourceURL },
+            concurrentFragments: getPreferences().concurrentFragments,
+            start: 0.02,
+            end: 0.95,
+            stage: `远程高清下载（${index + 1}/${remoteCandidates.length}）`,
+            onProgress: options.onProgress,
+            isCancelFlagSet,
+          })
+          if (!segmented) {
+            try { FileManager.removeSync(workPath) } catch {}
+            continue
+          }
+          if (isCancelFlagSet()) throw new Error("下载已取消")
+          const filePath = await publishMediaFile(workPath, taskId, options.outputTitle)
+          const choice: MediaChoice = { ...options.choice, kind: "video", label: candidate.label || options.choice.label }
+          try {
+            await verifyMediaFile(filePath, { ...choice, kind: "video" }, taskId)
+          } catch (error) {
+            await logEvent({ level: "warn", event: "download.douyin.remote.verify.soft-fail", taskId, details: { message: error instanceof Error ? error.message : String(error), filePath } })
+          }
+          options.onProgress({ fraction: 1, stage: "下载完成" })
+          await logEvent({ level: "info", event: "download.douyin.remote.completed", taskId, details: { filePath, label: candidate.label } })
+          return {
+            filePath,
+            fileName: Path.basename(filePath),
+            sourceURL: options.sourceURL,
+            choice,
+            taskId,
+            fileSizeBytes: await fileSizeBytes(filePath),
+          }
+        } catch (error) {
+          if (isCancelFlagSet()) throw error instanceof Error ? error : new Error(String(error))
+          await logEvent({ level: "warn", event: "download.douyin.remote.failed", taskId, details: { label: candidate.label, message: error instanceof Error ? error.message : String(error) } })
+          try { FileManager.removeSync(workPath) } catch {}
+        }
+      }
+      await logEvent({ level: "warn", event: "download.douyin.remote.all-failed", taskId, details: { count: remoteCandidates.length } })
+    }
+
     const result: DouyinDownloadSuccess = await downloadDouyinVideo(options.sourceURL, {
       preferNoWatermark: true,
       onProgress: (progress) => {
@@ -2562,7 +2964,62 @@ async function enrichProbeResolutions(probe: MediaProbe, sourceURL: string, opti
 }
 
 export async function probeMedia(url: string, options: ProbeOptions = {}): Promise<MediaProbe> {
-  const probe = await probeMediaCore(url, options)
+  let probe: MediaProbe | null = null
+  let localError: unknown = null
+  try {
+    probe = await probeMediaCore(url, options)
+  } catch (error) {
+    localError = error
+  }
+
+  // 通用远程解析兜底：本地探测失败（probe 为 null）或结果不理想（≤1 个候选）时，
+  // 尝试远程解析附加真实播放资源（远程只解析、本地下载）。
+  // 抖音在 probeDouyinDirect 内已先于本地链路执行远程解析，这里跳过避免重复。
+  const preferences = getPreferences()
+  const remoteEligible = preferences.douyinRemoteEnabled && preferences.douyinRemoteToken && (probe === null || probe.choices.length <= 1)
+  if (remoteEligible && detectMediaPlatform(probe?.webpageURL || url) !== "douyin") {
+    const taskId = createTaskId()
+    const remoteLogs: string[] = []
+    const remote = await resolveRemoteMedia({
+      config: {
+        enabled: true,
+        endpoint: preferences.douyinRemoteEndpoint,
+        token: preferences.douyinRemoteToken,
+      },
+      url,
+      log: (message) => {
+        remoteLogs.push(message)
+        void logEvent({ level: "info", event: "remote.resolver.log", taskId, details: { message: message.slice(0, 300) } })
+      },
+    })
+    if (remote && remote.candidates.length > 0) {
+      const remoteChoices = remoteResultToMediaChoices(remote, probe?.webpageURL || url)
+      probe = {
+        title: probe?.title || remote.title || "远程解析媒体",
+        uploader: probe?.uploader,
+        duration: probe?.duration,
+        thumbnail: probe?.thumbnail,
+        webpageURL: probe?.webpageURL || url,
+        choices: [...remoteChoices, ...(probe?.choices ?? [])],
+      }
+      await logEvent({
+        level: "info",
+        event: "remote.resolver.completed",
+        taskId,
+        details: { platform: remote.platform, via: remote.via, url, qualityCount: remote.candidates.length, topHeight: remote.candidates[0]?.height ?? 0, choiceCount: probe.choices.length },
+      })
+    }
+    // 本地失败且远程也失败时，把远程解析原因附加到错误提示（如 token 失效/页面 404）
+    if (probe === null && remote === null) {
+      const remoteHint = remoteLogs.filter((m) => /404|失败|无效|未渲染|未捕获|跳过|匹配/.test(m)).pop()
+      if (remoteHint) {
+        const base = localError instanceof Error ? localError : new Error(String(localError))
+        localError = new Error(`${base.message} ｜ 远程解析：${remoteHint}`)
+      }
+    }
+  }
+
+  if (probe === null) throw localError instanceof Error ? localError : new Error(String(localError))
   return enrichProbeResolutions(probe, url, options)
 }
 
@@ -2572,9 +3029,9 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
   // X multi-video bare status URLs extract as playlists with empty top-level formats.
   // Prefer /video/1 so probe and later download share the same single-item URL.
   const sourceURL = pinXStatusVideoURL(extractedURL, 1)
-  // 抖音：匿名 WebView(+detail) → 合成候选，不走 yt-dlp / 不要求用户登录
+  // 抖音始终使用本地 WebView；存在本地登录会话时仅在该 WebView 内复用，绝不导出 Cookie。
   if (detectMediaPlatform(sourceURL) === "douyin") {
-    return probeDouyinDirect(sourceURL)
+    return probeDouyinDirect(sourceURL, options.douyinWebView)
   }
   const taskId = createTaskId()
   // B 站短链（b23.tv 等）先解析成完整 URL：generic extractor 直接吃短链会在
@@ -3405,8 +3862,21 @@ export async function downloadMedia(options: {
   await ensureDirectories()
 
   // 抖音：匿名 WebView → 候选 → 流式/图文下载（全程无用户登录）
+  // （含远程高清候选：Camoufox 直链分段下载，失败回退本地 WebView 候选）
   if (detectMediaPlatform(sourceURL) === "douyin" || isDouyinDirectChoice(options.choice)) {
     return downloadDouyinDirect({
+      sourceURL,
+      choice: options.choice,
+      outputTitle: options.outputTitle,
+      onProgress: options.onProgress,
+      onCancelPath: options.onCancelPath,
+    })
+  }
+
+  // 通用远程直链（非抖音平台的远程解析候选）：直接并发分段下载真实播放资源，失败即报错
+  // （本地候选作为独立 choice 已并列展示，无需自动回退）。
+  if (isRemoteDirectChoice(options.choice) && options.choice.sourceURL) {
+    return downloadRemoteDirect({
       sourceURL,
       choice: options.choice,
       outputTitle: options.outputTitle,

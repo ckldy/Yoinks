@@ -24,6 +24,12 @@ export type YoinksPreferences = {
   umpFirst: boolean
   /** 下载完成/失败时若 App 在后台，发送本地通知提示（默认开）。 */
   notifyDownloadComplete: boolean
+  /** 抖音远程高清解析开关（Camoufox MCP 抓 detail，无水印多档；需配置端点与 Token）。 */
+  douyinRemoteEnabled: boolean
+  /** 抖音远程解析 MCP 端点（默认 DSH 本地 ecc.vcncv.com/camoufox/mcp，不连 eooa）。 */
+  douyinRemoteEndpoint: string
+  /** 抖音远程解析 MCP API Key（X-API-Key；旧 eooa 端点时填 Bearer Token）。 */
+  douyinRemoteToken: string
 }
 
 export const DEFAULT_PREFERENCES: YoinksPreferences = {
@@ -40,6 +46,9 @@ export const DEFAULT_PREFERENCES: YoinksPreferences = {
   showRecentCandidates: true,
   umpFirst: true,
   notifyDownloadComplete: true,
+  douyinRemoteEnabled: false,
+  douyinRemoteEndpoint: "https://ecc.vcncv.com/camoufox/mcp",
+  douyinRemoteToken: "",
 }
 
 function isSaveMode(value: unknown): value is SaveMode {
@@ -66,6 +75,10 @@ function isLimit(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0)
 }
 
+function isString(value: unknown): value is string {
+  return typeof value === "string"
+}
+
 function isBoolean(value: unknown): value is boolean {
   return typeof value === "boolean"
 }
@@ -86,6 +99,9 @@ export function normalizePreferences(value: unknown): YoinksPreferences {
     showRecentCandidates: isBoolean(source.showRecentCandidates) ? source.showRecentCandidates : DEFAULT_PREFERENCES.showRecentCandidates,
     umpFirst: isBoolean(source.umpFirst) ? source.umpFirst : DEFAULT_PREFERENCES.umpFirst,
     notifyDownloadComplete: isBoolean(source.notifyDownloadComplete) ? source.notifyDownloadComplete : DEFAULT_PREFERENCES.notifyDownloadComplete,
+    douyinRemoteEnabled: isBoolean(source.douyinRemoteEnabled) ? source.douyinRemoteEnabled : DEFAULT_PREFERENCES.douyinRemoteEnabled,
+    douyinRemoteEndpoint: isString(source.douyinRemoteEndpoint) && source.douyinRemoteEndpoint.length > 0 ? source.douyinRemoteEndpoint : DEFAULT_PREFERENCES.douyinRemoteEndpoint,
+    douyinRemoteToken: isString(source.douyinRemoteToken) ? source.douyinRemoteToken : DEFAULT_PREFERENCES.douyinRemoteToken,
   }
 }
 

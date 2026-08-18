@@ -53,7 +53,6 @@ import {
   mediaPlatformLabel,
   probeMedia,
   probeSafariPublicPlayerFrame,
-  xiaohongshuMissingToken,
   previewYouTubeUMPClip,
   TEMP_DIR,
   resolveAutomaticChoice,
@@ -154,7 +153,6 @@ import {
   clearImportedCookie,
 } from "./services/platform-auth"
 import { openOnlinePreview, type OnlinePreviewOptions } from "./services/online-preview"
-import { isNativePreviewCandidate, openNativePreview, type NativePreviewOptions } from "./services/native-preview"
 import {
   clearSafariMediaCandidates,
   isLikelyHLSAudioRendition,
@@ -729,17 +727,15 @@ function View() {
   }
 
   const loginForPlatform = async (platform: AuthPlatform): Promise<PlatformAuthSession | null> => {
-    const choice = platform === "douyin"
-      ? 1
-      : await Dialog.actionSheet({
-          title: `${authPlatformLabel(platform)}需要登录状态`,
-          message: "平台要求近期 Cookie 才能继续。仅本次使用会在关闭 Yoinks、替换链接或下载结束后清除；保留登录状态可用于该平台之后的下载。",
-          actions: [{ label: "仅本次使用" }, { label: "保留登录状态" }],
-          cancelButton: true,
-        })
+    const choice = await Dialog.actionSheet({
+      title: `${authPlatformLabel(platform)}需要登录状态`,
+      message: "平台要求近期 Cookie 才能继续。仅本次使用会在关闭 Yoinks、替换链接或下载结束后清除；保留登录状态可用于该平台之后的下载。",
+      actions: [{ label: "仅本次使用" }, { label: "保留登录状态" }],
+      cancelButton: true,
+    })
     if (choice == null) return null
     const retention = choice === 0 ? "temporary" : "persistent"
-    setStatus(platform === "douyin" ? "请在本机抖音页面扫码登录，完成后关闭页面。" : `请在${authPlatformLabel(platform)}页面完成登录，完成后关闭页面。`)
+    setStatus(`请在${authPlatformLabel(platform)}页面完成登录，完成后关闭页面。`)
     const session = await beginPlatformLogin(platform, retention)
     updatePlatformSessions((current) => ({ ...current, [platform]: session }))
     await logEvent({ level: "info", event: "platform-auth.login.completed", details: { platform, retention } })
@@ -747,12 +743,9 @@ function View() {
   }
 
   const probeWithPlatformSession = async (sourceURL: string, session: PlatformAuthSession | null, referer?: string, safariMediaKind?: "video" | "audio", skipPublicPlayerFallback = false): Promise<MediaProbe> => {
-    if (session?.platform === "douyin") {
-      // 抖音只复用本机 WebView Cookie；不导出 Cookie 文件，也不传入远程解析。
-      return probeMedia(sourceURL, { douyinWebView: session.webView, referer, safariMediaKind, skipPublicPlayerFallback })
-    }
     let cookieFile: string | null = null
     try {
+      // 仅在调用方明确选择登录会话时使用 Cookie；匿名探测不能被全局导入 Cookie 隐式改变。
       const imported = session ? getImportedCookiePath() : null
       if (imported) cookieFile = imported
       else if (session) cookieFile = await createTaskCookieFile(session)
@@ -764,8 +757,8 @@ function View() {
 
   const preflightDiscoverItem = async (sourceURL: string): Promise<{ probe: MediaProbe; probeAuthorizedPlatform?: AuthPlatform }> => {
     const platform = detectMediaPlatform(sourceURL)
-    const anonymousFirst = platform === "youtube"
-    let session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+    const anonymousFirst = platform === "youtube" || platform === "douyin"
+    let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
     try {
       return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session?.platform }
     } catch (firstError) {
@@ -812,24 +805,15 @@ function View() {
     setCompletedSaveMode(null)
     setProgress({ fraction: 0.02, stage: "正在解析媒体" })
     const platform = detectMediaPlatform(sourceURL)
-    // 小红书完整链接缺少 xsec_token：网页版地址栏复制不带凭证，远程解析必 404，提前提示正确操作（省 40s+ 无谓等待）
-    if (xiaohongshuMissingToken(sourceURL)) {
-      analysisBusyRef.current = false
-      setAnalyzing(false)
-      setProgress({ fraction: 0, stage: "" })
-      await logEvent({ level: "warn", event: "probe.xiaohongshu.missing-token", details: { sourceURL } })
-      setStatus("该小红书链接缺少访问凭证（xsec_token），无法解析。网页版复制链接不带凭证。请在「小红书 App」打开笔记 → 点右上角「分享」→「复制链接」（xhslink.com 短链或带凭证的完整链接均可）→ 再粘贴到这里。")
-      return
-    }
     const isSafariCandidate = sourceURL === safariCandidateURLRef.current
     const safariReferer = isSafariCandidate ? safariCandidateRefererRef.current || undefined : undefined
     const safariMediaKind = isSafariCandidate ? safariCandidateMediaKindRef.current || undefined : undefined
-    setStatus(platform === "douyin" ? "正在通过本地 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
+    setStatus(platform === "douyin" ? "正在通过匿名 WebView 解析抖音页面…" : "yt-dlp 正在准备探测。")
 
     try {
-      // YouTube 默认匿名；抖音若已本地登录，只复用该 WebView 会话，不生成 Cookie 文件。
-      const anonymousFirst = platform === "youtube"
-      let session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      // YouTube 与抖音默认匿名，避免 WebView Cookie 与 android_vr 客户端组合导致格式不可用；仅在匿名访问受限时才登录重探。
+      const anonymousFirst = platform === "youtube" || platform === "douyin"
+      let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
       let probeResult: MediaProbe
       try {
         probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
@@ -2210,35 +2194,6 @@ function View() {
 
     setPreviewing(true)
     try {
-    // 抖音 muxed 直链（HE-AACv2 音轨）走原生 AVPlayer：iOS WebKit <video> 无法解码
-    // HE-AACv2（有画面无声），AVFoundation 完整支持（2026-08-18 真机实锤）。
-    const nativePreview = isNativePreviewCandidate(selectedChoice.previewURL)
-    if (nativePreview) {
-      const nativeOptions: NativePreviewOptions = {
-        url: selectedChoice.previewURL,
-        audioURL: selectedChoice.previewAudioURL,
-        title: probe.title,
-        autoplayMode: preferences.previewAutoplayMode,
-        headers: selectedChoice.previewHeaders,
-        duration: probe.duration,
-      }
-      const nativeResult = await openNativePreview(nativeOptions)
-      if (nativeResult.status === "presented") {
-        return
-      }
-      if (nativeResult.status === "invalid-url") {
-        setStatus("预览链接无效")
-        await Dialog.alert({ title: "在线预览失败", message: nativeResult.message })
-        return
-      }
-      // 原生播放失败（极少见）：不再回退 WebView 播放器——WebView <video> 无法解码
-      // HE-AACv2 音轨（无声），回退只会叠加第二个播放页面且仍无声（2026-08-18 实锤）。
-      setStatus("原生播放器未能打开")
-      await logEvent({ level: "warn", event: "preview.native.failed", details: { choiceId: selectedChoice.id, message: nativeResult.message } })
-      await Dialog.alert({ title: "在线预览失败", message: nativeResult.message })
-      return
-    }
-
     const previewOptions: OnlinePreviewOptions = {
       url: selectedChoice.previewURL,
       title: probe.title,
@@ -2248,9 +2203,6 @@ function View() {
       previewHeaders: selectedChoice.previewHeaders,
       // DASH video-only: pair separate audio stream (no full player-skill sync).
       audioUrl: selectedChoice.previewAudioURL,
-      // Douyin local desktop bit_rate/play_addr are muxed (audio inside MP4):
-      // mark so preview logs report hasAudio correctly.
-      muxedAudio: selectedChoice.id.startsWith("douyin-") && !selectedChoice.previewAudioURL,
       duration: probe.duration,
       videoCodec: selectedChoice.previewVideoCodec,
       audioCodec: selectedChoice.previewAudioCodec,
@@ -3041,17 +2993,14 @@ return (
               <Button title="检查下载引擎" systemImage="arrow.clockwise" action={() => void refreshTools()} disabled={loadingTools || downloading} />
               {supportedAuthPlatforms().map((platform) => {
                 const session = platformSessions[platform]
-                const isDouyin = platform === "douyin"
                 return (
-                  <VStack key={platform} alignment="leading" spacing={6}>
-                    <Button
-                      title={session ? `${authPlatformLabel(platform)} · 已登录` : `登录${authPlatformLabel(platform)}`}
-                      systemImage={session ? "checkmark.circle.fill" : "person.crop.circle.badge.plus"}
-                      action={() => void loginForPlatform(platform)}
-                      disabled={downloading || analyzing}
-                    />
-                    {isDouyin && session ? <Button title="清除本地抖音登录" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformLogin("douyin").then(() => updatePlatformSessions((current) => { const next = { ...current }; disposePlatformSession(next.douyin); delete next.douyin; return next }))} disabled={downloading || analyzing} /> : null}
-                  </VStack>
+                  <Button
+                    key={platform}
+                    title={session ? `${authPlatformLabel(platform)} · 已登录` : `登录${authPlatformLabel(platform)}`}
+                    systemImage={session ? "checkmark.circle.fill" : "person.crop.circle.badge.plus"}
+                    action={() => void loginForPlatform(platform)}
+                    disabled={downloading || analyzing}
+                  />
                 )
               })}
               <Button
@@ -3062,7 +3011,7 @@ return (
               />
               <Text font="caption" foregroundStyle="secondaryLabel">导入 Netscape 格式 cookies.txt（如浏览器扩展“Get cookies.txt”导出），适用于会员视频或 WebView 登录被阻断的场景。导入后探测和下载将优先使用。</Text>
               {loggedInSessions.length ? <Button title="清除登录状态" systemImage="person.crop.circle.badge.xmark" role="destructive" action={() => void clearPlatformAuth()} disabled={downloading || analyzing} /> : null}
-              <Text font="caption" foregroundStyle="secondaryLabel">抖音登录仅用于本机 WebView 的格式实验；Cookie 不导出、不写入文件、不传给远程解析。其他平台登录仍仅服务本地下载链路。</Text>
+              <Text font="caption" foregroundStyle="secondaryLabel">登录仅服务小红书、YouTube 等 yt-dlp 站点；抖音全程匿名 WebView，无需登录。</Text>
             </Section>
             <Section header={<Text font="headline">发现</Text>}>
               <Toggle
