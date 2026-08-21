@@ -126,10 +126,26 @@ export function safariMediaCandidatePriority(candidate: Pick<SafariMediaCandidat
   return 5
 }
 
+export function safariCandidateHeight(candidate: Pick<SafariMediaCandidate, "url">): number {
+  try {
+    const pathname = new URL(candidate.url).pathname
+    // 匹配 240p / 720p / 1080p / 1080P 等（如 /video/1080.mp4, /240p.m3u8, /1080_p.mp4）
+    const match = pathname.match(/(?:^|[\/_.-])(\d{3,4})p?(?=[._-]|$)/i)
+    return match ? Number(match[1]) : 0
+  } catch {
+    return 0
+  }
+}
+
 export function sortSafariMediaCandidates(candidates: SafariMediaCandidate[]): SafariMediaCandidate[] {
   return candidates
     .map((candidate, index) => ({ candidate, index }))
-    .sort((a, b) => safariMediaCandidatePriority(a.candidate) - safariMediaCandidatePriority(b.candidate) || a.index - b.index)
+    .sort(
+      (a, b) =>
+        safariMediaCandidatePriority(a.candidate) - safariMediaCandidatePriority(b.candidate) ||
+        safariCandidateHeight(b.candidate) - safariCandidateHeight(a.candidate) || // 高清晰度优先
+        a.index - b.index
+    )
     .map(({ candidate }) => candidate)
 }
 

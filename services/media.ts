@@ -2,7 +2,7 @@ import { AbortController, Path, Script, fetch } from "scripting"
 import { createTaskId, logEvent } from "./logs"
 import { probeBilibiliDirect } from "./bilibili"
 import { probeYouTubeDirect, parseYouTubeVideoID } from "./youtube"
-import { extractPublicPlayerFrameSources, extractPublicPlayerSources, type PublicPlayerSource } from "./public-player-source"
+import { extractPublicPlayerFrameSources, extractPublicPlayerSources, extractStreamTapeGetVideoURL, type PublicPlayerSource } from "./public-player-source"
 import type { AuthPlatform } from "./platform-auth"
 import { getPreferences } from "./preferences"
 import { isHwCompatibleBilibiliUrl } from "./player/bilibili-cdn"
@@ -491,6 +491,68 @@ async function resolveRedirectedDirectMedia(sourceURL: string, referer: string, 
     }
     return choice
   } catch { return null } finally { clearTimeout(timeout) }
+}
+
+/**
+ * StreamTape（含同结构的流媒网关站）专用探测：页面 HTML 的 #botlink 是 get_video 网关 URL，
+ * 但 token 被 JS 混淆。还原后拿到真 token 的 get_video URL，纯 HTTP（Safari UA + 页面自身
+ * Referer）即可 302 到 tapecontent.net 真实直链（.mp4）。无需 recaptcha / 浏览器会话。
+ */
+async function probeStreamTapeDirect(sourceURL: string): Promise<MediaProbe | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 8000)
+  try {
+    // 1) 带页面自身 Referer + Safari UA 拉取播放器页 HTML（无 Referer 会返回 “Video not found” 广告页）。
+    const pageResponse = await fetch(sourceURL, {
+      headers: { Accept: "text/html,application/xhtml+xml", Referer: sourceURL, "User-Agent": MOBILE_SAFARI_UA },
+      signal: controller.signal,
+    })
+    if (!pageResponse.ok) return null
+    const contentType = pageResponse.headers.get("content-type") || ""
+    if (contentType && !/text\/html|application\/xhtml\+xml/i.test(contentType)) return null
+    const html = await pageResponse.text()
+    if (!html || html.length > 1_048_576) return null
+    // 2) 解混淆 botlink 得到真 get_video URL。
+    const getVideoURL = extractStreamTapeGetVideoURL(html, sourceURL)
+    if (!getVideoURL) return null
+    // 3) 跟随 get_video 302 拿到 tapecontent 直链；HEAD 优先（轻量），失败 fallback GET。
+    const getVideoRequestURL = `${getVideoURL}${getVideoURL.includes("?") ? "&" : "?"}stream=1`
+    let mediaResponse: Awaited<ReturnType<typeof fetch>> | null = null
+    try {
+      mediaResponse = await fetch(getVideoRequestURL, {
+        method: "HEAD",
+        headers: { Accept: "*/*", Referer: sourceURL, "User-Agent": MOBILE_SAFARI_UA },
+        signal: controller.signal,
+      })
+    } catch {
+      mediaResponse = await fetch(getVideoRequestURL, {
+        headers: { Accept: "*/*", Referer: sourceURL, "User-Agent": MOBILE_SAFARI_UA },
+        signal: controller.signal,
+      })
+    }
+    if (!mediaResponse || !mediaResponse.ok) return null
+    const finalURL = mediaResponse.url || getVideoURL
+    // 4) 验证最终 URL 确实指向媒体域（防止 get_video 返回 200 非 302 时误把网关当直链）。
+    try {
+      const url = new URL(finalURL)
+      if (!/(?:^|\.)tapecontent\.net$/i.test(url.hostname)) return null
+    } catch { return null }
+    const choice = directMediaChoice(finalURL, "video")
+    if (!choice) return null
+    choice.sourceURL = finalURL
+    choice.sourceReferer = sourceURL
+    choice.previewReferer = sourceURL
+    choice.previewHeaders = { Referer: sourceURL, "User-Agent": MOBILE_SAFARI_UA }
+    const title = html.match(/<meta\b[^>]*\bname\s*=\s*["']og:title["'][^>]*\bcontent\s*=\s*["']([^"']+)["']/i)?.[1]
+    return { title: title ? title.slice(0, 240) : "StreamTape 视频", webpageURL: sourceURL, choices: [choice] }
+  } catch { return null } finally { clearTimeout(timeout) }
+}
+
+function isStreamTapePageURL(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return /(?:^|\.)streamtape\.com$/i.test(url.hostname) && /^\/(?:e|v)\//i.test(url.pathname)
+  } catch { return false }
 }
 
 /**
@@ -3023,6 +3085,97 @@ export async function probeMedia(url: string, options: ProbeOptions = {}): Promi
   return enrichProbeResolutions(probe, url, options)
 }
 
+// —— 通用免播放取链探测框架（方案 B）——
+// 每个策略 = test（URL 是否命中）+ probe（主动取链，无需用户点击播放）。
+// 调度器按注册表顺序试，首个非 null 返回；全部落空则走 yt-dlp 主链兜底。
+// 新增站点只需在此注册表追加一条策略，不必再改 probeMediaCore 的主流程。
+type PlayerProbeStrategy = {
+  name: string
+  test: (url: string) => boolean
+  probe: (url: string, taskId: string) => Promise<MediaProbe | null>
+}
+
+// B 站原生探测策略：浏览器式 fetch + 真实 UA 拿 m 站页面 → playurl API 直链。
+async function probeBilibiliStrategy(url: string, taskId: string): Promise<MediaProbe | null> {
+  const bilibiliProbe = await probeBilibiliDirect(url)
+  if (!bilibiliProbe) return null
+  await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: bilibiliProbe.title, choiceCount: bilibiliProbe.choices.length, formatCount: bilibiliProbe.choices.length, webpageURL: bilibiliProbe.webpageURL, origin: "bilibili-native" } })
+  return bilibiliProbe
+}
+
+// YouTube 原生探测策略：IOS client innertube 直出签名 URL，再做代表性音视频 url-check。
+async function probeYouTubeStrategy(url: string, taskId: string): Promise<MediaProbe | null> {
+  const youtubeProbe = await probeYouTubeDirect(url)
+  if (!youtubeProbe || !youtubeProbe.choices.length) return null
+  // 优先验证用户最常选的 H.264/MP4 路径；单条 VP9 URL 失败不能代表整套 IOS 结果。
+  // 最多检查两条视频和一条代表音频，避免探测流量与等待时间失控。
+  const videoCandidates = youtubeProbe.choices
+    .filter((choice) => choice.kind === "video" && choice.sourceURL)
+    .sort((a, b) => Number(b.youtubeVideoItag === 137) - Number(a.youtubeVideoItag === 137)
+      || Number(b.videoCodec === "h264") - Number(a.videoCodec === "h264")
+      || Number(Boolean(b.youtubeVideoItag)) - Number(Boolean(a.youtubeVideoItag))
+      || (b.height || 0) - (a.height || 0))
+    .slice(0, 2)
+  const failedVideoChoiceIds = new Set<string>()
+  let usableVideoChoice: MediaChoice | undefined
+  for (const choice of videoCandidates) {
+    const result = await checkYouTubeURL(choice.sourceURL!)
+    let host = ""
+    try { host = new URL(choice.sourceURL!).hostname } catch {}
+    await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "video", itag: choice.youtubeVideoItag || null, codec: choice.videoCodec || null, host, status: result.status || null, reason: result.reason } })
+    if (result.usable) {
+      usableVideoChoice = choice
+      break
+    }
+    failedVideoChoiceIds.add(choice.id)
+  }
+  if (usableVideoChoice) {
+    let audioUsable = true
+    if (usableVideoChoice.previewAudioURL) {
+      const result = await checkYouTubeURL(usableVideoChoice.previewAudioURL)
+      let host = ""
+      try { host = new URL(usableVideoChoice.previewAudioURL).hostname } catch {}
+      await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "audio", itag: usableVideoChoice.youtubeAudioItag || null, codec: usableVideoChoice.previewAudioCodec || null, host, status: result.status || null, reason: result.reason } })
+      audioUsable = result.usable
+    }
+    const availableChoices = youtubeProbe.choices.filter((choice) =>
+      !failedVideoChoiceIds.has(choice.id) && (audioUsable || !choice.previewAudioURL),
+    )
+    if (availableChoices.length) {
+      const availableProbe = { ...youtubeProbe, choices: availableChoices }
+      await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: availableProbe.title, choiceCount: availableChoices.length, formatCount: availableChoices.length, webpageURL: availableProbe.webpageURL, origin: "youtube-native" } })
+      return availableProbe
+    }
+  }
+  await logEvent({ level: "warn", event: "probe.youtube.direct.url-blocked", taskId, details: { message: "IOS client 代表性音视频直链不可用，回退 yt-dlp", choiceCount: youtubeProbe.choices.length, checkedVideoCount: videoCandidates.length } })
+  return null
+}
+
+// StreamTape 原生探测策略：botlink 解混淆 → get_video 302 → tapecontent 直链。
+async function probeStreamTapeStrategy(url: string, taskId: string): Promise<MediaProbe | null> {
+  const streamTapeProbe = await probeStreamTapeDirect(url)
+  if (!streamTapeProbe) return null
+  await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: streamTapeProbe.title, choiceCount: streamTapeProbe.choices.length, formatCount: streamTapeProbe.choices.length, webpageURL: streamTapeProbe.webpageURL, origin: "streamtape-native" } })
+  return streamTapeProbe
+}
+
+// 策略注册表：专用站点在前（命中快、结果准），通用兜底在后。
+const PLAYER_PROBE_STRATEGIES: PlayerProbeStrategy[] = [
+  { name: "bilibili-native", test: (url) => detectMediaPlatform(url) === "bilibili", probe: probeBilibiliStrategy },
+  { name: "youtube-native", test: (url) => detectMediaPlatform(url) === "youtube", probe: probeYouTubeStrategy },
+  { name: "streamtape-native", test: (url) => isStreamTapePageURL(url), probe: probeStreamTapeStrategy },
+]
+
+// 统一调度器：按注册表顺序试，首个非 null 返回；全部落空返回 null（调用方回退 yt-dlp）。
+async function probePlayerDirect(url: string, taskId: string): Promise<MediaProbe | null> {
+  for (const strategy of PLAYER_PROBE_STRATEGIES) {
+    if (!strategy.test(url)) continue
+    const result = await strategy.probe(url, taskId)
+    if (result) return result
+  }
+  return null
+}
+
 async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<MediaProbe> {
   const extractedURL = extractFirstURL(url)
   if (!extractedURL) throw new Error("请输入有效的公开 http 或 https 链接。")
@@ -3049,65 +3202,10 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
     probeURL = normalizedBili
     await logEvent({ level: "info", event: "probe.bilibili.normalized", taskId, details: { sourceURL, normalizedURL: probeURL } })
   }
-  // B 站：优先原生页面+API 探测（yt-dlp 在当前网络/抓包环境下被 412 风控拦截，
-  // 浏览器式 fetch + 真实 UA 可稳定拿到直链）；失败时回退 yt-dlp（完整 URL 命中
-  // Bilibili extractor，412 时 m 站回退兜底）。
-  if (detectMediaPlatform(probeURL) === "bilibili") {
-    const bilibiliProbe = await probeBilibiliDirect(probeURL)
-    if (bilibiliProbe) {
-      await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: bilibiliProbe.title, choiceCount: bilibiliProbe.choices.length, formatCount: bilibiliProbe.choices.length, webpageURL: bilibiliProbe.webpageURL, origin: "bilibili-native" } })
-      return bilibiliProbe
-    }
-  }
-  // YouTube：优先 IOS client innertube 原生探测（实测 ~1.7s 直出签名 URL，无需 potoken/nsig，
-  // 绕开 yt-dlp 在 MITM 环境下的 SSL 首败与 bot 风控）；失败/受限（会员/年龄限制）返回 null
-  // 回退 yt-dlp（含登录链路），原生探测不作为唯一路径。
-  if (detectMediaPlatform(probeURL) === "youtube") {
-    const youtubeProbe = await probeYouTubeDirect(probeURL)
-    if (youtubeProbe && youtubeProbe.choices.length) {
-      // 优先验证用户最常选的 H.264/MP4 路径；单条 VP9 URL 失败不能代表整套 IOS 结果。
-      // 最多检查两条视频和一条代表音频，避免探测流量与等待时间失控。
-      const videoCandidates = youtubeProbe.choices
-        .filter((choice) => choice.kind === "video" && choice.sourceURL)
-        .sort((a, b) => Number(b.youtubeVideoItag === 137) - Number(a.youtubeVideoItag === 137)
-          || Number(b.videoCodec === "h264") - Number(a.videoCodec === "h264")
-          || Number(Boolean(b.youtubeVideoItag)) - Number(Boolean(a.youtubeVideoItag))
-          || (b.height || 0) - (a.height || 0))
-        .slice(0, 2)
-      const failedVideoChoiceIds = new Set<string>()
-      let usableVideoChoice: MediaChoice | undefined
-      for (const choice of videoCandidates) {
-        const result = await checkYouTubeURL(choice.sourceURL!)
-        let host = ""
-        try { host = new URL(choice.sourceURL!).hostname } catch {}
-        await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "video", itag: choice.youtubeVideoItag || null, codec: choice.videoCodec || null, host, status: result.status || null, reason: result.reason } })
-        if (result.usable) {
-          usableVideoChoice = choice
-          break
-        }
-        failedVideoChoiceIds.add(choice.id)
-      }
-      if (usableVideoChoice) {
-        let audioUsable = true
-        if (usableVideoChoice.previewAudioURL) {
-          const result = await checkYouTubeURL(usableVideoChoice.previewAudioURL)
-          let host = ""
-          try { host = new URL(usableVideoChoice.previewAudioURL).hostname } catch {}
-          await logEvent({ level: result.usable ? "info" : "warn", event: "probe.youtube.direct.url-check", taskId, details: { stream: "audio", itag: usableVideoChoice.youtubeAudioItag || null, codec: usableVideoChoice.previewAudioCodec || null, host, status: result.status || null, reason: result.reason } })
-          audioUsable = result.usable
-        }
-        const availableChoices = youtubeProbe.choices.filter((choice) =>
-          !failedVideoChoiceIds.has(choice.id) && (audioUsable || !choice.previewAudioURL),
-        )
-        if (availableChoices.length) {
-          const availableProbe = { ...youtubeProbe, choices: availableChoices }
-          await logEvent({ level: "info", event: "probe.completed", taskId, details: { title: availableProbe.title, choiceCount: availableChoices.length, formatCount: availableChoices.length, webpageURL: availableProbe.webpageURL, origin: "youtube-native" } })
-          return availableProbe
-        }
-      }
-      await logEvent({ level: "warn", event: "probe.youtube.direct.url-blocked", taskId, details: { message: "IOS client 代表性音视频直链不可用，回退 yt-dlp", choiceCount: youtubeProbe.choices.length, checkedVideoCount: videoCandidates.length } })
-    }
-  }
+  // 通用免播放取链探测框架：按注册表顺序试站点级原生探测，首个非 null 返回。
+  const directProbe = await probePlayerDirect(probeURL, taskId)
+  if (directProbe) return directProbe
+  
   const referer = options.referer && /^https?:\/\//i.test(options.referer) && !/[\r\n]/.test(options.referer) ? options.referer : undefined
   const safariUserAgent = referer ? MOBILE_SAFARI_UA : undefined
   await logEvent({ level: "info", event: "probe.started", taskId, details: { sourceURL, authorizedPlatform: options.authorizedPlatform || null, cookieAuthorized: Boolean(options.cookieFile), safariRefererApplied: Boolean(referer), safariUserAgentApplied: Boolean(safariUserAgent) } })

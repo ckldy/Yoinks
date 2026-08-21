@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Yoinks
 // @namespace https://github.com/ckldy/Yoinks
-// @version 1.3.4
+// @version 1.3.13
 // @description Collect public media candidates from the current page for Yoinks.
 // @match http://*/*
 // @match https://*/*
@@ -30,6 +30,42 @@ type Candidate = { id: string; url: string; kind: CandidateKind; pageURL: string
 type CaptureSession = { id: string; startedAt: number; pageURL: string }
 type FrameReport = { sessionId: string; reportId: string; pageURL: string; pageTitle?: string; candidates: Candidate[]; capturedAt: number }
 
+// —— 通用免播放取链采集注册表（方案 B）——
+// 每个条目 = name + extract（主动提取候选，无需用户点击播放）。
+// 提取器保持原有“无条件收集 + classify 过滤”语义（空结果即无匹配），不引入 test() 门控，
+// 避免脆弱正则导致漏判。新增站点只需在 EXTRACTORS 数组追加一条，不必再改 collectCandidates() 主体。
+// 注意：数组初始化会引用下方 function 声明（提升），故 extract 一律用箭头函数延迟求值。
+type PlayerExtractionStrategy = {
+  name: string
+  extract: () => Promise<string[]>
+}
+
+const PLAYER_EXTRACTION_STRATEGIES: PlayerExtractionStrategy[] = [
+  { name: "maccms-config", extract: async () => maccmsPlayerConfigURLs() },
+  { name: "same-origin-frame-script", extract: async () => sameOriginFrameScriptSourceURLs() },
+  { name: "same-origin-frame-media", extract: async () => sameOriginFrameMediaURLs() },
+  { name: "iframe-query", extract: async () => iframeQueryMediaURLs() },
+  { name: "vue-component", extract: async () => vueComponentMediaURLs() },
+  // PH 系：签名清单端点并发 fetch 解析（最多 3 个）+ 直接 CDN 媒体直链直接入候选
+  { name: "ph-endpoint", extract: async () => {
+      const { endpoints, directMedia } = playerMediaEndpointURLs()
+      const fetches = endpoints.slice(0, MAX_MEDIA_ENDPOINT_FETCHES)
+      const resolved = await Promise.all(fetches.map(ep => resolvePHMediaEndpoint(ep)))
+      return [...resolved.flat(), ...directMedia]
+    } },
+  { name: "supjav-server", extract: async () => resolveSupjavServerLinks() },
+]
+
+// 统一调度器：按注册表顺序试，收集所有非空结果。
+async function collectViaStrategies(): Promise<string[]> {
+  const values: string[] = []
+  for (const strategy of PLAYER_EXTRACTION_STRATEGIES) {
+    const result = await strategy.extract()
+    for (const url of result) if (url) values.push(url)
+  }
+  return values
+}
+
 const STORAGE_KEY = "yoinks-media-candidates-v1"
 const DIAGNOSTIC_STORAGE_KEY = "yoinks-media-candidates-diagnostic-v1"
 const SESSION_STORAGE_KEY = "yoinks-media-candidates-session-v1"
@@ -39,10 +75,14 @@ const FLOATING_ENTRY_ID = "yoinks-media-candidate-entry"
 const FLOATING_ENTRY_LONG_PRESS_MS = 700
 const FLOATING_ENTRY_POSITION_KEY = "yoinks-floating-entry-position-v1"
 const FLOATING_ENTRY_DRAG_THRESHOLD_PX = 8
+const DOUBLE_CLICK_MS = 450
 const FLOATING_ENTRY_EDGE_MARGIN_PX = 12
 const CAPTURE_DELAY_MS = 1500
 const SESSION_WAIT_MS = 2600
-const SESSION_TTL_MS = 8000
+// supjav→StreamTape 装载链较长：token 反转（带 Referer 302）+ StreamTape iframe 内
+// recaptcha v3 自动评分 + 播放器 fetch(get_video&plain=1)。iframe 副本 reportFrame 轮询
+// 等待 runtime 候选，顶层也等 frame 报告；TTL 需要盖住整条链（约 12-18s）。
+const SESSION_TTL_MS = 20000
 // beeg 等站点播放器（hls.js）不会自动请求 m3u8：iOS Safari 拦截 video.play() 的
 // NotAllowedError 后只在用户点击播放按钮时才 loadSource()。捕获时若发现页面有媒体
 // 元素但无候选，先主动触发播放，再进入监听循环，等用户点播放后自动补捕获。
@@ -154,6 +194,7 @@ const NOISE_VIDEO_THUMB_RE = /vidthumb\.mp4(?:$|[?#])/i
 const NON_MEDIA_EXT_RE = /\.(?:svg|png|jpe?g|gif|webp|avif|ico|bmp|css|js|json|woff2?|ttf|otf|eot|map|xml)(?:$|[?#/])/i
 function priority(candidate: Candidate): number {
   const pathname = new URL(candidate.url).pathname.toLowerCase()
+  // HLS：master/playlist 最高优先级（0），其次才是其他 HLS
   if (candidate.kind === "hls") return /(?:^|[-_.\/])(?:master|playlist)(?:[-_.\/]|$)/i.test(pathname) ? 0 : /(?:^|[-_.])(?:a\d+|audio)(?:[-_.]|$)/i.test(pathname) ? 4 : 1
   const base = candidate.kind === "dash" ? 2 : candidate.kind === "video" ? 3 : candidate.kind === "audio" ? 4 : 5
   return NOISE_PREVIEW_RE.test(pathname) || NOISE_VIDEO_THUMB_RE.test(pathname) ? 6 : base
@@ -308,22 +349,36 @@ function vueComponentMediaURLs(): string[] {
   return values
 }
 // 页面内联脚本里的 mediaDefinition 配置中，指向签名清单端点的 videoUrl（如 /media/hls?s=...）。
-function playerMediaEndpointURLs(): string[] {
-  const values: string[] = []
+// Pornhub 系 mediaDefinitions 数组同时含完整 CDN MP4 直链（ev.phncdn.com/.../240P_1000K.mp4，
+// 多档 240/480/720/1080P）和签名清单端点（/media/hls?s=...）。签名端点需 fetch 解析，
+// 完整 CDN 直链则直接作为候选（否则会被 PH_MEDIA_ENDPOINT_RE 过滤掉，只剩 og:video 的 240P）。
+function playerMediaEndpointURLs(): { endpoints: string[]; directMedia: string[] } {
+  const endpoints: string[] = []
+  const directMedia: string[] = []
   for (const script of Array.from(document.querySelectorAll("script")) as any[]) {
     const text = String(script.textContent || "")
     if (text.length > 100000) continue
     for (const match of text.matchAll(PLAYER_MEDIA_DEFINITION_PATTERN)) {
-      // JSON 转义：\/media\/hls?s=... 还原为 /media/hls?s=...
-      const url = normalizeURL(match[1].replace(/\\\//g, "/"))
-      if (url && PH_MEDIA_ENDPOINT_RE.test(new URL(url).pathname)) values.push(url)
+      // JSON 转义：\/media\/hls?s=... → /media/hls?s=...，\u0026 → &（签名参数分隔符）。
+      const url = normalizeURL(match[1].replace(/\\\//g, "/").replace(/\\u0026/gi, "\u0026"))
+      if (!url) continue
+      try {
+        const pathname = new URL(url).pathname
+        if (PH_MEDIA_ENDPOINT_RE.test(pathname)) {
+          // 签名清单端点：留给 ph-endpoint 策略 fetch 解析
+          endpoints.push(url)
+        } else if (/\.(?:mp4|m4v|mov|webm|mkv|m3u8|mpd)(?:$|[?#/])/i.test(pathname)) {
+          // 完整 CDN 媒体直链（多档清晰度）：直接作为候选，不再依赖 og:video 低清单一档
+          directMedia.push(url)
+        }
+      } catch {}
     }
   }
-  return [...new Set(values)]
+  return { endpoints: [...new Set(endpoints)], directMedia: [...new Set(directMedia)] }
 }
 // 内容脚本 world 里优先用 GM.xmlHttpRequest（扩展特权请求，不依赖页面 CSP/网络栈）；
 // 兼容旧环境回退到页面 fetch（AbortController 超时）。
-function gmFetchText(url: string, timeoutMs: number): Promise<string | null> {
+function gmFetchText(url: string, timeoutMs: number, referer?: string): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
     const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, timeoutMs)
@@ -335,7 +390,7 @@ function gmFetchText(url: string, timeoutMs: number): Promise<string | null> {
           url,
           responseType: "text",
           timeout: timeoutMs,
-          headers: { "Accept": "application/json, text/plain, */*" },
+          headers: { "Accept": "application/json, text/plain, */*", ...(referer ? { "Referer": referer } : {}) },
           onload: (response: any) => { done(typeof response?.responseText === "string" ? response.responseText : null) },
           onerror: () => done(null),
           ontimeout: () => done(null),
@@ -349,12 +404,67 @@ function gmFetchText(url: string, timeoutMs: number): Promise<string | null> {
         const controller = new AbortController()
         const timer2 = setTimeout(() => controller.abort(), timeoutMs)
         try {
-          const res = await fetch(url, { headers: { "Accept": "application/json, text/plain, */*" }, signal: controller.signal })
+          const res = await fetch(url, { headers: { "Accept": "application/json, text/plain, */*", ...(referer ? { "Referer": referer } : {}) }, signal: controller.signal })
           if (res.ok) done(await res.text()); else done(null)
         } finally { clearTimeout(timer2) }
       } catch { done(null) }
     })()
   })
+}
+// 获取重定向后的最终 URL（GM.xmlHttpRequest 的 finalUrl 属性）。
+// supjav 等站点校验 Referer：不带 Referer 时 supjav.php?c= 返回 200 而非 302，
+// 因此 referer 默认为当前页面 URL（调用方也可显式传入）。
+async function gmFetchFinalURL(url: string, timeoutMs: number, referer?: string): Promise<string | null> {
+  return new Promise(resolve => {
+    let settled = false
+    const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null) } }, timeoutMs)
+    const done = (value: string | null) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value) } }
+    const refererHeader = referer || location.href
+    try {
+      if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+        GM.xmlHttpRequest({
+          method: "GET",
+          url,
+          timeout: timeoutMs,
+          headers: { "Accept": "*/*", "Referer": refererHeader },
+          onload: (response: any) => {
+            const final = typeof response?.finalUrl === "string" && response.finalUrl ? response.finalUrl : null
+            done(final)
+          },
+          onerror: () => done(null),
+          ontimeout: () => done(null),
+        })
+        return
+      }
+    } catch {}
+    // 兜底：页面 fetch 自动跟随重定向，但无法拿 finalURL；返回 null
+    done(null)
+  })
+}
+// supjav.com 服务器选项卡（TV/FST/ST/VOE）：data-link 是 token，反转后请求 ?c= 拿到 302 目标上游页。
+// TV = turbovidhls.com（像素诱饵），ST = streamtape.com（真实源），VOE = johnbeyondnation.com（混淆源）。
+// 注意：不自动点击 ST 选项卡！supjav 页面在按钮首次点击时触发 smartpop 广告弹窗
+// （go.mnaspm.com/smartpop）导致页面跳转。让用户自己点 ST + 点播放，StreamTape iframe 内
+// 插件副本（frame report + 运行时代理）在会话期间自动捕获 tapecontent 直链。
+async function resolveSupjavServerLinks(): Promise<string[]> {
+  if (!/supjav\.com/i.test(location.hostname)) return []
+  const buttons = Array.from(document.querySelectorAll("a.btn-server[data-link]")) as any[]
+  if (!buttons.length) return []
+  // 只解析 ST/FST（真实上游），并行请求；TV 是像素诱饵、VOE 是混淆源，跳过以省时。
+  const targets: any[] = []
+  for (const btn of buttons) {
+    if (!/^(ST|FST)$/i.test(String(btn.textContent || "").trim())) continue
+    const token = String(btn.getAttribute("data-link") || "").trim()
+    if (!token || token.length < 8) continue
+    const reversed = token.split("").reverse().join("")
+    targets.push({ token, target: `https://lk1.supremejav.com/supjav.php?c=${reversed}` })
+  }
+  const finals = await Promise.all(targets.map((item) => gmFetchFinalURL(item.target, 6000)))
+  const results: string[] = []
+  for (const finalURL of finals) {
+    if (finalURL && !/turbovidhls\.com/i.test(finalURL) && !results.includes(finalURL)) results.push(finalURL)
+  }
+  return results
 }
 // PH 系清单端点返回 JSON（数组或对象），提取其中带媒体扩展名的绝对 URL。失败静默返回空数组；
 // 调用方只把解析出的真实媒体 URL 作为候选。
@@ -385,24 +495,9 @@ async function collectCandidates(): Promise<Candidate[]> {
   // （kt_player/flowplayer 等）设置媒体地址；有媒体元素或播放器容器（div 类名含
   // player 的 flowplayer 壳，porntrex kt_player 在页面无 <video> 时也适用）即提取。
   if (document.querySelector("video, audio, .fp-player, .kt_player, .kt-player, .player-wrap, .player-holder, .premium-player, [class*='player' i]")) { for (const value of playerScriptSourceURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" }) }
-  // MacCMS player_ 配置对象（player_aaaa.url）无条件提取：不依赖 video/player 容器门控。
-  for (const value of maccmsPlayerConfigURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
-  // avtoday.io/player 等同源 iframe 播放器：顶层无媒体元素时正片地址仍在 iframe 内联脚本
-  // （var m3u8_url = '...'）里，直接读同源 iframe 的 contentDocument 脚本，不依赖 iframe 报告链路。
-  for (const value of sameOriginFrameScriptSourceURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
-  // MacCMS vplayer 嵌套同源 iframe（dsd.com.se 等）：真实清单带 sign 签名，只出现在
-  // 嵌套 iframe 的 <video> 上（顶层 MacPlayer 配置是无签名直链 403），递归读取 currentSrc。
-  for (const value of sameOriginFrameMediaURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
-  // 155jx 类第三方播放器 iframe：正片地址作为 query 参数（url=）传给播放器页面（跨域 iframe
-  // 内部请求代理不到），直接解析 iframe src 的媒体参数即可拿到真实地址（classify 二次过滤）。
-  for (const value of iframeQueryMediaURLs()) pending.push({ value, source: "metadata" })
-  // jvlook 类 Vue 单页：videoDetail.videoUrlOne/Two/Three 在组件 data 里（镜像源常藏在
-  // videoUrlTwo/Three），运行时读取 Vue 树即可拿到真实媒体地址，避免只抓到 Twitter 原始源。
-  for (const value of vueComponentMediaURLs()) pending.push({ value, source: "dom", mediaKind: "inferred" })
-  // PH 系签名清单端点：主动 fetch 解析（无需用户点击播放），把真实媒体 URL 加入候选。
-  // 并发 fetch（hls/mp4 端点互不依赖），避免串行等待拖慢捕获（真机曾串行耗时 6s+）。
-  const endpointResults = await Promise.all(playerMediaEndpointURLs().slice(0, MAX_MEDIA_ENDPOINT_FETCHES).map(endpoint => resolvePHMediaEndpoint(endpoint)))
-  for (const urls of endpointResults) { for (const url of urls) pending.push({ value: url, source: "metadata" }) }
+  // —— 通用免播放取链采集注册表：按顺序收集策略提取器结果（已包含 MacCMS/Vue/iframe/PH/supjav）
+  const strategyResults = await collectViaStrategies()
+  for (const value of strategyResults) pending.push({ value, source: "strategy", mediaKind: "inferred" })
   document.querySelectorAll('link[rel="preload"][as="video"], link[rel="preload"][as="audio"]').forEach((element: any) => { const value = element.getAttribute("href"); if (value) pending.push({ value, source: "preload" }) })
   document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[name="twitter:player:stream"], meta[property="twitter:player:stream"]').forEach((element: any) => { const value = element.getAttribute("content"); if (value) pending.push({ value, source: "metadata" }) })
   performance.getEntriesByType("resource").forEach((entry: any) => pending.push({ value: entry.name, source: "performance" }))
@@ -486,6 +581,17 @@ function installRuntimeProxies(): void {
     if (normalized) {
       const kind = classify(normalized)
       if (kind && !NON_MEDIA_EXT_RE.test(normalized)) pushRuntimeCandidate(normalized, kind)
+      // 重定向最终 URL 捕获：请求 URL 无媒体扩展名（如 streamtape get_video 302→tapecontent.mp4），
+      // 但响应重定向到真实媒体地址时，按最终 URL 补入候选（流媒/渐进媒体均支持）。
+      promise.then((res: any) => {
+        try {
+          if (!res || typeof res.url !== "string" || !res.url) return
+          const finalURL = normalizeURL(res.url)
+          if (!finalURL || finalURL === normalized) return
+          const finalKind = classify(finalURL)
+          if (finalKind && !NON_MEDIA_EXT_RE.test(finalURL) && !runtimeCandidates.has(finalURL)) pushRuntimeCandidate(finalURL, finalKind)
+        } catch {}
+      }).catch(() => {})
       // hls 响应文本缓存：URL 命中 hls 或 content-type/正文嗅探到 HLS 时缓存清单文本，
       // 供 App 下载时清单端点 403/404 兑底（采集器已成功 fetch 过，文本真实有效）。
       // URL classify 不到的扩展名端点：content-type=mpegurl 或正文 #EXTM3U 时以最终响应
@@ -563,12 +669,14 @@ function runtimeManifestCacheObject(): Record<string, string> | undefined {
 // 顶层页面常混合广告/追踪 iframe（如 a.adtng.com 横幅）与正片播放器 iframe
 // （如 mydaddy.cc/video/...）。直接取第一个 iframe 会把广告当成播放器线索；
 // 改为评分选择：排除广告/追踪域名，优先播放器特征路径（/video/、/embed/ 等）。
-const AD_FRAME_HOST_RE = /(?:\.|^)(?:adtng|mavrtracktor|magsrv|whitetrafsa|gsrv|doubleclick|googlesyndication|googletagservices|adnxs|taboola|outbrain|amazon-adsystem|adform|criteo|pubmatic|rubiconproject|openx|casalemedia|serving-sys|zedo)(?:\.|$)/i
+const AD_FRAME_HOST_RE = /(?:\.|^)(?:adtng|mavrtracktor|magsrv|whitetrafsa|gsrv|doubleclick|googlesyndication|googletagservices|adnxs|taboola|outbrain|amazon-adsystem|adform|criteo|pubmatic|rubiconproject|openx|casalemedia|serving-sys|zedo|eix304|exosrv|adsterra|popads|popcash|trafficjunky|juicyads)(?:\.|$)/i
 const PLAYER_FRAME_PATH_RE = /(?:^|[\/_.-])(?:video|embed|player|watch|stream|play|episode|share|e)(?:[\/_.-]|$)/i
 function frameURLScore(url: string): number {
   try {
     const parsed = new URL(url)
     if (AD_FRAME_HOST_RE.test(parsed.hostname)) return -1
+    // 广告位特征：路径为 /ad 或 query 带 spotid/zoneid 等广告位参数（如 a.eix304.com/ad?spotid=...&type=300x250）
+    if (/\/ad(?:$|[\/?#])/i.test(parsed.pathname) || /(?:^|&)(?:spotid|zoneid|placement|ad_id|adtype)=/i.test(parsed.search)) return -1
     return PLAYER_FRAME_PATH_RE.test(parsed.pathname) ? 2 : 0
   } catch { return 0 }
 }
@@ -581,7 +689,13 @@ function firstPublicFrameURL(): string | undefined {
   for (const frame of Array.from(document.querySelectorAll("iframe")) as any[]) {
     const url = normalizeURL(frame.getAttribute("src"))
     if (!url) continue
-    const score = frameURLScore(url)
+    let score = frameURLScore(url)
+    if (score >= 0) {
+      // 尺寸偏好：大尺寸 iframe 多为播放器（≥640x360 加分），小尺寸横幅广告（≤336x280）降分。
+      const rect = frame.getBoundingClientRect()
+      if (rect.width >= 640 && rect.height >= 360) score += 1
+      else if (rect.width > 0 && rect.height > 0 && rect.width <= 336 && rect.height <= 280) score -= 1
+    }
     if (score > bestScore) { bestScore = score; best = url }
   }
   return best
@@ -591,7 +705,13 @@ function validReport(value: any): value is FrameReport { return !!value && typeo
 function captureDiagnostic(candidateCount: number, topLevelCandidateCount: number, frameReportCount: number, frameCandidateCount: number, waitMs: number, errorKind?: string): Record<string, unknown> {
   const entries = performance.getEntriesByType("resource") as Array<{ name?: string; initiatorType?: string }>, initiators: Record<string, number> = {}, hosts = new Set<string>(); let mediaLikeResourceCount = 0, iframeCount = 0
   for (const entry of entries) { const initiator = String(entry.initiatorType || "other").slice(0, 40); initiators[initiator] = (initiators[initiator] || 0) + 1; if (initiator === "iframe") iframeCount += 1; try { const url = new URL(String(entry.name || "")); hosts.add(url.host); if (/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|m4a|mp3|aac|opus|ogg|wav|vid)(?:$|[?#])/i.test(url.pathname) || /(?:manifest|playlist|m3u8|mpd|stream|media|video)=/i.test(url.search)) mediaLikeResourceCount += 1 } catch {} }
-  return { version: 1, browserVersion: String(GM_info?.script?.version || "unknown"), stage: candidateCount ? "captured" : "empty", capturedAt: Date.now(), pageURL: normalizeURL(location.href), candidateCount, resourceCount: entries.length, mediaLikeResourceCount, iframeCount, resourceHostCount: hosts.size, initiators, topLevelCandidateCount, frameReportCount, frameCandidateCount, waitMs, ...(errorKind ? { errorKind } : {}) }
+  // DOM 快照：iframe（src+尺寸）与媒体元素摘要，供 0 候选时定位真实播放器结构（懒加载/跨域）。
+  const iframes = Array.from(document.querySelectorAll("iframe")).slice(0, 12).map((frame: any) => { const rect = frame.getBoundingClientRect(); return { src: String(frame.getAttribute("src") || "").slice(0, 300), w: Math.round(rect.width), h: Math.round(rect.height) } })
+  const mediaElements: Array<{ tag: string; src: string; paused: boolean }> = []
+  for (const element of Array.from(document.querySelectorAll("video, audio")).slice(0, 8)) {
+    mediaElements.push({ tag: String(element.tagName || "").toLowerCase(), src: String(element.currentSrc || element.src || "").slice(0, 300), paused: element.paused === true })
+  }
+  return { version: 1, browserVersion: String(GM_info?.script?.version || "unknown"), stage: candidateCount ? "captured" : "empty", capturedAt: Date.now(), pageURL: normalizeURL(location.href), candidateCount, resourceCount: entries.length, mediaLikeResourceCount, iframeCount, resourceHostCount: hosts.size, initiators, topLevelCandidateCount, frameReportCount, frameCandidateCount, waitMs, iframes, mediaElements, ...(errorKind ? { errorKind } : {}) }
 }
 function mergeCandidates(topLevel: Candidate[], reports: FrameReport[]): Candidate[] {
   const seen = new Set<string>(), result: Candidate[] = []
@@ -610,7 +730,29 @@ if (isTopLevel()) GM.addValueChangeListener(REPORT_STORAGE_KEY, (_: string, __: 
 
 async function reportFrame(session: CaptureSession): Promise<void> {
   if (isTopLevel() || !validSession(session)) return
+  // iframe 内也要安装运行时代理：StreamTape 等播放器在 iframe 内 recaptcha 后
+  // 发起 get_video 请求，重定向后的 tapecontent 直链只有代理能捕获。
+  installRuntimeProxies()
+  // StreamTape 播放器：mainvideo.src 只在点击 .play-overlay 时设置（get_video?&stream=1）；
+  // 在 iframe 内主动点击 overlay，让播放器设置 src 并触发 get_video 请求。
+  if (/streamtape\.com/i.test(location.hostname)) {
+    for (let clickIndex = 0; clickIndex < 3; clickIndex += 1) {
+      const overlay = document.querySelector(".play-overlay")
+      if (overlay) { try { (overlay as any).click() } catch {} }
+      await wait(400)
+      // video.src 被设置后（get_video→tapecontent 302 加载完成），currentSrc 是最终直链。
+      const video = document.querySelector("video") as any
+      if (video && typeof video.currentSrc === "string" && video.currentSrc) break
+    }
+  }
   await wait(CAPTURE_DELAY_MS)
+  // StreamTape 等播放器 recaptcha 延迟较大：轮询等待 runtime 候选出现（最多等到会话 TTL）。
+  const pollDeadline = Date.now() + SESSION_TTL_MS
+  while (Date.now() < pollDeadline) {
+    if (!validSession(await GM.getValue(SESSION_STORAGE_KEY, null))) return
+    if (runtimeCandidates.size > 0) break
+    await wait(LISTEN_POLL_MS)
+  }
   if (!validSession(await GM.getValue(SESSION_STORAGE_KEY, null))) return
   const pageURL = normalizeURL(location.href); if (!pageURL) return
   const report: FrameReport = { sessionId: session.id, reportId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`, pageURL, pageTitle: document.title.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 240) || undefined, candidates: await collectCandidates(), capturedAt: Date.now() }
@@ -621,7 +763,7 @@ async function reportFrame(session: CaptureSession): Promise<void> {
 // `.video-before-ad.noVip`（"本视频为VIP会员专享"）。采集结果 0 候选时标记 gate，
 // 供 App 侧给出明确提示（VIP 账号登录后重新采集）而非笼统"无候选"。
 function detectPageGate(): { kind: "vip"; title?: string; posterURL?: string } | null {
-  const gateEl = document.querySelector<HTMLElement>(".video-before-ad.noVip")
+  const gateEl = document.querySelector(".video-before-ad.noVip") as any
   if (!gateEl) return null
   const title = gateEl.querySelector(".ad-title")?.textContent?.replace(/[\r\n\x00-\x1f\x7f]/g, " ").trim().slice(0, 120) || undefined
   let posterURL: string | undefined
@@ -646,7 +788,14 @@ async function captureCurrentPage(): Promise<{ count: number; hasFrameClue: bool
     // PH 系端点/og:video 已解析出真实媒体（source metadata）：正片已到手，
     // 无需再等 frame 报告或 30s 播放监听（真机 YouPorn 曾因白等监听耗时 37.6s）。
     // beeg 等必须点播才出 m3u8 的站点顶层没有 metadata 候选，仍走原流程。
+    // 例外：supjav→streamtape 的 metadata 候选只是上游页 URL（带 .mp4 后缀但非直链），
+    // 真实直链在 StreamTape iframe 内 recaptcha 后才由 frame 报告产出，需额外等待。
     if (topLevel.some(c => c.source === "metadata")) {
+      const hasStreamTape = topLevel.some(c => /streamtape\.com\/e\//i.test(c.url))
+      if (hasStreamTape) {
+        const frameDeadline = Date.now() + SESSION_TTL_MS
+        while (Date.now() < frameDeadline && activeReports.size === 0) await wait(LISTEN_POLL_MS)
+      }
       const candidates = mergeCandidates(topLevel, [...activeReports.values()])
       const playerFrameURL = firstPublicFrameURL()
       const manifestCache = runtimeManifestCacheObject()
@@ -820,7 +969,20 @@ async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
   let dragState: { startX: number; startY: number; offsetX: number; offsetY: number; left: number; top: number } | null = null
   let dragging = false, suppressClick = false
   const clearLongPress = () => { if (longPressTimer) clearTimeout(longPressTimer); longPressTimer = null }
+  // 双击手势检测：两次 click 间隔 <= DOUBLE_CLICK_MS 视为双击，触发打开主程序；否则为单击采集。
+  let doubleClickTimer: any = null
+  let lastClickAt = 0
+  const triggerOpenInYoinks = async () => {
+    // 双击拉起主程序：只跳转、不做捕获。候选来自此前的单击捕获（单击=完整捕获，
+    // 含触发播放与 30s 监听，页面自身请求不会触发反爬）；捕获期间浮标禁用，
+    // 双击被忽略，确保捕获不被截断、能拿到真实媒体链接。
+    const pageURL = normalizeURL(location.href) || location.href
+    const scheme = `scripting://run_single/YoinksRemote?url=${encodeURIComponent(pageURL)}&safari=1`
+    showFloatingFeedback(entry, "正在打开 Yoinks…")
+    try { (location as any).href = scheme } catch {}
+  }
   entry.addEventListener("pointerdown", (event: any) => {
+    event.stopPropagation()
     longPressTriggered = false; suppressClick = false; dragging = false
     const rect = entry.getBoundingClientRect()
     dragState = { startX: event.clientX, startY: event.clientY, offsetX: rect.left - event.clientX, offsetY: rect.top - event.clientY, left: rect.left, top: rect.top }
@@ -860,12 +1022,33 @@ async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
     entry.style.left = `${snappedLeft}px`; entry.style.top = `${top}px`
     void GM.setValue(FLOATING_ENTRY_POSITION_KEY, { x: snappedLeft, y: top })
   }
-  entry.addEventListener("pointerup", () => { clearLongPress(); finishDrag(); dragState = null; dragging = false })
-  entry.addEventListener("pointercancel", () => { clearLongPress(); finishDrag(); dragState = null; dragging = false })
+  entry.addEventListener("pointerup", (event: any) => { event.stopPropagation(); clearLongPress(); finishDrag(); dragState = null; dragging = false })
+  entry.addEventListener("pointercancel", (event: any) => { event.stopPropagation(); clearLongPress(); finishDrag(); dragState = null; dragging = false })
   entry.addEventListener("pointerleave", clearLongPress)
-  entry.addEventListener("click", async () => {
+  entry.addEventListener("click", async (event: any) => {
+    event.stopPropagation()
+    event.preventDefault()
     clearLongPress()
     if (longPressTriggered || suppressClick) { suppressClick = false; return }
+    const now = Date.now()
+    // 双击检测：300ms 内第二次点击
+    if (now - lastClickAt <= DOUBLE_CLICK_MS) {
+      // 双击：清除单击定时器，触发打开主程序
+      lastClickAt = 0
+      if (doubleClickTimer) { clearTimeout(doubleClickTimer); doubleClickTimer = null }
+      await triggerOpenInYoinks()
+      return
+    }
+    lastClickAt = now
+    // 单击：延迟 300ms 后执行捕获，若期间无第二次点击则执行
+    doubleClickTimer = setTimeout(() => {
+      doubleClickTimer = null
+      void performCapture()
+    }, DOUBLE_CLICK_MS)
+  })
+  
+  // 提取单击捕获逻辑为独立函数，供单击和双击共用
+  const performCapture = async () => {
     entry.disabled = true
     try {
       // 最优先：清除上一次捕获的旧候选数据（防止旧页面链接残留），
@@ -898,7 +1081,7 @@ async function installFloatingEntry(alwaysVisible: boolean): Promise<void> {
       showFloatingFeedback(entry, "采集失败")
       panel.classList.remove("show")
     } finally { entry.disabled = false }
-  })
+  }
   document.documentElement.appendChild(entry)
 }
 if (isTopLevel()) {

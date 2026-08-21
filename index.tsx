@@ -929,7 +929,9 @@ function View() {
       await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message } })
       setStatus(isLikelyHLSAudioRendition(sourceURL) && /未找到可下载的视频格式|no video formats|Requested format is not available/i.test(message)
         ? "该 HLS 清单看起来是音频子清单，未包含可下载视频。请在 Safari 选择 master.m3u8 或视频清单后再导入。"
-        : `探测失败：${message}`)
+        : /cloudflare|anti-bot|challenge|http error 403/i.test(message)
+          ? "探测失败：该站点启用了 Cloudflare 反爬防护，直接解析链接被拦截。请在 Safari 打开页面后用浮动入口双击捕获媒体候选。"
+          : `探测失败：${message}`)
     } finally {
       analysisBusyRef.current = false
       setAnalysisDraining(false)
@@ -943,6 +945,13 @@ function View() {
   // analyzeMedia without the automatic flag.
   useEffect(() => {
     void (async () => {
+      // 双击 Safari 插件拉起主程序：检测 queryParameters.safari=1 时自动导入 Safari 候选
+      // 此检查优先于剪贴板检查，不受 suppressed/checked 等状态影响
+      if (typeof Script.queryParameters.safari === "string" && Script.queryParameters.safari === "1") {
+        await importSafariMediaCandidate()
+        return
+      }
+
       const inspection = {
         checked: launchClipboardCheckedRef.current,
         suppressed: launchClipboardSuppressedRef.current,
@@ -1284,8 +1293,8 @@ function View() {
       if (frameProbe?.choices.length) {
         const recovered: SafariMediaCandidate[] = frameProbe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || playerFrameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: playerFrameURL, pageTitle: frameProbe.title || candidate.pageTitle, discoveredAt: candidate.discoveredAt, captureSource: "metadata" }))
         if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0], undefined, true); return }
-        const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
-        if (selected != null && recovered[selected]) { await analyzeSafariCandidate(recovered[selected], undefined, true); return }
+        // 双击 Safari 插件拉起主程序：多候选直接分析第一个，无需弹窗确认
+        await analyzeSafariCandidate(recovered[0], undefined, true)
         return
       }
       await logEvent({ level: "warn", event: "safari-candidate.frame-probe.fallback", details: { frameURL: playerFrameURL, candidateURL: candidate.url } })
@@ -1306,7 +1315,15 @@ function View() {
     if (!envelope) {
       if (diagnostic) await logEvent({ level: "warn", event: "safari-candidate.empty", details: { candidateCount: diagnostic.candidateCount, topLevelCandidateCount: diagnostic.topLevelCandidateCount, frameReportCount: diagnostic.frameReportCount, frameCandidateCount: diagnostic.frameCandidateCount, mediaLikeResourceCount: diagnostic.mediaLikeResourceCount, iframeCount: diagnostic.iframeCount, waitMs: diagnostic.waitMs, errorKind: diagnostic.errorKind || null } })
       const summary = diagnostic ? `最近采集：候选 ${diagnostic.candidateCount}，媒体类资源 ${diagnostic.mediaLikeResourceCount}，iframe ${diagnostic.iframeCount}，frame 报告 ${diagnostic.frameReportCount}。` : ""
-      setStatus(`Safari 暂无可导入的媒体候选。${summary}请在 Safari 扩展菜单运行“导入本页媒体候选到 Yoinks”。`)
+      setStatus(`Safari 暂无可导入的媒体候选。${summary}请先单击浮标捕获本页媒体（播放页可先点播放），再双击跳转。`)
+      return
+    }
+    // 双击跳转携带当前页面 URL（插件 normalizeURL(location.href) 的产物，字符串一致）：
+    // 候选来自其它页面时拒绝导入，防止「未先捕获就双击」时导入上一页残留候选。
+    const launchURL = typeof Script.queryParameters.url === "string" && Script.queryParameters.url.trim() ? Script.queryParameters.url : null
+    if (launchURL && envelope.pageURL && envelope.pageURL !== launchURL) {
+      await logEvent({ level: "warn", event: "safari-candidate.stale-page", details: { envelopePageURL: envelope.pageURL, launchURL } })
+      setStatus("Safari 候选来自其它页面，已忽略。请先单击浮标捕获本页媒体，再双击跳转。")
       return
     }
     // VIP 专享页（dsd.com.se 等 MacCMS）：服务端对匿名/普通账号不下发播放器配置，
@@ -1348,8 +1365,8 @@ function View() {
         const frameURL = envelope.playerFrameURL
         const recovered: SafariMediaCandidate[] = probe.choices.map((choice, index) => ({ id: `public-player-${index + 1}`, url: choice.sourceURL || choice.previewURL || frameURL, kind: choice.id.includes("hls") ? "hls" : choice.id.includes("dash") ? "dash" : choice.kind === "audio" ? "audio" : "video", pageURL: frameURL, pageTitle: probe.title || envelope.pageTitle, discoveredAt: envelope.capturedAt, captureSource: "metadata" }))
         if (recovered.length === 1) { await analyzeSafariCandidate(recovered[0], undefined, true); return }
-        const selected = await Dialog.actionSheet({ title: "公开播放器候选", message: "仅解析公开页面、同源脚本与公开 JSON；不使用 Cookie、授权或请求头。", actions: recovered.map(safariCandidate => ({ label: safariCandidateSummary(safariCandidate) })), cancelButton: true })
-        if (selected != null && recovered[selected]) { await analyzeSafariCandidate(recovered[selected], undefined, true); return }
+        // 双击 Safari 插件拉起主程序：多候选直接分析第一个（保持原有的失败回退链），无需弹窗确认
+        await analyzeSafariCandidate(recovered[0], undefined, true)
         return
       }
       await logEvent({ level: "warn", event: "safari-candidate.frame-probe.empty", details: { frameURL: envelope.playerFrameURL, candidateCount: envelope.candidates.length } })
@@ -1371,19 +1388,12 @@ function View() {
       await analyzeSafariCandidate(envelope.candidates[0], envelope.playerFrameURL, safariCandidateIsVidRedirect(envelope.candidates[0]))
       return
     }
-    const actions = envelope.candidates.map((candidate) => ({ label: safariCandidateSummary(candidate) }))
-    const selected = await Dialog.actionSheet({
-      title: "Safari 媒体候选",
-      message: `${envelope.pageTitle || "当前页面"} · ${new Date(envelope.capturedAt).toLocaleString()}\n${diagnostic ? `诊断：候选 ${diagnostic.candidateCount} · 媒体类资源 ${diagnostic.mediaLikeResourceCount} · iframe ${diagnostic.iframeCount} · 资源域名 ${diagnostic.resourceHostCount}\n` : ""}优先选择“推荐 · 自适应”HLS/DASH；标注“备用直链”的 MP4 仅包含其固定画质。\n仅导入公开 URL，不包含 Cookie、授权或请求头。`, 
-      actions,
-      cancelButton: true,
-    })
-    if (selected == null) return
-    const candidate = envelope.candidates[selected]
-    if (!candidate) return
-    // 分析失败时自动尝试同页面其他候选（如 jvlook 镜像源），避免 Twitter 原始源 403 后无路可走。
-    const fallbacks = envelope.candidates.filter((c) => c.url !== candidate.url)
-    await analyzeSafariCandidate(candidate, envelope.playerFrameURL, safariCandidateIsVidRedirect(candidate), fallbacks)
+    // 双击 Safari 插件拉起主程序：自动导入并分析第一个候选，无需弹窗确认
+    if (envelope.candidates.length > 0) {
+      const candidate = envelope.candidates[0]
+      await analyzeSafariCandidate(candidate, envelope.playerFrameURL, safariCandidateIsVidRedirect(candidate))
+      return
+    }
   }
 
   const chooseRecentLink = async () => {

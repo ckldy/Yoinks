@@ -17,6 +17,12 @@ except ImportError:
     print(json.dumps({"ok": False, "error": "yt-dlp is unavailable"}))
     raise SystemExit(2)
 
+# ios_system 的 stderr 是文本流：yt-dlp 报错时 write_string 会把消息按 encoding 编码成
+# bytes 写入，直接抛 "string argument expected, got 'bytes'"，把真实错误（如 Cloudflare
+# 403 反爬）吞掉，App 只能看到无意义的 TypeError。探测已 quiet，直接空转 to_stderr，
+# 让真实异常上抛到本脚本的 except 分支。
+YoutubeDL.to_stderr = lambda self, message, only_once=False: None
+
 
 def safe_url(value: str) -> bool:
     try:

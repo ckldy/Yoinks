@@ -252,3 +252,26 @@ export async function extractPublicPlayerSources(input: { pageURL: string; pageT
   }
   return null
 }
+
+/**
+ * StreamTape 专用解析：页面 HTML 内联的 `#botlink` 值是 get_video 网关 URL，但 token 被
+ * JS 混淆（初始 HTML 里是假 token，脚本执行后用 substring 拼接出真 token）。此处还原
+ * 混淆逻辑拿到真 get_video URL；真 token 的 get_video 纯 HTTP（Safari UA + 页面自身 Referer）
+ * 即可 302 到 tapecontent.net 真实直链（.mp4），无需 recaptcha / 浏览器会话。
+ * 还原规则（streamtape 播放页固定脚本，prefix 是任意字符串，不写死）：
+ *   document.getElementById('botlink').innerHTML = '<prefix>' + ('<混淆串>').substring(N);
+ * 解混淆 = prefix + 混淆串.slice(N)。例如：
+ *   '//streamtape.com/get_video?id' + ('xyza=jrm…&token=<真token>').substring(4)
+ *   = '//streamtape.com/get_video?id=jrm…&token=<真token>'
+ */
+export function extractStreamTapeGetVideoURL(html: string, pageURL: string): string | null {
+  // 页面脚本里对 botlink 的重写语句：prefix 与混淆串都可能是任意形式，
+  // 不要求 prefix 含 get_video；统一按 `prefix + obfuscated.slice(offset)` 还原。
+  const rewriteRE = /getElementById\(['"]botlink['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?\s*['"]([^'"]+)['"]\s*\)?\.substring\((\d+)\)/i
+  const rewrite = html.match(rewriteRE)
+  if (!rewrite) return null
+  const decoded = `${rewrite[1]}${rewrite[2].slice(Number(rewrite[3]))}`
+  const normalized = normalizePublicURL(decoded, pageURL)
+  if (!normalized || !/get_video/i.test(normalized)) return null
+  return normalized
+}

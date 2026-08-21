@@ -2,7 +2,7 @@
 
 面向 [Scripting](https://scripting.fun) 的 iOS 媒体下载脚本。粘贴或分享公开媒体链接，探测可选格式后下载，并可保存到相册或文件。
 
-当前版本：**1.6.17**
+当前版本：**1.6.19**
 
 作者：**vcncv**
 
@@ -128,6 +128,7 @@ scripting-ts project "Yoinks" --check
 
 | 版本 | 要点 |
 |------|------|
+| **1.6.19** | **通用免播放取链探测框架重构**（方案 B：App 侧 `PlayerProbeStrategy` 策略注册表 + 插件侧 `PLAYER_EXTRACTION_STRATEGIES`/`collectViaStrategies()`，净减 ~70 行）；**Safari 候选清晰度降序排序**（方案 A：`safariCandidateHeight()` + 排序链增强）；**Pornhub 捕获多档清晰度修复**（插件 v1.3.13：`playerMediaEndpointURLs` 返回 `{endpoints, directMedia}` + 还原 JSON 转义 `\/`/`\u0026`，真机闭环） |
 | **1.6.14** | **可靠性与隐私加固**：Safari 用户脚本改为临时文件校验后事务替换，发布 rename 失败自动恢复旧版；修复单链下载认证源 Cookie 文件未清理；导入 Cookie 清理改为可等待、失败保留路径以便重试；新增故障注入专项验证 |
 | **1.6.13** | UI 全面美化（主题系统 + 8 个共享组件 + 四页卡片化）；UMP 组件自愈链与双备份；UMP 插件迁移至项目 `python/ump-vendor/` 并通过 `--plugin-dir` 加载 |
 | **1.6.12** | **下载可靠性三件套**：B站/直链分段下载取消延迟修复（读循环取消检查点，25s→毫秒级，取消错误不再静默重试）+ 进度计数虚增修复（段重试扣除已写入字节，显示不再超总大小）；**下载后台保活**（BackgroundKeeper 包裹单链/批量下载，切后台继续分段 fetch/HLS/ffmpeg，引用计数并发安全）；**下载完成通知**（仅 App 后台时发送：单链成功/失败 + 批量汇总一条；点击通知切回原界面不重开实例；设置页开关默认开）；真机验收通过 |

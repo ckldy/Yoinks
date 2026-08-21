@@ -1,5 +1,28 @@
 # 更新日志
 
+## 1.6.19 — 2026-08-21
+
+> 通用免播放取链探测框架重构 + Safari 候选清晰度排序 + Pornhub 多档清晰度捕获修复。
+
+### 重构
+
+- **通用免播放取链探测框架（方案 B，App 侧）**：`services/media.ts` 新增 `PlayerProbeStrategy` 策略注册表与 `probePlayerDirect()` 调度器，把站点级原生探测从硬编码 `if` 链收敛为注册表（bilibili / youtube / streamtape），新增站点只需追加一条策略；净减约 50 行。
+- **通用免播放取链采集框架（方案 B，插件侧）**：`browser.tsx.src` 新增 `PlayerExtractionStrategy` 轻量 `PLAYER_EXTRACTION_STRATEGIES` 数组（maccms / 同源 iframe 脚本与媒体 / iframe query / Vue 组件 / PH 端点 / supjav 服务器）与 `collectViaStrategies()` 统一调度器，保留原“无条件收集 + classify 过滤”语义；净减约 20 行。
+
+### 改进
+
+- **Safari 候选清晰度降序排序**：`services/safari-media-candidates.ts` 新增 `safariCandidateHeight()`（从 URL 路径提取 240/480/720/1080 等清晰度），`sortSafariMediaCandidates()` 排序链增强为「kind 优先级 → 清晰度降序 → 原始索引」，同优先级候选自动高清在前。
+
+### 修复
+
+- **Pornhub 捕获只有 240P**（插件 v1.3.13，真机闭环）：Pornhub 的 `mediaDefinitions` 每个清晰度是一个**独立 master.m3u8 CDN 直链**（非传统“一个 master + 多档变体”）；旧 `playerMediaEndpointURLs()` 的 `PH_MEDIA_ENDPOINT_RE` 只认 `/media/` 签名端点，把 `em-h.phncdn.com/hls/...` 完整直链全部过滤掉，只剩 `og:video` 的 240P。修复：返回 `{ endpoints, directMedia }` 双通道（签名端点 fetch 解析 + 完整 CDN 直链直接入候选），并还原 JSON 转义 `\/` → `/` 与 `\u0026` → `&`（否则签名 URL 参数粘连失效）。
+
+### 验证
+
+- Safari 候选排序：16 项断言（清晰度提取 + 排序）全过。
+- `verify_browser_publish` 35 项（转换器无 TS 类型残留）全过。
+- 真机闭环：Pornhub 捕获 240/480/720/1080 多档清晰度符合预期。
+
 ## 1.6.17 — 2026-08-19
 
 > 通用远程解析：本地解析失败时自动远程解析（只解析不下载，下载仍在本地）；支持抖音 16 档无水印（含 4K H.265）、小红书 xhslink 短链、其它站点通用兑底；附带本地抖音真实 UA 解析与预览无声修复、小红书缺凭证前置提示。
