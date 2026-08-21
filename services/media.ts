@@ -2273,6 +2273,8 @@ export async function downloadDirectSegmented(options: {
   stage: string
   onProgress?: (value: { fraction: number; stage: string; downloadedBytes?: number; totalBytes?: number; speed?: number }) => void
   isCancelFlagSet: () => boolean
+  /** 日志关联的下载任务 ID（可选，便于按任务追溯段级失败）。 */
+  taskId?: string
 }): Promise<boolean> {
   if (options.isCancelFlagSet()) throw new Error("下载已取消")
   // 1) 探测总大小（Range bytes=0-0 只取头，不下载 body）。
@@ -2356,6 +2358,7 @@ export async function downloadDirectSegmented(options: {
     // 该段当前尝试已写入的字节数：失败重试前从总计数中扣除（重试会重新下载整段），
     // 否则 downloaded 重复计数会超过 total，进度显示「已下载 > 总大小」。
     let size = 0
+    let lastError: unknown = null
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (options.isCancelFlagSet()) return false
       try {
@@ -2421,12 +2424,18 @@ export async function downloadDirectSegmented(options: {
           clearTimeout(timeout)
         }
       } catch (error) {
+        lastError = error
         // 扣除本段本次尝试已写入的字节（重试将重新下载整段），避免 downloaded 虚增
         downloaded = Math.max(0, downloaded - size)
         // 取消错误不再静默重试，立即向上抛出（取消时其他段也通过检查点退出）
         if (options.isCancelFlagSet() || (error instanceof Error && error.message === "下载已取消")) throw error
         if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 300 * (attempt + 1)))
       }
+    }
+    // 3 次尝试全部失败：记录段级失败原因（此前只返回 false，日志仅剩笼统的「分段下载失败」，无法定位）
+    if (!options.isCancelFlagSet()) {
+      const message = lastError instanceof Error ? `${lastError.name} ${lastError.message}` : String(lastError)
+      await logEvent({ level: "warn", event: "download.direct.segment-failed", taskId: options.taskId, details: { segment: index, range: `${start}-${end}`, attempts: 3, message } })
     }
     return false
   }
@@ -4087,6 +4096,7 @@ export async function downloadMedia(options: {
             stage: "正在并发分段下载（多线程）",
             onProgress: options.onProgress,
             isCancelFlagSet,
+            taskId,
           })
         } catch (segError) {
           if (isCancelFlagSet() || (segError instanceof Error && segError.message === "下载已取消")) throw segError
@@ -4145,6 +4155,7 @@ export async function downloadMedia(options: {
               stage: "正在下载音频流（原生分段）",
               onProgress: options.onProgress,
               isCancelFlagSet,
+              taskId,
             })
           } catch (audioSegError) {
             audioDownloaded = false
