@@ -1,5 +1,32 @@
 # 更新日志
 
+## 1.6.22 — 2026-09-19
+
+> 修复「能识别格式但下载不了」：yt-dlp 自身进度行写入本环境文本捕获流会抛 `TypeError`，使**所有** yt-dlp 下载必定失败；同时修复该崩溃被谎报为「网络超时」。
+
+### 修复
+
+- **所有 yt-dlp 下载不再中断**（`ytdlp_runner.py`）：新增 `noprogress: True`，并中和 yt-dlp 的 stderr 输出（`YoutubeDL.to_stderr`，与 `ytdlp_probe.py` 一致）。
+  - 根因：Scripting 应用内 Python 的 `sys.stdout`/`sys.stderr` 是 `_CapturedStream`，其 `.buffer` 是 **`_io.StringIO`（文本流）而非 BytesIO**；而 yt-dlp 的 `write_string()` 只要发现 `hasattr(out, 'buffer')` 就把字符串 `encode` 成 bytes 写入，必然抛 `TypeError: string argument expected, got 'bytes'`。
+  - 该路径**不可避免**：yt-dlp 在 `downloader/common.py` 的 `__init__` 里无条件 `add_progress_hook(self.report_progress)`，因此 HLS 分片会在下载中途崩溃、渐进式 MP4 会在 `status: finished` 时崩溃（`quiet: True` 并不关闭进度行）。
+  - 这也解释了「探测正常、只有下载失败」：探测脚本早已中和 `to_stderr` 且只做 `download=False`，不受影响。
+  - 附带修复：`trouble()` 会先 `to_stderr(traceback)` 再抛 `DownloadError`，不中和就会让 TypeError 顶替真实错误（如 SSL 失败、403、需登录等）。
+- **不再把程序内部崩溃谎报为网络问题**（`services/media.ts`）：新增 `pythonTracebackSummary()`，在所有网络类启发式**之前**判定——若存在 traceback 且末行异常不是 yt-dlp 自己归类的失败（`DownloadError` / `\bERROR:`），则如实展示「下载失败：程序内部错误（<异常行>）」。
+  - 根因：`compactMessage()` 的通用 `/timed out|timeout|TransportError/` 启发式命中了 traceback 里 `concurrent/futures` 的 `fut.result(timeout)` 等库内部实现细节，与网络无关却触发了「下载过程中网络超时」。
+  - 注意：**不能**用 `/ERROR:/` 判定——它会匹配 `TypeError:` 的子串（`...Error:`），会把自己刚修好的分支又漏掉。
+
+### 验证
+
+- 真机原始失败已本地复现（用备份 runner 跑相同 config → 相同 `TypeError`，exit 1）；修复后同一命令 exit 0。
+- 新增 `verify_x_hls_download_e2e.ts`：**5/5 通过**。跑**应用真实管线**（`probeMedia` → `downloadMedia` 音视频双流 → `ffmpeg` 合并 → `verifyAndPublish`）处理用户报告的 X 链接与当初选中的 `video-720-hls-552-with-hls-audio-128000-Audio`，产出 8.7 MB MP4，`ffprobe` 确认同时含 video + audio 流。
+- 新增 `verify_download_error_message.ts`：**11/11 通过**（含「内部崩溃不得再被报为网络超时」与「真实 TLS 超时/页面超时/CDN 中断仍保留各自文案」）。
+- 新增 `verify_download_error_classification.ts`：**6/6 通过**，用真实失败输出证明中和 stderr 后 404 / `CERTIFICATE_VERIFY_FAILED` / 无可用格式等分类仍能正常命中。
+- 回归：`verify_output_paths`(12)、`verify_youtube_auth_gate`(36)、`verify_reliability_hardening`(15)、`verify_x_preview_audio` 全通过；项目启动回归通过。
+
+### 备注
+
+- runner 的 MP3 路径（`extract_audio: true`）会报 `ffprobe and ffmpeg not found`——Python 环境无法发现 App 内置 ffmpeg；当前 `services/media.ts` 硬编码 `extract_audio: false`，应用不走该路径，与本次修复无关。
+
 ## 1.6.21 — 2026-09-19
 
 > 修复 YouTube「公开视频也被要求登录」：错误分类被 JSON 转义击穿误判为需登录；并修复登录后反而彻底无法探测/下载的客户端冲突。

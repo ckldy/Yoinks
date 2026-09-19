@@ -15,6 +15,14 @@ for _m in list(sys.modules):
 
 from yt_dlp import YoutubeDL
 
+# ios_system 的 stdout/stderr 是文本捕获流：其 `.buffer` 是 StringIO（不是二进制流），
+# 而 yt-dlp 的 write_string 会把字符串 encode 成 bytes 再写入 buffer，于是抛
+# "TypeError: string argument expected, got 'bytes'"。进度行渲染与 report_error 都会
+# 触发它，前者会直接中断下载（如 X/Twitter 的 HLS 分片进度），后者会把真实错误吞掉。
+# 进度已通过 progress_hooks 写文件，这里中和 stderr 输出、并关闭 yt-dlp 自己的进度行
+# （见下方 options['noprogress']），让真实结果与异常正常上抛。与 ytdlp_probe.py 一致。
+YoutubeDL.to_stderr = lambda self, message, only_once=False: None
+
 
 class DownloadCancelled(Exception):
     pass
@@ -146,6 +154,9 @@ def main():
         "playlist_items": "1",
         # Progress is written via progress_hooks; keep stdout small so Shell.run keeps final path lines.
         "quiet": True,
+        # 关键：yt-dlp 自己的进度行会经 write_string 写入本环境的文本捕获流而抛 TypeError，
+        # 在 HLS 分片下载中会直接中断整个下载。进度已由 progress_hooks 写文件，无需它。
+        "noprogress": True,
         "no_warnings": True,
         "nocheckcertificate": bool(config.get("no_check_certificates", False)),
         "retries": 3,

@@ -304,12 +304,47 @@ export function isSafariHlsDirectFallbackFailure(value: string): boolean {
   return isCloudflareAntiBotFailure(value) || isRemoteHlsManifestDisconnect(value)
 }
 
+/**
+ * yt-dlp 内部异常时 Python 会打印完整 traceback。网络故障会被 yt-dlp 包装成
+ * `yt_dlp.utils.DownloadError: ERROR: ...`，而环境 bug（如本设备文本捕获流触发的
+ * TypeError）会以原始异常直接上抛。后者的 traceback 里满是库内部实现细节
+ * （例如 concurrent.futures 的 `fut.result(timeout)`），含 "timeout" 字样却与网络无关，
+ * 会被下面的超时启发式谎报为「网络超时」。
+ *
+ * 返回非空 = 这是一个未被 yt-dlp 归类的内部崩溃；返回 null = 交给原有网络类启发式。
+ */
+export function pythonTracebackSummary(value: string): string | null {
+  const source = String(value || "")
+  if (!/Traceback \(most recent call last\)/i.test(source)) return null
+  const lines = source
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  let exceptionLine: string | null = null
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (/^[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt)\b\s*:/.test(lines[index])) {
+      exceptionLine = lines[index]
+      break
+    }
+  }
+  if (!exceptionLine) return null
+  // yt-dlp 自己归类过的失败（网络/不支持等）保留原有更精确的文案。
+  // 注意不能用 /ERROR:/ 判定：它会把 "TypeError: ..." 误判成 yt-dlp 的 ERROR 行。
+  if (/DownloadError/i.test(exceptionLine) || /\bERROR:/.test(exceptionLine)) return null
+  return exceptionLine.slice(0, 300)
+}
+
 export function compactMessage(value: string): string {
   const cleaned = stripHostNoise(value)
   // 探测脚本失败时输出的是 JSON 信封 {"ok": false, "error": "ERROR: ..."}。
   // 直接展示会把转义后的原始串（含字面量 \u2019 等）暴露给用户，既难看也难读。
   // 这里先拆出内层 error 并还原转义，再交给下游规则匹配。
   const source = cleanProbeEnvelope(cleaned || value)
+  // 必须先于超时启发式：未被 yt-dlp 归类的 traceback 里的库内部字样不是网络故障证据。
+  const traceback = pythonTracebackSummary(source)
+  if (traceback) {
+    return `下载失败：程序内部错误（${traceback}）。请重试；若持续失败请反馈该错误信息。`
+  }
   if (isDownloadTlsTimeout(source)) {
     return "下载过程中网络 TLS/握手超时，请检查网络后重试；可改选 H.264 清晰度或稍后再试。"
   }
