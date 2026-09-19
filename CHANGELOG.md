@@ -1,5 +1,31 @@
 # 更新日志
 
+## 1.6.21 — 2026-09-19
+
+> 修复 YouTube「公开视频也被要求登录」：错误分类被 JSON 转义击穿误判为需登录；并修复登录后反而彻底无法探测/下载的客户端冲突。
+
+### 修复
+
+- **只有会员专享才提示登录**（`services/platform-auth.ts`）：新增统一判定 `classifyAuthGate()`，所有入口（单链分析 / 发现页 / 批量下载，`index.tsx` + `remote-entry.tsx` 共 6 处）改由它决定是否引导登录。
+  - 根因：yt-dlp 的错误经过 JSON 嵌套转义后，`’`(U+2019) 到达分类器时仍是**字面量** `\u2019`，导致 `/sign in to confirm you['’]?re not a bot/` 漏判，反机器人风控被 `isFreshCookieError` 的 `/sign in/` 命中，于是弹出了登录框。
+  - 现在分类前先 `unescapeForMatching()` 还原转义；YouTube 仅 `members-only` 提示登录，`bot-check` 提示换网/稍后重试，其余（`Requested format is not available`、无 streamingData、403、超时等）**一律不提示登录**。抖音保持永不提示；小红书/B站 保留原有 fresh-cookie 语义。
+- **登录后不再反而失败**（`ytdlp_probe.py` + `ytdlp_runner.py`）：不再硬编码 `player_client=["android_vr"]`，改用 `["default"]` 让 yt-dlp 按匿名/登录自动选择客户端集合。
+  - 根因：`android_vr` 在 yt-dlp 中 `SUPPORTS_COOKIES=False`；带账号 cookie 时 yt-dlp 会剔除所有不支持 cookie 的 client，硬编码后可用客户端被清空 → `Requested format is not available`（把「可换网恢复」变成「结构性无解」）。
+  - 附带收益：本设备无 JS runtime 时 yt-dlp 自选 `visionos`，实测同一视频 **31 档**（含 2160p/1440p）vs 原 `android_vr` 的 **5 档**。
+- **失败不再暴露原始 JSON**（`services/media.ts`）：新增 `cleanProbeEnvelope()`，展示前拆出内层 `error` 并还原 `\uXXXX` 转义，避免把转义后的原始串直接给用户。
+- **YouTube 探测不再空跑公开播放器兜底**（`services/media.ts`）：YouTube 是 SPA，该兜底必然 `checkedIframes=0 / hit=false`，只会白等 6 秒；已直接跳过。
+- **探测日志可定位**（`services/youtube.ts`）：改为先读 `playabilityStatus` 再判断 `streamingData`。原先先判 `streamingData` 会把 `LOGIN_REQUIRED`/`ERROR`/`UNPLAYABLE` 统一误报成「可能需登录/受限」，无法区分风控与会员专享。
+
+### 验证
+
+- 新增 `verify_youtube_auth_gate.ts`：**36/36 通过**（真实日志原始串的转义形态、bot-check/members-only/普通失败分类、抖音与小红书/B站 回归、信封解析、以及「入口不得再用旧分类直接分支」「客户端策略不得再硬编码 android_vr」的回归守卫）。
+- 真机可复现的端到端链路验证：真实 `ytdlp_probe.py` 返回 **31 档**；真实 `ytdlp_runner.py` 分别下载 video(2.0 MB)/audio(1.3 MB) 成功（exit 0），`ffmpeg -c copy` 合并出同时含 H.264 + AAC 的有效 MP4。
+- 回归：`verify_reliability_hardening`(15)、`verify_shell_quote`(3)、`verify_log_tail`(3)、`verify_launch_clipboard`(7) 全通过；项目启动回归通过。
+
+### 备注
+
+- 反机器人风控（`Sign in to confirm you're not a bot`）是**出口 IP 级**限制，登录无效；应换网或稍后重试。
+
 ## 1.6.20 — 2026-08-22
 
 > 分段下载失败原因可观测性增强：直链分段下载每段 3 次重试耗尽时记录段级失败日志，不再只有笼统的“分段下载失败”。

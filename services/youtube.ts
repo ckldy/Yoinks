@@ -127,13 +127,25 @@ export async function probeYouTubeDirect(sourceURL: string): Promise<MediaProbe 
   const startedAt = Date.now()
   await logEvent({ level: "info", event: "probe.youtube.direct.started", taskId, details: { sourceURL, videoId } })
   const player = await fetchPlayerResponse(videoId)
-  if (!player || !player.streamingData) {
-    await logEvent({ level: "warn", event: "probe.youtube.direct.empty", taskId, details: { videoId, message: "无 streamingData（可能需登录/受限）" } })
+  if (!player) {
+    await logEvent({ level: "warn", event: "probe.youtube.direct.failed", taskId, details: { videoId, message: "innertube 请求失败（网络/HTTP 异常）" } })
     return null
   }
+  // 先看 playabilityStatus：受限时 streamingData 本来就不存在，
+  // 如果先判 streamingData 会把真实原因（LOGIN_REQUIRED / ERROR / UNPLAYABLE）
+  // 统一误报成“可能需登录/受限”，导致真机日志无法区分风控与会员专享。
   const playability = player.playabilityStatus?.status || ""
   if (playability !== "OK") {
-    await logEvent({ level: "warn", event: "probe.youtube.direct.unplayable", taskId, details: { videoId, playability, reason: player.playabilityStatus?.reason || "" } })
+    await logEvent({
+      level: "warn",
+      event: "probe.youtube.direct.unplayable",
+      taskId,
+      details: { videoId, playability, reason: player.playabilityStatus?.reason || "" },
+    })
+    return null
+  }
+  if (!player.streamingData) {
+    await logEvent({ level: "warn", event: "probe.youtube.direct.empty", taskId, details: { videoId, message: "playability=OK 但无 streamingData（potoken/nsig 门槛）" } })
     return null
   }
   const allFormats = [...(player.streamingData.formats || []), ...(player.streamingData.adaptiveFormats || [])].filter((f) => f && f.url)

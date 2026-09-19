@@ -105,8 +105,23 @@ export function authPlatformLabel(platform: AuthPlatform): string {
   return PLATFORM_CONFIG[platform].label
 }
 
+/**
+ * yt-dlp 的错误文本会经 JSON 多层转义，非 ASCII 字符（如 ’ U+2019）到达分类器时
+ * 可能仍是**字面量** `\u2019`（反斜杠 + u2019 共 6 个字符），而不是真正的字符。
+ * 原有的 /sign in to confirm you['’]?re not a bot/ 因此漏判，把 YouTube 反机器人风控
+ * 误判成"需要登录"。分类前先还原一次转义，使两种形式都能命中。
+ */
+export function unescapeForMatching(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\[nrt]/g, " ")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\")
+}
+
+/** 仅用于非 YouTube 站点的会话失效判定；YouTube 一律走 [[classifyAuthGate]] 的严格判定。 */
 export function isFreshCookieError(message: string): boolean {
-  return /fresh cookies|cookies? (?:are|is) needed|login required|sign in|required to login|not logged in|members-only|join this channel/i.test(message)
+  return /fresh cookies|cookies? (?:are|is) needed|login required|sign in|required to login|not logged in|members-only|join this channel/i.test(unescapeForMatching(message))
 }
 
 /**
@@ -114,12 +129,36 @@ export function isFreshCookieError(message: string): boolean {
  * 与反机器人风控（isYouTubeBotCheckError）区分——bot 检测登录无效，不应引导登录。
  */
 export function isYouTubeMembersOnlyError(message: string): boolean {
-  return /members-only|join this channel|成为此频道的会员|会员专享/i.test(message)
+  return /members-only|join this channel|成为此频道的会员|会员专享|仅限会员|available to members/i.test(unescapeForMatching(message))
 }
 
 /** YouTube 反机器人风控（"Sign in to confirm you're not a bot"）：登录通常无效，应提示稍后重试/换网。 */
 export function isYouTubeBotCheckError(message: string): boolean {
-  return /sign in to confirm you['’]?re not a bot/i.test(message)
+  return /sign\s*in\s*to\s*confirm\s*you['’]?re\s*not\s*a\s*bot|confirm you['’]?re not a bot|not a bot/i.test(unescapeForMatching(message))
+}
+
+/** 探测失败后的登录引导决策。 */
+export type AuthGateDecision = "members-only" | "bot-check" | "fresh-cookie"
+
+/**
+ * 统一的登录引导判定——**只有确实需要账号时才允许提示登录**。
+ *
+ * - YouTube：仅 `members-only`（会员专享）需要账号；反机器人风控（`bot-check`）登录无效，
+ *   应提示换网/稍后重试；其余一切失败（含 `Requested format is not available`、
+ *   无 streamingData 等）都**不是**账号问题，返回 null 让调用方按普通失败处理。
+ *   注：登录态下 YouTube 客户端策略会变化（不支持 cookie 的 client 被剔除），
+ *   盲目引导登录反而会从"可换网恢复"变成"结构性无解"。
+ * - 抖音：始终匿名，不引导登录。
+ * - 其它站点：保持原有 fresh-cookie 语义（缺失/过期 Cookie 需要登录）。
+ */
+export function classifyAuthGate(platform: MediaPlatform, message: string): AuthGateDecision | null {
+  if (platform === "youtube") {
+    if (isYouTubeMembersOnlyError(message)) return "members-only"
+    if (isYouTubeBotCheckError(message)) return "bot-check"
+    return null
+  }
+  if (platform === "douyin") return null
+  return isFreshCookieError(message) ? "fresh-cookie" : null
 }
 
 export async function beginPlatformLogin(platform: AuthPlatform, retention: LoginRetention): Promise<PlatformAuthSession> {

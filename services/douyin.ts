@@ -483,16 +483,42 @@ export function buildDownloadCandidates(
       pushAddress("inline_play_addr_265", video.play_addr_265)
       pushAddress("inline_download_addr", video.download_addr)
 
+      const normalizeFileId = (value: unknown): string | null => {
+        if (typeof value !== "string" && typeof value !== "number") return null
+        const normalized = String(value).trim()
+        return normalized || null
+      }
+      const collectAudioURLs = (source: Record<string, unknown>): string[] => {
+        const urls: string[] = []
+        const appendAddress = (address: unknown) => {
+          if (Array.isArray(address)) {
+            urls.push(...address.map((value) => getString(value)).filter((url): url is string => Boolean(url)))
+            return
+          }
+          if (!isRecord(address)) return
+          urls.push(...urlsFromAddress(address))
+          urls.push(...[address.main_url, address.backup_url, address.fallback_url]
+            .map((value) => getString(value))
+            .filter((url): url is string => Boolean(url)))
+        }
+
+        appendAddress(source.url_list)
+        for (const key of ["play_addr", "download_addr", "audio_addr", "audio_play_addr"]) {
+          appendAddress(source[key])
+        }
+        return dedupeStrings(urls)
+      }
+
       const audioURLsByFileId = new Map<string, string[]>()
       for (const item of getArray(video.bit_rate_audio)) {
         if (!isRecord(item)) continue
         const audioMeta = getNestedRecord(item, "audio_meta")
-        const fileId = audioMeta && getString(audioMeta.file_id)
-        if (!audioMeta || !fileId) continue
-        const urlList = audioMeta.url_list
-        const urls = isRecord(urlList)
-          ? dedupeStrings([getString(urlList.main_url), getString(urlList.backup_url), getString(urlList.fallback_url)].filter((url): url is string => Boolean(url)))
-          : urlsFromAddress(urlList)
+        const fileId = normalizeFileId(audioMeta?.file_id ?? item.file_id)
+        if (!fileId) continue
+        const urls = dedupeStrings([
+          ...(audioMeta ? collectAudioURLs(audioMeta) : []),
+          ...collectAudioURLs(item),
+        ])
         if (urls.length) audioURLsByFileId.set(fileId, urls)
       }
 
@@ -501,7 +527,7 @@ export function buildDownloadCandidates(
         if (!isRecord(item)) continue
         const gearName = getString(item.gear_name) || getString(item.quality_type) || "bit_rate"
         const videoExtra = safeJSONParse(getString(item.video_extra))
-        const audioFileId = isRecord(videoExtra) ? getString(videoExtra.audio_file_id) : null
+        const audioFileId = isRecord(videoExtra) ? normalizeFileId(videoExtra.audio_file_id) : null
         pushAddress(`inline_bit_rate_${gearName}`, item.play_addr, audioFileId ? audioURLsByFileId.get(audioFileId) : undefined)
       }
     }

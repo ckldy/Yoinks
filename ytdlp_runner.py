@@ -121,12 +121,14 @@ def main():
         if filename:
             finished_paths.append(os.path.abspath(filename))
 
-    # YouTube web player client requires a JS runtime (deno) to decrypt nsig.
-    # This device has no JS runtime; prefer android_vr so downloads also work.
-    extractor_args = {"youtube": {"player_client": ["android_vr"]}}
+    # 不要硬编码 player_client：本设备无 JS runtime，yt-dlp 会自行选 *_DEFAULT_JSLESS_CLIENTS
+    # （visionos）；而带 cookie 登录后 yt-dlp 会剔除所有不支持 cookie 的 client，
+    # 硬编码 android_vr 会把可用客户端清空→ "Requested format is not available"。
+    # 必须在 ytdlp_probe.py 保持一致的客户端策略，否则探测到的 format id 在下载时不存在。
+    extractor_args = {"youtube": {"player_client": ["default"]}}
 
     # 合并调用方传入的 extractor_args（如 yt-dlp-ytse 的 youtube.formats=ump），
-    # 保留默认 player_client=android_vr 不覆盖。
+    # 保留默认 player_client 不覆盖。
     extra_args = config.get("extractor_args")
     if isinstance(extra_args, dict):
         for client, args in extra_args.items():

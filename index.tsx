@@ -148,6 +148,7 @@ import {
   isFreshCookieError,
   isYouTubeBotCheckError,
   isYouTubeMembersOnlyError,
+  classifyAuthGate,
   supportedAuthPlatforms,
   importCookieFile,
   getImportedCookiePath,
@@ -764,19 +765,22 @@ function View() {
 
   const preflightDiscoverItem = async (sourceURL: string): Promise<{ probe: MediaProbe; probeAuthorizedPlatform?: AuthPlatform }> => {
     const platform = detectMediaPlatform(sourceURL)
-    const anonymousFirst = platform === "youtube"
-    let session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+    // YouTube：先匿名探测。带 cookie 会触发 yt-dlp 的客户端过滤（不支持 cookie 的 client 被剔除），
+    // 反而可能导致格式不可用；仅会员专享等确实需要账号时才用现有会话重试。
+    const anonymousFirst = platform === "youtube" || platform === "douyin"
+    let session = !anonymousFirst && isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
     try {
       return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session?.platform }
     } catch (firstError) {
       const message = firstError instanceof Error ? firstError.message : String(firstError)
-      // YouTube：仅会员专享（members-only）才登录；反机器人风控登录无效，按普通失败处理。
-      if (platform === "youtube" && isYouTubeMembersOnlyError(message)) {
+      const gate = classifyAuthGate(platform, message)
+      // 仅会员专享需要账号；反机器人风控登录无效，按普通失败处理。
+      if (gate === "members-only") {
         session = await sessionForPlatform("youtube")
         if (session) return { probe: await probeWithPlatformSession(sourceURL, session), probeAuthorizedPlatform: session.platform }
         throw new Error("该视频需要 YouTube 会员登录；请先通过单链流程登录后再重试")
       }
-      if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(message)) {
+      if (gate === "fresh-cookie") {
         throw new Error(`需先登录${authPlatformLabel(platform)}（设置或单链流程）后再重试`)
       }
       throw firstError
@@ -829,22 +833,23 @@ function View() {
     try {
       // YouTube 默认匿名；抖音若已本地登录，只复用该 WebView 会话，不生成 Cookie 文件。
       const anonymousFirst = platform === "youtube"
-      let session = isAuthPlatform(platform) ? await sessionForPlatform(platform) : null
+      let session = isAuthPlatform(platform) && platform !== "youtube" && platform !== "douyin" ? await sessionForPlatform(platform) : null
       let probeResult: MediaProbe
       try {
         probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
       } catch (firstError) {
         if (gen !== analysisGenerationRef.current) return
         const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-        // YouTube 反机器人风控（bot 检测）：登录通常无效，不引导登录，提示稍后重试/换网。
-        if (platform === "youtube" && isYouTubeBotCheckError(firstMessage)) {
+        const gate = classifyAuthGate(platform, firstMessage)
+        // YouTube 反机器人风控（bot 检测）：登录无效，不引导登录，提示稍后重试/换网。
+        if (gate === "bot-check") {
           setProbe(null)
           await logEvent({ level: "error", event: "probe.failed", details: { sourceURL, message: firstMessage, botCheck: true } })
           setStatus("YouTube 将当前网络判定为可疑流量（反机器人风控），无法获取格式。请等待 15 分钟至数小时再试，或切换 Wi‑Fi/蜂窝网络更换 IP；频繁重试可能延长封禁。会员专享视频才需要登录。")
           return
         }
         // Douyin never enters the login branch; YouTube reaches it only when a members-only video needs an account.
-        if (platform === "youtube" && isYouTubeMembersOnlyError(firstMessage)) {
+        if (gate === "members-only") {
           await logEvent({
             level: "warn",
             event: "probe.login-required",
@@ -862,7 +867,7 @@ function View() {
           session = loggedIn
           setStatus("登录完成，正在重新探测……")
           probeResult = await probeWithPlatformSession(sourceURL, session, safariReferer, safariMediaKind, skipPublicPlayerFallback)
-        } else if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+        } else if (gate === "fresh-cookie") {
           await logEvent({
             level: "warn",
             event: "probe.login-required",
@@ -1973,7 +1978,8 @@ function View() {
             probeResult = await probeWithPlatformSession(item.sourceURL, session)
           } catch (firstError) {
             const firstMessage = firstError instanceof Error ? firstError.message : String(firstError)
-            if (platform === "youtube" && isYouTubeMembersOnlyError(firstMessage)) {
+            const gate = classifyAuthGate(platform, firstMessage)
+            if (gate === "members-only") {
               const youtubeSession = await sessionForPlatform("youtube")
               if (youtubeSession) {
                 probeSession = youtubeSession
@@ -1989,7 +1995,17 @@ function View() {
                 })
                 continue
               }
-            } else if (platform !== "douyin" && isAuthPlatform(platform) && isFreshCookieError(firstMessage)) {
+            } else if (gate === "bot-check") {
+              fail += 1
+              const msg = "YouTube 反机器人风控：请换网或稍后重试（登录无效）"
+              patchBatchItem(item.id, { status: "failed", errorMessage: msg })
+              await logEvent({
+                level: "warn",
+                event: "batch.item.failed",
+                details: { itemId: item.id, reason: "bot-check", platform },
+              })
+              continue
+            } else if (gate === "fresh-cookie") {
               fail += 1
               const msg = `需先登录${authPlatformLabel(platform)}（设置或单链流程）后再重试`
               patchBatchItem(item.id, { status: "failed", errorMessage: msg })

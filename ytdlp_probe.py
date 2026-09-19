@@ -261,8 +261,13 @@ def main() -> None:
         "retries": 3,
         "extractor_retries": 3,
         "nocheckcertificate": insecure,
-        # This device has no JS runtime; use android_vr so YouTube formats do not depend on web nsig decryption.
-        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+        # 不要硬编码 player_client：本设备无 JS runtime，yt-dlp 会自行选 *_DEFAULT_JSLESS_CLIENTS
+        # （visionos，实测 31 档，远多于 android_vr 的 5 档）；而**带 cookie 登录后** yt-dlp 会剔除
+        # 所有不支持 cookie 的 client（android_vr 就在其中，_base.py 默认 SUPPORTS_COOKIES=False），
+        # 硬编码 android_vr 会把可用客户端清空→ "Requested format is not available"。
+        # 用 "default" 让 yt-dlp 按匿名/登录自动选择正确的客户端集合。
+        # downloading 侧的 ytdlp_runner.py 必须保持一致，否则探测到的 format id 在下载时不存在。
+        "extractor_args": {"youtube": {"player_client": ["default"]}},
     }
     if plugin_dirs:
         options["plugin_dirs"] = plugin_dirs

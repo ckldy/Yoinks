@@ -236,6 +236,32 @@ function stripHostNoise(value: string): string {
     .join("\n")
 }
 
+/**
+ * 探测脚本失败时输出 JSON 信封（{"ok": false, "error": "ERROR: ..."}）。
+ * 取出内层 error 文案并还原 JSON 转义（\uXXXX / \n / \" ），
+ * 避免把转义后的原始串直接展示给用户或交给下游正则匹配。
+ */
+export function cleanProbeEnvelope(value: string): string {
+  const text = String(value || "").trim()
+  if (!text) return text
+  const candidate = text.startsWith("{") ? text : (text.match(/\{[\s\S]*\}\s*$/)?.[0] || "")
+  if (!candidate) return text
+  let envelope: unknown
+  try {
+    envelope = JSON.parse(candidate)
+  } catch {
+    return text
+  }
+  if (!envelope || typeof envelope !== "object") return text
+  const record = envelope as Record<string, unknown>
+  const inner = record.error ?? record.message
+  if (typeof inner !== "string" || !inner.trim()) return text
+  return inner.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\n/g, " ")
+    .replace(/\\"/g, '"')
+    .trim()
+}
+
 /** Extract yt-dlp ERROR snippets even when glued to a progress line without newline. */
 function extractErrorSnippets(source: string): string[] {
   const snippets: string[] = []
@@ -280,7 +306,10 @@ export function isSafariHlsDirectFallbackFailure(value: string): boolean {
 
 export function compactMessage(value: string): string {
   const cleaned = stripHostNoise(value)
-  const source = cleaned || value
+  // 探测脚本失败时输出的是 JSON 信封 {"ok": false, "error": "ERROR: ..."}。
+  // 直接展示会把转义后的原始串（含字面量 \u2019 等）暴露给用户，既难看也难读。
+  // 这里先拆出内层 error 并还原转义，再交给下游规则匹配。
+  const source = cleanProbeEnvelope(cleaned || value)
   if (isDownloadTlsTimeout(source)) {
     return "下载过程中网络 TLS/握手超时，请检查网络后重试；可改选 H.264 清晰度或稍后再试。"
   }
@@ -2670,7 +2699,7 @@ async function probeDouyinDirect(sourceURL: string, douyinWebView?: WebViewContr
       return urls[0] ?? ""
     }
     const entries = Array.from(groups.entries())
-    const checked: Array<{ label: string; url: string; audioURL?: string; headers: Record<string, string>; playable: boolean }> = []
+    const checked: Array<{ label: string; url: string; audioURL?: string; muxedAudio: boolean; headers: Record<string, string>; playable: boolean }> = []
     let cursor = 0
     const CONCURRENCY = 5
     await Promise.all(
@@ -2680,9 +2709,20 @@ async function probeDouyinDirect(sourceURL: string, douyinWebView?: WebViewContr
           cursor += 1
           const url = await pickPlayable(candidates.map((c) => c.url))
           const health = await inspectPlayable(url)
-          const audioURL = await pickPlayable(candidates.flatMap((candidate) => candidate.audioURLs || []))
+          const audioCandidates = candidates.flatMap((candidate) => candidate.audioURLs || [])
+          const audioURL = await pickPlayable(audioCandidates)
           const audioHealth = audioURL ? await inspectPlayable(audioURL) : { ok: false, url: "" }
-          checked.push({ label, url: health.url, audioURL: audioHealth.ok ? audioHealth.url : undefined, headers: candidates[0].headers, playable: health.ok && audioHealth.ok })
+          // 真实详情可能不提供 bit_rate_audio，但 bit_rate MP4 本身已包含视频和音频流。
+          // 此时只校验混流地址可访问，不再错误地强制要求独立音频 URL。
+          const muxedAudio = audioCandidates.length === 0
+          checked.push({
+            label,
+            url: health.url,
+            audioURL: audioHealth.ok ? audioHealth.url : undefined,
+            muxedAudio,
+            headers: candidates[0].headers,
+            playable: health.ok && (muxedAudio || audioHealth.ok),
+          })
         }
       }),
     )
@@ -2691,7 +2731,13 @@ async function probeDouyinDirect(sourceURL: string, douyinWebView?: WebViewContr
       level: "info",
       event: "probe.douyin.preview-health",
       taskId,
-      details: { groups: checked.length, playable: playableCount, blocked: checked.length - playableCount, pairedAudio: checked.filter((item) => Boolean(item.audioURL)).length },
+      details: {
+        groups: checked.length,
+        playable: playableCount,
+        blocked: checked.length - playableCount,
+        pairedAudio: checked.filter((item) => Boolean(item.audioURL)).length,
+        muxedAudio: checked.filter((item) => item.muxedAudio).length,
+      },
     })
     probe.choices = checked.filter((item) => item.playable).map((item, index) => ({
       id: `douyin-desktop-${index}`,
@@ -3264,6 +3310,9 @@ async function probeMediaCore(url: string, options: ProbeOptions = {}): Promise<
   }
   const tryPublicPlayerFallback = async (message: string): Promise<MediaProbe | null> => {
     if (options.skipPublicPlayerFallback) return null
+    // YouTube 是 SPA：页面内没有可静态抽取的 <video>/视频 iframe，该兜底必然空跑
+    // （真机日志已证实 checkedIframes=0 / hit=false），只会白等一次 6 秒超时。
+    if (detectMediaPlatform(sourceURL) === "youtube") return null
     // 放宽触发条件：除“无格式/超时”外，Safari 页面候选（带 referer 或显式媒体类型）
     // 的任意探测失败也尝试公开播放器静态抽取——正片可能藏在页面或同源 iframe 的
     // 播放器里（如 hqporner → mydaddy.cc fluidplayer 的 360/720/1080 三清晰度）。
