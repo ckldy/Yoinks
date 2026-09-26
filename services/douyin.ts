@@ -1009,6 +1009,11 @@ export async function extractFromWebView(
     if (capturedDetailText && !hasRichDetail) {
       data.apiDetailJSON = capturedDetailText
       hasInlineRoot = true
+      const root = extractInlineDetailRoot(data)
+      if (root) {
+        const detailTitle = getString(root.desc) || getString(root.caption)
+        if (detailTitle) data.title = detailTitle
+      }
       localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
       hasRichDetail = localBitRateCount > 0
       log?.("使用注入捕获的签名详情数据。")
@@ -1055,6 +1060,11 @@ export async function extractFromWebView(
         const apiDetailJSON = await fetchAwemeDetailInWebView(webView, fallbackAwemeId)
         if (apiDetailJSON) {
           data.apiDetailJSON = apiDetailJSON
+          const root = extractInlineDetailRoot(data)
+          if (root) {
+            const detailTitle = getString(root.desc) || getString(root.caption)
+            if (detailTitle) data.title = detailTitle
+          }
           localBitRateCount = getArray(getNestedRecord(extractInlineDetailRoot(data) || {}, "video")?.bit_rate).length
           hasRichDetail = localBitRateCount > 0
           log?.("作品详情接口已命中。")

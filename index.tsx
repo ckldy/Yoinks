@@ -3119,7 +3119,7 @@ return (
                 <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
                   <Text font="subheadline" fontWeight="semibold">浏览器脚本</Text>
                   <Text font="caption" foregroundStyle="secondaryLabel">
-                    源码 v{browserPlugin.expected ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
+                    源码 v{browserPlugin.expected ?? "?"} · 已发布 v{browserPlugin.published ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
                   </Text>
                 </VStack>
                 <Spacer />

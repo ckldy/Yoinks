@@ -1,5 +1,23 @@
 # 更新日志
 
+## 1.6.23 — 2026-09-26
+
+> Safari 双击跳转与状态可见性修复；抖音内联详情标题回填。
+
+### 修复
+
+- **远程入口补齐 Safari 唤起处理**（`remote-entry.tsx`）：`index.tsx` 已有 `Script.queryParameters.safari === "1"` 时优先 `importSafariMediaCandidate()` 的分支，远程入口缺失，导致双击跳转后不走导入链路而继续执行启动剪贴板检查。现已对齐两处入口。
+- **抖音内联详情标题回填**（`services/douyin.ts`）：`apiDetailJSON` 两条内联详情路径补齐从 `desc` / `caption` 回填 `data.title`，标题为空时不再只依赖页面标题兜底。
+
+### 改进
+
+- **设置页浏览器脚本状态可区分三处版本**（`index.tsx` / `remote-entry.tsx`）：原状态行只显示「源码 vX · Safari vY」，无法判断 `browser.tsx.src` 是否已发布到 `Yoinks.user.js`。现改为「源码 vX · 已发布 vY · Safari vZ」。
+
+### 备注
+
+- Safari 用户脚本 `browser.tsx.src` 版本 1.3.13 → 1.3.14（双击跳转仍使用宿主可识别的 `scripting://run_single/YoinksRemote?...&safari=1`；`scripting://YoinksRemote?...` 在当前宿主会报「链接未被理解」）。
+- 双击跳转仍会新建单次实例（`run_single` 语义），当前未找到可唤醒已运行实例的宿主支持方案。
+
 ## 1.6.22 — 2026-09-19
 
 > 修复「能识别格式但下载不了」：yt-dlp 自身进度行写入本环境文本捕获流会抛 `TypeError`，使**所有** yt-dlp 下载必定失败；同时修复该崩溃被谎报为「网络超时」。

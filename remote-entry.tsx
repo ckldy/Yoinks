@@ -932,6 +932,13 @@ function View() {
   // analyzeMedia without the automatic flag.
   useEffect(() => {
     void (async () => {
+      // 双击 Safari 插件拉起主程序：检测 queryParameters.safari=1 时自动导入 Safari 候选
+      // 此检查优先于剪贴板检查，不受 suppressed/checked 等状态影响
+      if (typeof Script.queryParameters.safari === "string" && Script.queryParameters.safari === "1") {
+        await importSafariMediaCandidate()
+        return
+      }
+
       const inspection = {
         checked: launchClipboardCheckedRef.current,
         suppressed: launchClipboardSuppressedRef.current,
@@ -3058,7 +3065,7 @@ return (
                 <VStack alignment="leading" spacing={3} frame={{ maxWidth: "infinity", alignment: "leading" as any }}>
                   <Text font="subheadline" fontWeight="semibold">浏览器脚本</Text>
                   <Text font="caption" foregroundStyle="secondaryLabel">
-                    源码 v{browserPlugin.expected ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
+                    源码 v{browserPlugin.expected ?? "?"} · 已发布 v{browserPlugin.published ?? "?"}{browserPlugin.current ? ` · Safari v${browserPlugin.current}` : " · Safari 版本未知"}
                   </Text>
                 </VStack>
                 <Spacer />
